@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use auth_limiter::{
+use fareward::{
     limiter::{
         aggregation::UsageKey,
         credits_blob::Credits,
@@ -171,7 +171,7 @@ impl Client {
         let mut frame = vec![opcode];
         frame.extend_from_slice(body);
         let mut mac = Hmac::<Sha256>::new_from_slice(SECRET).unwrap();
-        mac.update(b"genix-server-utils:v6");
+        mac.update(b"fareward:v7");
         mac.update(&self.nonce);
         mac.update(&self.sequence.to_be_bytes());
         mac.update(&frame);

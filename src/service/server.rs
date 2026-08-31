@@ -77,7 +77,7 @@ pub async fn run(
 ) -> Result<()> {
     let connection_slots = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
-    info!(address = %listener.local_addr()?, max_connections, max_inflight, "auth-limiter listening");
+    info!(address = %listener.local_addr()?, max_connections, max_inflight, "fareward listening");
 
     loop {
         tokio::select! {

@@ -9,7 +9,7 @@
 use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
-use auth_limiter::{
+use fareward::{
     bridge::{self, channel::ChannelRegistry, http::BridgeState},
     config::AppConfig,
     limiter::{quota::RateLimiter, storage::ScyllaLimiterStore},
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = AppConfig::load().context("auth-limiter configuration is invalid")?;
+    let config = AppConfig::load().context("fareward configuration is invalid")?;
     // One pool to the cluster, shared by the limiter and the request-log writer. Two would double
     // the connections to the same nodes for nothing.
     let session = connect_session(&config.database)

@@ -2,7 +2,7 @@
 #
 # The binary these produce is statically linked against musl and depends on nothing at runtime:
 # no glibc version to match, no shared libraries to install. That is what lets
-# configure_auth_limiter.py install a prebuilt binary instead of compiling in place.
+# configure_fareward.py install a prebuilt binary instead of compiling in place.
 #
 # rust-lld rather than the default `cc`: the C compiler on the build machine only knows how to
 # link for the machine it runs on, so cross-building aarch64 from x86_64 fails with "file in

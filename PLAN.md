@@ -2,7 +2,7 @@
 
 Status: implemented, including Go-side size-to-credit formulas and TCP client integration.
 
-Target: `auth_limiter/`
+Target: `fareward/`
 
 ## 1. Goal
 
@@ -448,7 +448,7 @@ services and the config they share and nothing else.
 
 ```text
 # Purpose: Keep protocol, business rules, persistence, and process wiring independently testable.
-auth_limiter/
+fareward/
 ├── Cargo.toml
 ├── README.md
 ├── PLAN.md

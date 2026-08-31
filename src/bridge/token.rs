@@ -7,7 +7,7 @@
 //!    colbin and shares nothing with it beyond sitting at the same boundary.
 //!
 //! Both are mirrors of Go code in another repository, so every rule here is pinned by
-//! vectors generated from that Go code — see `auth_limiter/vectors`, which prints them.
+//! vectors generated from that Go code — see `fareward/vectors`, which prints them.
 
 use std::sync::OnceLock;
 
@@ -213,7 +213,7 @@ mod tests {
     }
 
     /// Tokens produced by `colbin.Marshal` on the real Go struct, printed by
-    /// `go run ./auth_limiter/vectors`. Each covers a different shape: the plain case, an
+    /// `go run ./fareward/vectors`. Each covers a different shape: the plain case, an
     /// omitted field (`Created` is zero) with an empty string, the i32 maximum, multi-byte
     /// UTF-8, a long user name, and a negative value, which is what clears the message's
     /// ALL_POSITIVE flag and puts the integers on the zigzag path.

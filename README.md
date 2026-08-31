@@ -1,17 +1,17 @@
-# Auth-Limiter
+# Fareward
 
 One Rust process hosting four server-side services over two transports:
 
 | Service | Transport | Port | Purpose |
 |---|---|---|---|
-| Access gate + credit limiter | Raw TCP, loopback | `auth_limiter` (default `127.0.0.1:14013`) | Authorizes the caller against its cached grants, then charges CPU/inference quota — both in one round trip. |
-| Lock service | Raw TCP, same port | `auth_limiter` | Serializes an action across concurrent Lambdas. |
-| Request log | Raw TCP, same port | `auth_limiter` | One row per finished request, plus the code lines that failed. |
-| SSE bridge | HTTP (TLS via Nginx) | `sse_bridge.port` (default `14012`) | Relays agent events between the backend and browser tabs, authenticating both ends. |
+| Access gate + credit limiter | Raw TCP, loopback | `fareward` (default `127.0.0.1:14013`) | Authorizes the caller against its cached grants, then charges CPU/inference quota — both in one round trip. |
+| Lock service | Raw TCP, same port | `fareward` | Serializes an action across concurrent Lambdas. |
+| Request log | Raw TCP, same port | `fareward` | One row per finished request, plus the code lines that failed. |
+| SSE bridge | HTTP (TLS via Nginx) | `sse_bridge.port` (default `14012`) | Relays agent events between a backend and browser tabs, authenticating both ends. |
 
 The limiter, the lock and the request log share the port, the connection, and the handshake —
 nothing else. Each opcode has its own frame width, its own codec, and its own module. That shared port is why its
-address is the root-level `auth_limiter` key rather than something under `[rate_limit]`: it
+address is the root-level `fareward` key rather than something under `[rate_limit]`: it
 belongs to the process, not to any one service inside it.
 
 The bridge shares nothing with either but the process: the config load, the shutdown signal, and
@@ -30,14 +30,124 @@ to end, with the exact bytes. Designs: [PLAN.md](PLAN.md) (rate limiter, includi
 formats), [PLAN_LOCK_SERVICE.md](PLAN_LOCK_SERVICE.md) and
 [PLAN_MULTIPLEXING.md](PLAN_MULTIPLEXING.md) (lock service),
 [PLAN_SSE_BRIDGE.md](PLAN_SSE_BRIDGE.md) (bridge). Deployment:
-[`../scripts/configure/CONFIGURE_AUTH_LIMITER.md`](../scripts/configure/CONFIGURE_AUTH_LIMITER.md).
+[`../scripts/configure/CONFIGURE_FAREWARD.md`](../scripts/configure/CONFIGURE_FAREWARD.md).
 
 > **One process, shared fate.** The rate limiter loads existing usage from ScyllaDB before
-> admitting anything and exits when it cannot — which also stops the bridge. Deploy the backend
-> tables (including `credit_usage`, `company_credit_budget`, `user_logs`, `request_errors` and `server_metrics`) before
-> starting the daemon. The request log and the metrics collector are the two halves that do *not*
-> share that fate: they drop rows rather than propagate a failure, because taking the process down
-> would stop everything else.
+> admitting anything and exits when it cannot — which also stops the bridge. Deploy the tables
+> [it expects](#the-tables-it-expects-to-already-exist) before starting the daemon. The request log
+> and the metrics collector are the two halves that do *not* share that fate: they drop rows rather
+> than propagate a failure, because taking the process down would stop everything else.
+
+## The backend contract
+
+This repository is standalone: it builds, tests and runs with no Go in the picture, and its only
+non-crates.io build dependency is `colbin`, a Rust crate. What it is *not* is self-contained. The
+daemon answers questions something asks it and writes rows something reads, so a backend has to play
+the client. The Go backend in `github.com/ivanjoz/genix` is that client today, and the only one —
+but the coupling is **four contracts, not a language**.
+
+| # | Contract | Defined by | What a different backend has to do |
+|---|---|---|---|
+| 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` — eight-byte nonce at accept, then every frame tagged `HMAC-SHA256(fareward:v7 ‖ nonce ‖ sequence ‖ opcode ‖ payload)` truncated to 8 bytes, over fixed-width big-endian fields. |
+| 2 | The ScyllaDB schema | nobody here — the daemon issues no `CREATE TABLE` | Create the tables and columns below before first start. |
+| 3 | The `accesos_computed` packing | `src/limiter/access.rs` | Write `users.accesos_computed` as little-endian `u16` grants. |
+| 4 | The browser session token | `src/bridge/token.rs` | Issue a colbin-encoded `core.UsuarioToken`. **The only Go-shaped contract** — see below. |
+
+Contracts 1–3 belong to the raw-TCP half. Contract 4 belongs to the SSE bridge alone, and the bridge
+shares nothing with the rest but the config load and the tokio runtime — so a deployment that does
+not run the bridge never meets contract 4 at all.
+
+### The tables it expects to already exist
+
+The daemon prepares its statements at startup and **never creates schema**. Ownership of these
+tables sits with whoever runs the migrations; in the Genix deployment that is the Go ORM.
+
+| Table | Access | Used for |
+|---|---|---|
+| `users` | read | `accesos_computed`, `status` — the grant cache behind `CHARGE_CREDITS` |
+| `credit_usage_company`, `credit_usage_user` | read + write | the quota windows, loaded at cold start |
+| `company_credit_budget` | read + write | the extra-credit pool, its ceiling and the activated month |
+| `user_logs`, `request_errors` | write | the request log |
+| `server_metrics` | write | the metrics collector |
+
+The split matters at startup. The limiter loads usage before admitting anything and **exits** if it
+cannot, so its four tables are a hard precondition. The last three are written by the two services
+that fail open: a missing column leaves `ensure_prepared` retrying once a minute and dropping rows,
+and the process stays up.
+
+### Could a Rust or Node backend drive this?
+
+**Go: nothing to do.** [`go/`](go/) is a module in this repository — `github.com/ivanjoz/fareward/go`
+— that implements contracts 1 and 3 and depends on the standard library and nothing else. Configure
+it and call it; see [The Go client](#the-go-client).
+
+**Rust: yes, with nothing missing.** All four contracts are available to it. The frame protocol is
+already in this crate, and `colbin` is the same crate the bridge decodes with, so a Rust backend can
+issue session tokens directly.
+
+**Node: yes for the raw-TCP services, with one gap at the bridge.** Contracts 1–3 are byte layouts
+and CQL — nothing about them is Go. Contract 4 is the exception: colbin has Go and Rust
+implementations and **no JavaScript one**, so a Node backend would have to write a colbin encoder
+for the five fields of `UsuarioToken`, or run without the bridge, or swap `decode_session_token` for
+a format it can already produce. The *channel* token is not a barrier — it is a small varint format
+already mirrored in TypeScript in `frontend/core/agent/channel.ts`.
+
+**Any other language: the same shape.** Contract 4 is the only place one specific Go type's wire
+encoding is assumed, and it is confined to one function behind one trait-free entry point. For
+contract 1, read `go/connection.go` rather than `src/service/` — it is the same protocol seen from
+the caller's side, which is the side a port has to reproduce.
+
+### The Go client
+
+`go/` holds the client the Genix backend uses, and it is the reference implementation of contract 1.
+It lives here rather than in the backend so a wire change and the client that speaks it move in one
+commit, and so a backend that is not Genix can depend on it without depending on Genix.
+
+Configure once, then call package-level functions — there is no client object to thread through
+call sites, because the daemon keys its frame sequence per connection and one process wants one
+sequence:
+
+```go
+import fareward "github.com/ivanjoz/fareward/go"
+
+fareward.SetLogger(myLogger)                      // optional; a no-op until set
+if err := fareward.ConfigureFareward(addr, secret); err != nil { return err }
+
+err := fareward.ChargeAPIUsage(ctx, companyID, userID, routeID, method, payloadBytes, required)
+lock, err := fareward.AcquireLock(ctx, action, identifier, maxWaiters)
+err := fareward.SendRequestLog(ctx, record)
+err := fareward.InvalidateUserAccess(ctx, companyID, userID)
+err := fareward.MutateCompanyCreditBudget(ctx, companyID, op, amount)
+```
+
+It owns the wire *and the tariff* — `APICPUCredits`, `APICPUBaseCredits`, `InferenceCredits` —
+because the daemon charges the counts a frame names and does not compute them. It owns none of the
+policy above that: route-to-access mapping, charging exemptions and HTTP status mapping stay in the
+caller, which is why the Genix backend keeps a 156-line adapter (`core/fareward_api.go`) on its side
+of the seam and nothing more.
+
+The module has **no dependencies beyond the standard library**, and that is worth keeping: this is
+the one piece of the system a backend links into its own binary, so its dependency list becomes
+somebody else's transitive dependency list.
+
+Its cross-language HMAC vectors sit next to the Rust ones they pin, in `go/credits_test.go` and
+`go/locks_test.go`, so a change to `DOMAIN` fails both suites in the same repository.
+
+### What is *not* a contract
+
+Most of what reads like backend coupling is caller-side policy this daemon has no opinion about:
+
+- **Tariffs.** The daemon charges the credits the frame names; it does not compute them. Which
+  method costs what, the KiB boundaries and the GET base-plus-top-up split are the client's.
+- **Which route needs which access.** `src/limiter/access.rs` answers "does this user hold any of
+  these grants" and deliberately does not know access *names*, that `access_list.yml` exists, or
+  which route maps to which grant.
+- **Route ids.** The request log stores whatever number the client puts in bits 39..24.
+- **Who is exempt.** The user-1 bypass, unmapped GETs being free, `POST.user-self` needing no
+  access — all resolved before a frame is ever built.
+
+[Charging rules in the Go client](#charging-rules-in-the-go-client) documents what one client chose
+for the first four; a different backend picks its own without touching this repository.
 
 ## Layout
 
@@ -62,6 +172,11 @@ src/
 │                # cgroup v2), writer (the tick loop and the insert)
 └── bridge/      # token.rs (colbin + channel token), auth (the browser's session
                  # token and the backend's service header), channel, http (axum)
+
+go/              # the Go client: its own module, stdlib only. The reference
+                 # implementation of the raw-TCP protocol above, and what the Genix
+                 # backend imports.
+vectors/         # its own module too: prints the session-token vectors token.rs asserts
 ```
 
 ## Authentication
@@ -71,11 +186,11 @@ a database round trip:
 
 | Who proves what | How | Secret |
 |---|---|---|
-| Backend → raw-TCP port | An eight-byte random nonce written at accept, then every frame tagged with `HMAC-SHA256(genix-server-utils:v6 ‖ nonce ‖ sequence ‖ opcode ‖ payload)` truncated to 8 bytes. | `internal_apikey` |
+| Backend → raw-TCP port | An eight-byte random nonce written at accept, then every frame tagged with `HMAC-SHA256(fareward:v7 ‖ nonce ‖ sequence ‖ opcode ‖ payload)` truncated to 8 bytes. | `internal_apikey` |
 | Backend → SSE bridge | `X-Bridge-Auth: <unix seconds>.<hex signature>`, signed over `sse-bridge:v1\|<unix seconds>` and accepted within ±300 s of this host's clock. | `internal_apikey` |
-| Browser → SSE bridge | `Authorization: Bearer <session token>` — the colbin token the backend issued, its own HMAC recomputed over `usrToken:v1 ‖ company ‖ user ‖ created ‖ username`. | `secret_phrase` |
+| Browser → SSE bridge | `Authorization: Bearer <session token>` — the colbin token the backend client issued, its own HMAC recomputed over `usrToken:v1 ‖ company ‖ user ‖ created ‖ username`. | `secret_phrase` |
 
-Both keys are root-level in `config.toml` and must match the backend byte for byte. Each use is
+Both keys are root-level in `config.toml` and must match the backend client's byte for byte. Each use is
 domain-separated, so one key serving two protocols cannot produce interchangeable tags, and
 splitting the two means the inter-service key can be rotated without invalidating every live session
 token. Every tag is compared in constant time, including the bridge's, where the value is a string
@@ -119,14 +234,15 @@ the reference material it ties together.
   ever relaxing a burst gate.
 - Aggregates every accepted charge into user/company and five-minute/daily in-memory records.
 - Flushes only changed absolute records to `credit_usage` every 15 seconds.
-- Fails closed in the Go backend for quota exhaustion and daemon/storage unavailability.
+- Leaves the fail-closed decision to the caller. The Go client fails closed on quota
+  exhaustion and on daemon/storage unavailability; the daemon only reports which it was.
 
 Version one must run as a single active process. Two instances would have independent in-memory
 quota state and must not write the same absolute rows.
 
 ## Configuration
 
-Add `[auth_limiter]` and `[rate_limit]` to the project `config.toml`; the complete commented
+Add `[fareward]` and `[rate_limit]` to the project `config.toml`; the complete commented
 example is in [`../config.example.toml`](../config.example.toml).
 
 ```toml
@@ -140,7 +256,7 @@ example is in [`../config.example.toml`](../config.example.toml).
 #
 # public = true puts the port on the open internet. Frames are HMAC-authenticated but NOT
 # encrypted, so it is only worth it when the backend runs off-box (Lambda, for instance).
-[auth_limiter]
+[fareward]
 host   = "127.0.0.1"
 port   = 14013
 public = false
@@ -169,7 +285,7 @@ user_inference_1h     = 5000
 
 The eight burst/hour ceilings are the only settings here with no built-in default: a guessed quota
 is worse than none, so the process refuses to start without them. Since that refusal is a
-three-second crash loop under `Restart=always`, the nested Auth Limiter installer writes these
+three-second crash loop under `Restart=always`, the nested Fareward installer writes these
 defaults into `config.toml` when they are absent, rather than leaving the daemon to discover it.
 
 The lock service adds process-wide ceilings only — per-action policy stays in the Go call sites:
@@ -228,7 +344,7 @@ selected backend serves its own `/agent/stream`.
 
 ```bash
 # Purpose: Compile and verify all protocol, codec, limiter, lock, and flush tests.
-cd auth_limiter
+cd fareward
 cargo test
 cargo build --release
 ```
@@ -240,7 +356,7 @@ everything it held.
 
 Building needs a C compiler even though no crate here contains C: rustc shells out to `cc` to
 link, and a `build.rs` is itself an executable that has to be linked before cargo can run it.
-`../scripts/configure/configure_auth_limiter.py` installs one when the host has none.
+`../scripts/configure/configure_fareward.py` installs one when the host has none.
 
 For a host that should compile nothing, build a static binary and ship it instead. `.cargo/
 config.toml` pins `rust-lld` for the musl targets, which is also what makes cross-building arm64
@@ -252,8 +368,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 ```
 
-Every versioned [GitHub Release of this repository](https://github.com/ivanjoz/auth-limiter/releases)
-publishes these static outputs as `auth-limiter_linux_amd64` and `auth-limiter_linux_arm64`, built
+Every versioned [GitHub Release of this repository](https://github.com/ivanjoz/fareward/releases)
+publishes these static outputs as `fareward_linux_amd64` and `fareward_linux_arm64`, built
 by `.github/workflows/release-binaries.yml` on a native runner per architecture. Downloading
 `latest` is convenient for a manual install; replace `latest/download` with `download/vX.Y.Z` to
 pin production automation to an immutable release.
@@ -267,8 +383,8 @@ case "$(uname -m)" in
 esac
 
 # Download the public binary and the manifest without requiring a GitHub token.
-release_base_url=https://github.com/ivanjoz/auth-limiter/releases/latest/download
-release_asset="auth-limiter_linux_${release_architecture}"
+release_base_url=https://github.com/ivanjoz/fareward/releases/latest/download
+release_asset="fareward_linux_${release_architecture}"
 curl --fail --location --output "$release_asset" "${release_base_url}/${release_asset}"
 curl --fail --location --output SHA256SUMS "${release_base_url}/SHA256SUMS"
 
@@ -287,11 +403,11 @@ go run . generate_controllers
 go run . check_tables
 ```
 
-Run locally from `auth_limiter/` (it finds `../config.toml`):
+Run locally from `fareward/` (it finds `../config.toml`):
 
 ```bash
 # Purpose: Enable detailed request and flush diagnostics during local development.
-RUST_LOG=auth_limiter=debug cargo run
+RUST_LOG=fareward=debug cargo run
 ```
 
 ## SSE bridge HTTP contract
@@ -402,7 +518,7 @@ before the range check both sides already ran — so anything left above fourtee
 The HMAC covers the opcode and payload plus the connection nonce and the frame sequence, so a frame
 can be replayed neither as itself nor as a different operation. Authentication, malformed-frame,
 unknown-opcode, initialization and transport failures close the connection. The domain string is
-bumped on every wire change — `genix-server-utils:v6` today — because replies are not authenticated:
+bumped on every wire change — `fareward:v7` today — because replies are not authenticated:
 without the bump an old client would authenticate fine and then misread a reply that grew under it.
 
 ### Replies are multiplexed
@@ -637,7 +753,7 @@ nothing — everything comes from `config.toml` — and installs a C compiler if
 After starting the service it probes `/health` rather than trusting `systemctl restart`: this daemon
 exits when ScyllaDB is unreachable, which with `Restart=always` looks identical to a healthy start.
 The generated unit and the three non-negotiable Nginx streaming settings are in
-[`../scripts/configure/CONFIGURE_AUTH_LIMITER.md`](../scripts/configure/CONFIGURE_AUTH_LIMITER.md).
+[`../scripts/configure/CONFIGURE_FAREWARD.md`](../scripts/configure/CONFIGURE_FAREWARD.md).
 
 For a self-hosted backend, select both components (`237` or `238`) and choose Backend mode `1` or
 `2`: the dispatcher then installs this daemon without its public SSE Nginx vhost and does not
@@ -646,7 +762,12 @@ require `sse_bridge.url`, since the backend already serves `/agent/stream`.
 Keep the raw TCP listener on loopback or a private network. HMAC authenticates messages but does not
 encrypt them, and the bridge's HTTP port speaks plain HTTP with Nginx terminating TLS in front.
 
-## Go charging rules
+## Charging rules in the Go client
+
+**None of this is daemon behaviour.** The tariff is computed caller-side and arrives as the credit
+counts already inside the frame, so what follows describes the choices the Go backend made, not a
+rule this repository enforces. It is here because it is the only worked example of the policy layer
+contract 1 leaves open, and because reading the usage tables requires knowing it.
 
 Sizes are uncompressed bytes in binary KiB (`1 KiB = 1024 bytes`), and the group boundaries are the
 same for both methods:

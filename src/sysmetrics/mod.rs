@@ -1,7 +1,7 @@
 //! One row every five seconds in `server_metrics` with what this machine was doing.
 //!
 //! This daemon owns the writes and the Go ORM owns the schema, the same split `reqlog` uses for
-//! `user_logs`. Here it is not a preference: the backend may be a Lambda, so `auth_limiter` is the
+//! `user_logs`. Here it is not a preference: the backend may be a Lambda, so `fareward` is the
 //! only Genix process guaranteed to be on the box and therefore the only one that can promise a
 //! continuous series.
 //!
@@ -59,7 +59,7 @@ pub struct MetricsSample {
     pub network_rx_rate: i16,
     pub network_tx_rate: i16,
     pub backend: ServiceSample,
-    pub auth_limiter: ServiceSample,
+    pub fareward: ServiceSample,
     pub search: ServiceSample,
     pub scylla: ServiceSample,
 }
@@ -73,7 +73,7 @@ impl Default for MetricsSample {
             network_rx_rate: NOT_MEASURED,
             network_tx_rate: NOT_MEASURED,
             backend: ServiceSample::default(),
-            auth_limiter: ServiceSample::default(),
+            fareward: ServiceSample::default(),
             search: ServiceSample::default(),
             scylla: ServiceSample::default(),
         }
@@ -120,7 +120,7 @@ impl WindowPeaks {
             network_rx_rate: peak(current.network_rx_rate, sample.network_rx_rate),
             network_tx_rate: peak(current.network_tx_rate, sample.network_tx_rate),
             backend: peak_service(current.backend, sample.backend),
-            auth_limiter: peak_service(current.auth_limiter, sample.auth_limiter),
+            fareward: peak_service(current.fareward, sample.fareward),
             search: peak_service(current.search, sample.search),
             scylla: peak_service(current.scylla, sample.scylla),
         };

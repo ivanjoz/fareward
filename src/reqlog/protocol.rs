@@ -334,7 +334,7 @@ mod tests {
     ///
     /// Every other test here round-trips through this module's own `encode`, which would agree
     /// with itself even if both halves drifted from Go together. This one cannot: it is the actual
-    /// output of `encodeRequestLog(sampleRecord())` in backend/core/auth_limiter/request_log.go,
+    /// output of `encodeRequestLog(sampleRecord())` in backend/core/fareward/request_log.go,
     /// and the values below are that function's sample record. Regenerate it from
     /// `TestEncodeRequestLogWireOffsets` if the layout ever changes on purpose.
     #[test]

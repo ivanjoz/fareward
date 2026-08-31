@@ -55,12 +55,15 @@ impl ServerMetricsWriter {
         // untrusted reaches this string.
         //
         // Every column is named: the Go side owns these names, and a rename there fails the
-        // prepare instead of writing values into the wrong columns. server_utils_* predates this
-        // crate's rename to auth-limiter and stays: the table already holds rows under it.
+        // prepare instead of writing values into the wrong columns. fareward_* replaced
+        // server_utils_* in the rename; the ORM adds columns but never drops them, so the old pair
+        // survives on deployed tables holding pre-rename rows until their TTL expires it. That is
+        // also why `ensure_prepared` retries rather than giving up: on a host where the backend has
+        // not yet run its schema deploy, this prepare fails until the new columns exist.
         let insert_statement = format!(
             "INSERT INTO server_metrics (date, slot, cpu_percent, mem_percent, disk_percent, \
              net_rx_rate, net_tx_rate, backend_mem_mb, backend_cpu_percent, \
-             server_utils_mem_mb, server_utils_cpu_percent, search_mem_mb, search_cpu_percent, \
+             fareward_mem_mb, fareward_cpu_percent, search_mem_mb, search_cpu_percent, \
              scylla_mem_mb, scylla_cpu_percent) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl_seconds}"
         );
@@ -118,7 +121,7 @@ impl ServerMetricsWriter {
             let mut collector = SystemMetricsCollector::new(
                 ServiceUnits {
                     backend: config.backend_unit.clone(),
-                    auth_limiter: config.auth_limiter_unit.clone(),
+                    fareward: config.fareward_unit.clone(),
                     search: config.search_unit.clone(),
                     scylla: config.scylla_unit.clone(),
                 },
@@ -248,8 +251,8 @@ fn row_values(date: i16, slot: i16, sample: &MetricsSample) -> [i16; 15] {
         sample.network_tx_rate,
         sample.backend.memory_mb,
         sample.backend.cpu_percent,
-        sample.auth_limiter.memory_mb,
-        sample.auth_limiter.cpu_percent,
+        sample.fareward.memory_mb,
+        sample.fareward.cpu_percent,
         sample.search.memory_mb,
         sample.search.cpu_percent,
         sample.scylla.memory_mb,
@@ -319,7 +322,7 @@ mod tests {
                 memory_mb: 6,
                 cpu_percent: 7,
             },
-            auth_limiter: crate::sysmetrics::ServiceSample {
+            fareward: crate::sysmetrics::ServiceSample {
                 memory_mb: 8,
                 cpu_percent: 9,
             },

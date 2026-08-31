@@ -16,13 +16,17 @@ use thiserror::Error;
 /// the opcode byte; `:v2` widened the reply to 5 bytes; `:v3` gave `LOCK_RELEASE` a payload; `:v4`
 /// added `LOG_REQUEST`, the first length-prefixed frame and the first that is never answered; `:v5`
 /// added `MUTATE_COMPANY_BUDGET`; `:v6` widened `CHARGE_CREDITS` with four authorization slots and
-/// gave the reply's `detail` a meaning for that opcode, and added `INVALIDATE_USER_ACCESS`.
+/// gave the reply's `detail` a meaning for that opcode, and added `INVALIDATE_USER_ACCESS`; `:v7`
+/// renamed the string itself to `fareward` without changing a frame.
 /// Replies are not themselves authenticated, so without the bump an old client would keep
 /// authenticating fine, read 1 byte of a 5-byte reply, and silently misinterpret everything
 /// after that.
-/// The value kept its pre-rename spelling on purpose: it identifies the protocol, not the crate,
-/// so a rename must not consume a version bump or invalidate frames a deployed backend still signs.
-const DOMAIN: &[u8] = b"genix-server-utils:v6";
+/// `:v7` is the first value to carry this crate's own name. The rename from
+/// `genix-server-utils:v6` is not itself a frame-format change, but it invalidates every tag a
+/// peer on the old string produces, which is exactly what a bump is for: the skew surfaces as a
+/// failed HMAC on the first frame rather than as a silent misread. Backend and daemon must
+/// therefore be deployed together across this boundary.
+const DOMAIN: &[u8] = b"fareward:v7";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -113,11 +117,11 @@ mod tests {
         ];
         assert_eq!(
             compute_hash(secret, &nonce, 0, &payload).unwrap(),
-            [0x0F, 0x13, 0xFA, 0xB1, 0xDE, 0xF3, 0xCA, 0xA8]
+            [0x51, 0x2A, 0x79, 0x02, 0x61, 0x0E, 0xA0, 0xCE]
         );
         assert_eq!(
             compute_hash(secret, &nonce, 1, &payload).unwrap(),
-            [0xA9, 0x87, 0x64, 0x7C, 0xD4, 0x89, 0x26, 0xAD]
+            [0x36, 0x7A, 0xF0, 0xEA, 0x23, 0xBA, 0x00, 0xE8]
         );
 
         // Opcode 0x02 with action 7, identifier -42, 3 waiters, 5000 ms wait, 15000 ms lease.
@@ -127,14 +131,14 @@ mod tests {
         ];
         assert_eq!(
             compute_hash(secret, &nonce, 0, &acquire).unwrap(),
-            [0x63, 0xFE, 0x19, 0x83, 0xE2, 0x84, 0xE6, 0x3E]
+            [0x10, 0x9D, 0x0A, 0xA7, 0x58, 0x22, 0xCB, 0xD1]
         );
 
         // Opcode 0x06 for company 7 / user 300: the invalidation is signed like everything else.
         let invalidate = [0x06, 0x00, 0x00, 0x07, 0x00, 0x01, 0x2C];
         assert_eq!(
             compute_hash(secret, &nonce, 0, &invalidate).unwrap(),
-            [0x82, 0xE1, 0xEA, 0x44, 0x84, 0xB5, 0x90, 0x74]
+            [0x04, 0xEA, 0x41, 0xB9, 0x79, 0x38, 0x55, 0x50]
         );
     }
 }

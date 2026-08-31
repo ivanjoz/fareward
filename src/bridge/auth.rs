@@ -157,7 +157,7 @@ mod tests {
     /// Vector 1 of the colbin set: company 7, user 42, created 1234, user "tester", whose
     /// Hash field was computed by Go's `core.ComputeUsuarioTokenHash` with TEST_SECRET. If
     /// this passes, the Rust and Go session-token HMACs agree byte for byte. Printed by
-    /// `go run ./auth_limiter/vectors`, which is also where token.rs's vectors come from.
+    /// `go run ./fareward/vectors`, which is also where token.rs's vectors come from.
     const GO_SESSION_TOKEN: &str = "Q5mjBvVTyUTj9mc7Ts4bJyNY1FI+iZwkAv4B";
 
     #[test]

@@ -5,7 +5,8 @@ How one HTTP request becomes a charge, who decides what, and where the numbers e
 multiplexing or the extra pool.
 
 The reference material is split across `README.md` — "Authentication", "Rate limiter behavior",
-"TCP contract", "Access management and authorization", "Extra credits", "Go charging rules". This
+"TCP contract", "Access management and authorization", "Extra credits", "Charging rules in the Go
+client". This
 document is the flow those sections are pieces of.
 
 ---
@@ -44,7 +45,7 @@ implies. It answers "does this user hold any of these four packed grants".
 ## 2. Who talks to whom
 
 ```
-browser              backend (Go, Lambda or VPS)            auth-limiter (Rust daemon)
+browser              backend (Go, Lambda or VPS)            fareward (Rust daemon)
    │                          │                                       │
    │── GET api/productos ────▶│                                       │
    │                          │  CheckUser: token only, no DB         │
@@ -68,7 +69,7 @@ browser              backend (Go, Lambda or VPS)            auth-limiter (Rust d
 ```
 
 Both processes must be deployed together: the frame HMAC is domain-separated by version
-(`genix-server-utils:v6`), so a mismatched pair fails every frame.
+(`fareward:v7`), so a mismatched pair fails every frame.
 
 ---
 
@@ -422,7 +423,7 @@ use.
 | `detail = 0` when access *was* asked | Treated as unavailability | Failing open would unauthorize every gated route on a version drift |
 | ScyllaDB read fails mid-admission | Admission fails cleanly | The platform row is loaded *before* any counter is mutated, so nothing is charged half-way |
 | Daemon restart | Counters recovered by summing usage rows | Up to one flush interval of usage is lost — the same window for every counter |
-| Backend/daemon version mismatch | Every frame fails the HMAC | Domain separation (`:v6`) makes it loud instead of subtly wrong |
+| Backend/daemon version mismatch | Every frame fails the HMAC | Domain separation (`:v7`) makes it loud instead of subtly wrong |
 | No budget row for the company | **Everything refused** | `StoredBudget::default()` is `daily = 0`, and `exceeds(0, 2, 0)` is true. Nothing seeds this row at company creation — only the SaaS panel writes it. This is the most common "out of credit" state there is, and the extra pool is what makes it survivable |
 
 ---
@@ -432,16 +433,16 @@ use.
 | Concern | File |
 |---|---|
 | The gate, the catalogue, the tariff | `backend/main-handlers.go` — `enforceAccessAndCredits`, `resolveRouteAccess`, `chargedMethodFor`, `chargeGetResponseTopUp` |
-| Frame encoding, tariff arithmetic, reply decoding | `backend/core/auth_limiter/credits.go` |
-| Access invalidation (`0x06`) | `backend/core/auth_limiter/access_invalidation.go`, called from `backend/security/shared.go` |
+| Frame encoding, tariff arithmetic, reply decoding | `backend/core/fareward/credits.go` |
+| Access invalidation (`0x06`) | `backend/core/fareward/access_invalidation.go`, called from `backend/security/shared.go` |
 | Packed grant construction | `backend/core/responses.go` — `MakeAccesoNivelPacked` |
-| Wire codec | `auth_limiter/src/limiter/protocol.rs` |
-| Grant cache, codec, verdict | `auth_limiter/src/limiter/access.rs` |
-| The decision and every counter | `auth_limiter/src/limiter/quota.rs` — `admit_at` |
-| Blob encoding | `auth_limiter/src/limiter/credits_blob.rs` |
-| Time frames and the UTC-5 offset | `auth_limiter/src/limiter/time_frame.rs` |
-| ScyllaDB statements | `auth_limiter/src/limiter/storage.rs` |
-| Opcode dispatch, reply construction | `auth_limiter/src/service/server.rs`, `protocol.rs`, `auth.rs` |
+| Wire codec | `fareward/src/limiter/protocol.rs` |
+| Grant cache, codec, verdict | `fareward/src/limiter/access.rs` |
+| The decision and every counter | `fareward/src/limiter/quota.rs` — `admit_at` |
+| Blob encoding | `fareward/src/limiter/credits_blob.rs` |
+| Time frames and the UTC-5 offset | `fareward/src/limiter/time_frame.rs` |
+| ScyllaDB statements | `fareward/src/limiter/storage.rs` |
+| Opcode dispatch, reply construction | `fareward/src/service/server.rs`, `protocol.rs`, `auth.rs` |
 | Panel reporting | `backend/config/company_credit_usage.go`, `company_credit_budget.go` |
 
 ### The tests that hold the contracts

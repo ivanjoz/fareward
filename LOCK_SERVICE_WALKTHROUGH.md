@@ -53,7 +53,7 @@ B and C are not wrong to be refused — they are the abuse pattern. What matters
 ## 3. Who talks to whom
 
 ```
-browser                backend (Go, Lambda)              auth-limiter (Rust daemon)
+browser                backend (Go, Lambda)              fareward (Rust daemon)
    │                          │                                    │
    │── POST p-signup-request ▶│                                    │
    │                          │──── TCP connect ──────────────────▶│
@@ -102,7 +102,7 @@ The opcode is a routing header only — the three operations share no field:
 | `0x02` | `LOCK_ACQUIRE` | action u16 · identifier i64 · max_waiters u8 · wait_ms u16 · lease_ms u16 | 24 B |
 | `0x03` | `LOCK_RELEASE` | — (the connection identifies the lock) | 9 B |
 
-`HMAC = SHA256(internal_apikey, "genix-server-utils:v2" ‖ nonce ‖ sequence_be64 ‖ opcode+payload)`,
+`HMAC = SHA256(internal_apikey, "fareward:v7" ‖ nonce ‖ sequence_be64 ‖ opcode+payload)`,
 truncated to 8 bytes. The sequence counts frames on this connection and both sides increment it
 in lockstep, so a frame cannot be replayed even as itself.
 
@@ -148,7 +148,7 @@ Client IP `203.0.113.45`, first frame on a fresh connection (sequence 0).
 core.AcquireLock(ctx, core.ActionSignUpByIP /* =1 */, 3405803821, 2 /* max waiters */)
 
 // wait (5s, how long we will queue) and lease (15s, the daemon's deadline on us while we
-// hold) are constants in backend/core/auth_limiter/locks.go, not per-call-site knobs.
+// hold) are constants in backend/core/fareward/locks.go, not per-call-site knobs.
 ```
 
 **Step 3 — the frame on the wire.** 24 bytes:
@@ -164,7 +164,7 @@ core.AcquireLock(ctx, core.ActionSignUpByIP /* =1 */, 3405803821, 2 /* max waite
  └───────────────────────────────────────────────────── opcode LOCK_ACQUIRE
 ```
 
-**Step 4 — the daemon decides.** `auth_limiter/src/lock/registry.rs:82`
+**Step 4 — the daemon decides.** `fareward/src/lock/registry.rs:82`
 
 ```
 key = (1, 3405803821)
@@ -283,7 +283,7 @@ with a `Lost()` channel. That channel closes both when the connection dies and w
 elapses, and it is advisory either way: under a partition the holder may already be past the
 check, so work inside a lock must stay idempotent regardless.
 
-Each of these wire changes bumps the HMAC domain (`:v2` today, `:v3` when release widens).
+Each of these wire changes bumps the HMAC domain (`:v7` today, `:v8` when release widens).
 Replies are not signed, so a version skew cannot be caught by the signature — bumping the domain
 turns a mismatched peer into an immediate authentication failure instead of a client silently
 misreading a reply that grew under it.

@@ -1,6 +1,6 @@
 // A module of its own, so the vector generator can depend on colbin without
 // joining the backend's module graph.
-module github.com/ivanjoz/auth-limiter/vectors
+module github.com/ivanjoz/fareward/vectors
 
 go 1.27
 
