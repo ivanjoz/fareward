@@ -130,6 +130,11 @@ provider output. The Rust service trusts these authenticated quantities and does
 
 ### 4.3 Frame authentication
 
+> **Superseded.** The tag is a domain-separated SipHash-2-4 over `fareward:v8`, not a truncated
+> HMAC-SHA256 over `genix-rate-limiter:v1`, and it covers a wider frame than the 19 bytes below.
+> `src/siphash.rs` and `src/service/auth.rs` are the current definition; the rest of this section
+> is the original design.
+
 The 64-bit hash is the first eight bytes of a domain-separated HMAC-SHA256:
 
 ```text

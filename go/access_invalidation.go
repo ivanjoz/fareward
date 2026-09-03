@@ -8,7 +8,7 @@ import (
 
 // Opcode 0x06: drop a user's cached authorization grants.
 //
-//	[opcode:1][company:u24][user:u24][hmac:8]
+//	[opcode:1][company:u24][user:u24][tag:8]
 //
 // The daemon caches `users.accesos_computed` for ten minutes so it can answer the route gate without
 // reading ScyllaDB. This is what keeps that TTL a backstop rather than the mechanism: the backend

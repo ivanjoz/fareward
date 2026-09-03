@@ -68,8 +68,8 @@ browser              backend (Go, Lambda or VPS)            fareward (Rust daemo
                                                      company_credit_budget
 ```
 
-Both processes must be deployed together: the frame HMAC is domain-separated by version
-(`fareward:v7`), so a mismatched pair fails every frame.
+Both processes must be deployed together: the frame tag is domain-separated by version
+(`fareward:v8`), so a mismatched pair fails every frame.
 
 ---
 
@@ -153,7 +153,7 @@ measured response.
 ### Handshake
 
 On accept, the daemon writes **eight random bytes**. Every later frame is
-`[opcode:1][payload][hmac:8]`, big-endian, the tag bound to the nonce *and* to the frame's sequence
+`[opcode:1][payload][tag:8]`, big-endian, the tag bound to the nonce *and* to the frame's sequence
 number.
 
 ### Request frame — 29 bytes
@@ -161,7 +161,7 @@ number.
 ```
  offset  0        3        6      8      10       12                    20
         ┌────────┬────────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
-opcode  │company │  user  │route │ cpu  │infer │ acc0 │ acc1 │ acc2 │ acc3 │  hmac
+opcode  │company │  user  │route │ cpu  │infer │ acc0 │ acc1 │ acc2 │ acc3 │  tag 
  0x01   │  u24   │  u24   │ u16  │ u16  │ u16  │ u16  │ u16  │ u16  │ u16  │  8 bytes
         └────────┴────────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
@@ -172,7 +172,7 @@ The real pinned vector, from `TestChargeFrameMatchesTheRustAuthVector` and its R
 ```
 01 12 34 56 00 00 2A 00 67 01 2C 00 19 01 39 00 8B 00 00 00 00 0F 13 FA B1 DE F3 CA A8
 │  └──┬───┘ └──┬───┘ └─┬─┘ └─┬─┘ └─┬─┘ └─┬─┘ └─┬─┘ └─┬─┘ └─┬─┘ └────────┬─────────┘
-│   company    user   route  cpu  infer  acc0  acc1  acc2  acc3       hmac
+│   company    user   route  cpu  infer  acc0  acc1  acc2  acc3       tag
 │   0x123456    42     103   300    25   0x139 0x8B    —     —
 └─ CHARGE_CREDITS
 ```
@@ -423,7 +423,7 @@ use.
 | `detail = 0` when access *was* asked | Treated as unavailability | Failing open would unauthorize every gated route on a version drift |
 | ScyllaDB read fails mid-admission | Admission fails cleanly | The platform row is loaded *before* any counter is mutated, so nothing is charged half-way |
 | Daemon restart | Counters recovered by summing usage rows | Up to one flush interval of usage is lost — the same window for every counter |
-| Backend/daemon version mismatch | Every frame fails the HMAC | Domain separation (`:v7`) makes it loud instead of subtly wrong |
+| Backend/daemon version mismatch | Every frame fails the tag | Domain separation (`:v8`) makes it loud instead of subtly wrong |
 | No budget row for the company | **Everything refused** | `StoredBudget::default()` is `daily = 0`, and `exceeds(0, 2, 0)` is true. Nothing seeds this row at company creation — only the SaaS panel writes it. This is the most common "out of credit" state there is, and the extra pool is what makes it survivable |
 
 ---

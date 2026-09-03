@@ -88,7 +88,7 @@ frame captured on one connection cannot be replayed on another.
 
 ```
         ┌────────┬──────────────────────────┬──────────────┐
-        │ opcode │        payload           │  HMAC (8)    │
+        │ opcode │        payload           │   tag (8)    │
         │  1 B   │   width fixed per opcode │              │
         └────────┴──────────────────────────┴──────────────┘
          └──────── signed together ────────┘
@@ -102,7 +102,7 @@ The opcode is a routing header only — the three operations share no field:
 | `0x02` | `LOCK_ACQUIRE` | action u16 · identifier i64 · max_waiters u8 · wait_ms u16 · lease_ms u16 | 24 B |
 | `0x03` | `LOCK_RELEASE` | — (the connection identifies the lock) | 9 B |
 
-`HMAC = SHA256(internal_apikey, "fareward:v7" ‖ nonce ‖ sequence_be64 ‖ opcode+payload)`,
+`tag = SipHash-2-4(SHA-256(internal_apikey)[..16], "fareward:v8" ‖ nonce ‖ sequence_be64 ‖ opcode+payload)`,
 truncated to 8 bytes. The sequence counts frames on this connection and both sides increment it
 in lockstep, so a frame cannot be replayed even as itself.
 
@@ -116,7 +116,7 @@ in lockstep, so a frame cannot be replayed even as itself.
 ```
 
 `correlation` is the low 16 bits of the request's sequence, echoed back. Nothing extra is sent to
-carry it — the sequence already exists for the HMAC. Today only one request is ever in flight, so
+carry it — the sequence already exists for the tag. Today only one request is ever in flight, so
 it is a desync check; under multiplexing it is what routes a reply to the right caller.
 
 `status` — `0` always means success:
@@ -154,7 +154,7 @@ core.AcquireLock(ctx, core.ActionSignUpByIP /* =1 */, 3405803821, 2 /* max waite
 **Step 3 — the frame on the wire.** 24 bytes:
 
 ```
- 02 │ 00 01 │ 00 00 00 00 CB 00 71 2D │ 02 │ 13 88 │ 3A 98 │ <8-byte HMAC>
+ 02 │ 00 01 │ 00 00 00 00 CB 00 71 2D │ 02 │ 13 88 │ 3A 98 │ <8-byte tag>
  ▲    ▲       ▲                         ▲    ▲       ▲
  │    │       │                         │    │       └─ lease_ms  = 15000
  │    │       │                         │    └───────── wait_ms   = 5000
@@ -194,7 +194,7 @@ send the verification mail       (≤4s connect + ≤6s send)
 INSERT the sign_up_request row
 ```
 
-**Step 7 — release.** 9 bytes, `03 │ <HMAC>`. No payload: the connection identifies the lock.
+**Step 7 — release.** 9 bytes, `03 │ <tag>`. No payload: the connection identifies the lock.
 
 Meanwhile B, queued at step 4, is handed the permit the instant A releases, and its step 6 count
 now includes A's row.
@@ -236,7 +236,7 @@ the race rare and orderly, it is not a correctness guarantee on its own.
 |---|---|
 | Listener, handshake, opcode dispatch | `src/service/server.rs:94` |
 | Opcode table, frame widths, reply encoding | `src/service/protocol.rs` |
-| Frame HMAC | `src/service/auth.rs` |
+| Frame tag | `src/service/auth.rs`, `src/siphash.rs` |
 | Key registry, queueing, FIFO, pruning | `src/lock/registry.rs:82` |
 | Acquire payload codec | `src/lock/protocol.rs` |
 | Go client, connection pool, typed errors | `backend/core/lock_service.go:140` |
@@ -283,7 +283,7 @@ with a `Lost()` channel. That channel closes both when the connection dies and w
 elapses, and it is advisory either way: under a partition the holder may already be past the
 check, so work inside a lock must stay idempotent regardless.
 
-Each of these wire changes bumps the HMAC domain (`:v7` today, `:v8` when release widens).
+Each of these wire changes bumps the tag domain (`:v8` today, `:v9` when release widens).
 Replies are not signed, so a version skew cannot be caught by the signature — bumping the domain
 turns a mismatched peer into an immediate authentication failure instead of a client silently
 misreading a reply that grew under it.

@@ -28,9 +28,8 @@ use fareward::{
     lock::registry::{LockLimits, LockRegistry},
     reqlog::{protocol::REQUEST_LOG_MAX_PAYLOAD_SIZE, writer::RequestLogSink},
     service::server,
+    siphash::{SipHasher24, derive_key},
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -170,12 +169,12 @@ impl Client {
     async fn write_frame(&mut self, opcode: u8, body: &[u8]) {
         let mut frame = vec![opcode];
         frame.extend_from_slice(body);
-        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET).unwrap();
-        mac.update(b"fareward:v7");
-        mac.update(&self.nonce);
-        mac.update(&self.sequence.to_be_bytes());
-        mac.update(&frame);
-        frame.extend_from_slice(&mac.finalize().into_bytes()[..8]);
+        let mut hasher = SipHasher24::new(&derive_key(SECRET));
+        hasher.write(b"fareward:v9");
+        hasher.write(&self.nonce);
+        hasher.write(&self.sequence.to_be_bytes());
+        hasher.write(&frame);
+        frame.extend_from_slice(&hasher.finish().to_be_bytes());
         self.sequence += 1;
         self.socket.write_all(&frame).await.unwrap();
     }

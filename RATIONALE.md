@@ -1,25 +1,48 @@
-## This repository builds and publishes its own release binaries
+## SipHash-2-4 for the internal tags, keyed BLAKE2s-128 for the session token
 
-**Context** — The crate lived here but nothing here built it. `genix`'s
-`release-binaries.yml` compiled both architectures, and its `plan`/`reuse` jobs existed only to
-work around the mismatch: a `genix` tag usually means the backend changed and this crate did not,
-so the workflow diffed the recorded gitlink and re-downloaded the previous tag's assets to avoid
-starting two Rust runners for an unchanged crate. A repository that ships a binary could not
-produce that binary on its own.
+**Context** — Three relationships were authenticated with HMAC-SHA256 and none of them wanted a
+256-bit digest. The raw-TCP frame tag threw away 24 of its 32 bytes on every frame; the browser
+session token's `Hash` was a `u64` and took the first eight bytes of a digest; only the bridge's
+`X-Bridge-Auth` header carried the whole thing. All three are short, keyed, secret-only
+authentications of a few dozen bytes — the case a Merkle–Damgård hash with an ipad/opad wrapper
+suits least. But they are not the same *kind* of secret, which is what decided the outcome.
 
-**Decision** — `.github/workflows/release-binaries.yml` here builds `fareward_linux_amd64` and
-`fareward_linux_arm64` on `push` of a `v*` tag (plus `workflow_dispatch` for validation), and
-publishes them with a `SHA256SUMS` manifest as a release of this repository. Two native runners,
-`ubuntu-24.04` and `ubuntu-24.04-arm`, so `cargo test` runs on the architecture it ships for
-instead of only cross-compiling for it. `genix` deleted its three fareward jobs and its
-deployer now fetches these assets from here.
+**Decision** — Two primitives, split by who holds the credential.
 
-**Rationale** — The reuse machinery becomes unnecessary rather than merely simpler: in this
-repository a `v*` tag exists only because this crate changed, so there is never an unchanged build
-to skip. The costs are real and accepted: releasing is now two tags instead of one, and a host that
-takes the backend and the daemon together resolves two `latest` releases that no single tag pins
-to each other. The wire protocol is what actually constrains that pairing, and it has its own
-version in the HMAC domain — see the rename entry below.
+`src/siphash.rs` and `go/siphash/` implement SipHash-2-4 incrementally, used for the two internal
+tags: `fareward:v8` for the frame tag and `sse-bridge:v2` for the service header, both 64-bit, keyed
+by `SHA-256(secret)[..16]`. The session token instead uses **keyed BLAKE2s-128** under
+`usrToken:v3`, keyed by the full `SHA-256(secret_phrase)` — 32 bytes, exactly BLAKE2s' maximum. Its
+`Hash` field widened from `uint64` to 16 bytes, so `core.UsuarioToken` and the Rust `UserToken`
+carry `[]byte`/`[u8; 16]` and the colbin field became `Kind::Bytes`. The `hmac` crate is gone;
+`sha2` stays for key derivation. `backend/core/usuario-accesos.go` and `backend/agent/bridge.go` are
+the mirrors in the parent repository and moved in the same change.
+
+**Rationale** — 64 bits is right for the internal tags and wrong for the token. The frame tag and
+the service header are verified by exactly one rate-limited peer on a loopback or private path, and
+the header additionally expires in 300 s; blind forgery at 2^-64 per attempt is not a threat there,
+and both were already 64-bit on the wire. The session token is the opposite: a long-lived bearer
+credential held by an untrusted party, carrying no random component — company, user, `created` and
+username are all guessable — so the tag is not integrity protection over a secret, it *is* the
+credential, and its width is the session's entire strength. 64 bits sat exactly on the floor NIST
+sets for session secrets, below what every mainstream signed-token format uses. Keyed BLAKE2s-128 is
+a purpose-built 128-bit MAC rather than a 256-bit digest truncated to fit; `x/crypto` refuses to
+construct `New128` without a key for precisely this reason, and RustCrypto's `Blake2sMac<U16>`
+agrees with it byte for byte — pinned in `src/bridge/auth.rs` against `x/crypto`'s own `hashes128`
+table, since BLAKE2 folds digest and key length into its parameter block and a mismatch there would
+be invisible until every browser was rejected.
+
+SipHash is hand-written on both sides rather than taken from a crate: `go/` is a stdlib-only module
+by policy, so one side had to be written here anyway, and two implementations that must agree are
+easier to keep honest when they read the same way. Each is pinned against the 64 reference vectors
+from the SipHash paper. BLAKE2s is *not* hand-written — it is the one tag a user holds, so both
+sides use a vetted library. Widening the token also closed a latent hazard: colbin omits a
+zero-valued field, so a token issued with an empty `Hash` carries no hash at all, and the decoder
+now refuses it rather than reading sixteen zeros into the comparison.
+
+The costs, accepted: all three domain bumps are breaking at once, so the daemon and the backend must
+deploy together and every live browser session logs in again; the token grew 8 bytes; and the
+backend gained `golang.org/x/crypto` as a direct dependency.
 
 ## The crate, the config section and the systemd units all take the fareward name
 
@@ -42,7 +65,7 @@ remembers why it is there:
   `backend/core/fareward/connection.go`. Renaming it is not a frame-format change, but it
   invalidates every tag a peer still signing `genix-server-utils:v6` produces — so it spends a
   version bump rather than pretending not to. That is what the bump buys: the skew fails the first
-  frame's HMAC loudly instead of leaving two incompatible protocols both calling themselves `:v6`.
+  frame's tag loudly instead of leaving two incompatible protocols both calling themselves `:v6`.
   Backend and daemon must cross this boundary in a single deploy.
 - The metrics columns are now `fareward_mem_mb` / `fareward_cpu_percent` in
   `src/sysmetrics/writer.rs`, matching the Go fields that define them. This is a schema change on a
@@ -141,5 +164,5 @@ the crate widened first, which is a decision better taken when there is a caller
 
 The vectors moved with the decoder. `token.rs`, `auth.rs` and `tests/bridge_http.rs` each carried the
 same stale `0x01` hex message; all three now carry the base64 the Go generator prints, and the one in
-`auth.rs` still proves the Rust and Go token HMACs agree byte for byte, since its `Hash` field was
+`auth.rs` still proves the Rust and Go token hashes agree byte for byte, since its `Hash` field was
 computed by `core.ComputeUsuarioTokenHash` with the same test secret.

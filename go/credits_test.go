@@ -71,18 +71,20 @@ func TestAFrameNeedsCreditsOrARequiredAccess(t *testing.T) {
 // which must fail closed: failing open would silently unauthorize every gated route the moment the
 // two binaries drifted apart.
 func TestAccessVerdictDecoding(t *testing.T) {
-	if err := decodeAccessResponse(0, false); err != nil {
+	if _, err := decodeAccessResponse(0, nil, false); err != nil {
 		t.Fatalf("an unrequested check reported %v", err)
 	}
-	if err := decodeAccessResponse(1, true); err != nil {
-		t.Fatalf("a granted check reported %v", err)
+	// Granted, slot 0, no sub-accesses.
+	grant, err := decodeAccessResponse(1|(0b1<<3), nil, true)
+	if err != nil || grant == nil || grant.GrantedSlots != 0b1 {
+		t.Fatalf("a granted check decoded to %+v, %v", grant, err)
 	}
 
 	for _, check := range []struct {
 		detail         uint16
 		identityFailed bool
 	}{{2, false}, {3, true}, {4, true}} {
-		err := decodeAccessResponse(check.detail, true)
+		_, err := decodeAccessResponse(check.detail, nil, true)
 		denied, ok := err.(*AccessDenied)
 		if !ok {
 			t.Fatalf("detail %d decoded as %T: %v", check.detail, err, err)
@@ -97,9 +99,53 @@ func TestAccessVerdictDecoding(t *testing.T) {
 	}
 
 	// A daemon that ignored the slots, and one that answered something invented.
-	for _, detail := range []uint16{0, 5, 65535} {
-		if err := decodeAccessResponse(detail, true); !errors.Is(err, ErrFarewardUnavailable) {
+	for _, detail := range []uint16{0, 5, 7} {
+		if _, err := decodeAccessResponse(detail, nil, true); !errors.Is(err, ErrFarewardUnavailable) {
 			t.Fatalf("detail %d decoded as %v; want unavailability", detail, err)
+		}
+	}
+}
+
+// The masks and the tail describe each other, so every way they can disagree is a desynchronized
+// pair of binaries — refused, because half-reading the tail attributes one access's sub-accesses to
+// another.
+func TestAccessGrantSplitsTheReplyTailPerSlot(t *testing.T) {
+	// Slots 0 and 2 granted; only slot 2 carries sub bytes, and its run is two bytes long.
+	detail := uint16(1) | (0b101 << 3) | (0b100 << 7)
+	grant, err := decodeAccessResponse(detail, []byte{0x81, 0x20}, true)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if grant.GrantedSlots != 0b101 {
+		t.Fatalf("GrantedSlots = %b; want 101", grant.GrantedSlots)
+	}
+	if len(grant.SubAccesoBytes) != 1 ||
+		!bytes.Equal(grant.SubAccesoBytes[2], []byte{0x81, 0x20}) {
+		t.Fatalf("SubAccesoBytes = %v", grant.SubAccesoBytes)
+	}
+
+	// Two slots, two runs, split at the MORE bit rather than in the middle.
+	detail = uint16(1) | (0b11 << 3) | (0b11 << 7)
+	grant, err = decodeAccessResponse(detail, []byte{0x06, 0x81, 0x20}, true)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if !bytes.Equal(grant.SubAccesoBytes[0], []byte{0x06}) ||
+		!bytes.Equal(grant.SubAccesoBytes[1], []byte{0x81, 0x20}) {
+		t.Fatalf("runs split wrongly: %v", grant.SubAccesoBytes)
+	}
+
+	for name, check := range map[string]struct {
+		detail uint16
+		extra  []byte
+	}{
+		"sub-accesses on an ungranted slot": {uint16(1) | (0b1 << 3) | (0b10 << 7), []byte{0x01}},
+		"tail ends mid run":                 {uint16(1) | (0b1 << 3) | (0b1 << 7), []byte{0x81}},
+		"tail longer than the mask claims":  {uint16(1) | (0b1 << 3) | (0b1 << 7), []byte{0x01, 0x02}},
+		"tail present with no marked slot":  {uint16(1) | (0b1 << 3), []byte{0x01}},
+	} {
+		if _, err := decodeAccessResponse(check.detail, check.extra, true); err == nil {
+			t.Errorf("%s was accepted", name)
 		}
 	}
 }
@@ -239,14 +285,14 @@ func TestChargeFrameMatchesTheRustAuthVector(t *testing.T) {
 	want := []byte{
 		0x01, 0x12, 0x34, 0x56, 0x00, 0x00, 0x2A, 0x00, 0x67, 0x01, 0x2C, 0x00, 0x19, 0x01,
 		0x39, 0x00, 0x8B, 0x00, 0x00, 0x00, 0x00,
-		0x51, 0x2A, 0x79, 0x02, 0x61, 0x0E, 0xA0, 0xCE,
+		0xD2, 0xA6, 0x9B, 0x95, 0xEC, 0x5E, 0x0C, 0x94,
 	}
 	if !bytes.Equal(frame, want) {
 		t.Fatalf("charge frame = % X; want % X", frame, want)
 	}
 	// The tag is bound to the sequence, so frame two of a connection differs in its last eight bytes.
 	next := buildFarewardFrame(secret, &nonce, 1, opcodeChargeCredits, payload)
-	wantTag := []byte{0x36, 0x7A, 0xF0, 0xEA, 0x23, 0xBA, 0x00, 0xE8}
+	wantTag := []byte{0xF1, 0x7B, 0x93, 0xF3, 0xA4, 0x9D, 0x7D, 0x3E}
 	if !bytes.Equal(next[len(next)-farewardAuthTagSize:], wantTag) {
 		t.Fatalf("sequence 1 tag = % X; want % X", next[len(next)-farewardAuthTagSize:], wantTag)
 	}
@@ -262,7 +308,7 @@ func TestAccessInvalidationFrameMatchesTheRustAuthVector(t *testing.T) {
 	frame := buildFarewardFrame([]byte("test-secret"), &nonce, 0, opcodeInvalidateUserAccess, payload)
 	want := []byte{
 		0x06, 0x00, 0x00, 0x07, 0x00, 0x01, 0x2C,
-		0x04, 0xEA, 0x41, 0xB9, 0x79, 0x38, 0x55, 0x50,
+		0xB7, 0x90, 0xDA, 0x17, 0xF1, 0x4C, 0xCD, 0x92,
 	}
 	if !bytes.Equal(frame, want) {
 		t.Fatalf("invalidation frame = % X; want % X", frame, want)
@@ -282,21 +328,21 @@ func TestAccessInvalidationFrameMatchesTheRustAuthVector(t *testing.T) {
 // difference is the whole exemption, and it is what keeps company 1 usable when the limiter
 // says the tenant is out of credit.
 func TestTheOperatorCompanyIsExemptFromCreditBudgets(t *testing.T) {
-	if err := chargeConfiguredCredits(
+	if _, err := chargeConfiguredCredits(
 		context.Background(), CreditExemptCompanyID, 1, 10, 5, 0, nil, false,
 	); err != nil {
 		t.Fatalf("the exempt company must not be charged, got %v", err)
 	}
 
 	// Any other tenant still reaches the limiter, so the exemption is not a global bypass.
-	if err := chargeConfiguredCredits(
+	if _, err := chargeConfiguredCredits(
 		context.Background(), CreditExemptCompanyID+1, 1, 10, 5, 0, nil, false,
 	); err == nil {
 		t.Fatal("a non-exempt company must still be metered")
 	}
 
 	// Inference credits go through the same seam, so the agent is exempt too.
-	if err := chargeConfiguredCredits(
+	if _, err := chargeConfiguredCredits(
 		context.Background(), CreditExemptCompanyID, 1, 10, 0, 500, nil, false,
 	); err != nil {
 		t.Fatalf("inference credits must be exempt as well, got %v", err)
@@ -306,7 +352,7 @@ func TestTheOperatorCompanyIsExemptFromCreditBudgets(t *testing.T) {
 // Exemption is from the budget, not from permissions: a frame that still has an access to
 // check must reach the daemon rather than be short-circuited to nil.
 func TestTheExemptCompanyIsStillAuthorized(t *testing.T) {
-	err := chargeConfiguredCredits(
+	_, err := chargeConfiguredCredits(
 		context.Background(), CreditExemptCompanyID, 1, 10, 5, 0, []uint16{9}, false)
 	if err == nil {
 		t.Fatal("an access check must still be sent for the exempt company")

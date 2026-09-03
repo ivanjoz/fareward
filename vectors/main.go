@@ -12,7 +12,6 @@
 package main
 
 import (
-	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -20,6 +19,8 @@ import (
 	"strings"
 
 	"github.com/ivanjoz/colbin"
+	"github.com/ivanjoz/fareward/go/siphash"
+	"golang.org/x/crypto/blake2s"
 )
 
 // UsuarioToken mirrors backend/core.UsuarioToken minus its json tags, which
@@ -29,7 +30,7 @@ type UsuarioToken struct {
 	CompanyID int32
 	ID        int32
 	Created   int32
-	Hash      uint64
+	Hash      []byte
 	User      string
 }
 
@@ -37,18 +38,31 @@ type UsuarioToken struct {
 // deployed key.
 const testSecret = "K1OzWIN0yarCc9ge"
 
-// computeHash is core.ComputeUsuarioTokenHash: the token's own HMAC, which the
-// bridge recomputes to prove the identity was issued by the backend.
-func computeHash(token UsuarioToken) uint64 {
-	mac := hmac.New(sha256.New, []byte(testSecret))
+// computeHash is core.ComputeUsuarioTokenHash: the token's own keyed BLAKE2s-128
+// tag, which the bridge recomputes to prove the identity was issued by the backend.
+func computeHash(token UsuarioToken) []byte {
 	payload := make([]byte, 12)
 	binary.BigEndian.PutUint32(payload[0:4], uint32(token.CompanyID))
 	binary.BigEndian.PutUint32(payload[4:8], uint32(token.ID))
 	binary.BigEndian.PutUint32(payload[8:12], uint32(token.Created))
-	mac.Write([]byte("usrToken:v1"))
-	mac.Write(payload)
-	mac.Write([]byte(token.User))
-	return binary.BigEndian.Uint64(mac.Sum(nil)[:8])
+
+	tokenKey := sha256.Sum256([]byte(testSecret))
+	hasher, err := blake2s.New128(tokenKey[:])
+	if err != nil {
+		panic(err)
+	}
+	hasher.Write([]byte("usrToken:v3"))
+	hasher.Write(payload)
+	hasher.Write([]byte(token.User))
+	return hasher.Sum(nil)
+}
+
+// makeServiceAuthHeader is backend/agent.makeBridgeServiceAuthHeader at a fixed
+// timestamp: the other value the bridge's Rust tests are pinned against.
+func makeServiceAuthHeader(unixSeconds int64) string {
+	hasher := siphash.New(siphash.DeriveKey([]byte(testSecret)))
+	hasher.WriteString(fmt.Sprintf("sse-bridge:v2|%d", unixSeconds))
+	return fmt.Sprintf("%d.%016x", unixSeconds, hasher.Sum64())
 }
 
 // makeB64UrlEncode is core.MakeB64UrlEncode, the alphabet the backend publishes
@@ -82,10 +96,21 @@ func main() {
 			panic(err)
 		}
 		standard := base64.StdEncoding.EncodeToString(data)
-		fmt.Printf("%-16s %2d B  hash=%d\n", c.name, len(data), c.token.Hash)
+		fmt.Printf("%-16s %2d B  hash=%x\n", c.name, len(data), c.token.Hash)
 		fmt.Printf("  base64      %s\n", standard)
 		fmt.Printf("  url-alphabet %s\n\n", makeB64UrlEncode(standard))
 	}
+
+	// A token whose Hash is empty: colbin omits a zero-valued field entirely, so this payload
+	// carries no hash at all. The bridge must refuse it rather than read sixteen zeros and
+	// compare them, which is the one way a widened tag could be quietly bypassed.
+	hashless, err := colbin.Marshal(UsuarioToken{CompanyID: 7, ID: 42, Created: 1234, User: "tester"})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("hashless token: %s\n", makeB64UrlEncode(base64.StdEncoding.EncodeToString(hashless)))
+
+	fmt.Printf("X-Bridge-Auth at 1700000000: %s\n", makeServiceAuthHeader(1_700_000_000))
 }
 
 // colbinVersion is a label for the printout, so a regenerated vector says which

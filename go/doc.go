@@ -33,7 +33,7 @@
 //
 // # What this package decides, and what it does not
 //
-// It owns the wire: framing, the connection nonce, the sequence-bound HMAC, reply correlation,
+// It owns the wire: framing, the connection nonce, the sequence-bound SipHash tag, reply correlation,
 // and the codecs for each opcode. It also owns the *tariff* — APICPUCredits, APICPUBaseCredits
 // and InferenceCredits — because the daemon charges the credit counts a frame names and does not
 // compute them.

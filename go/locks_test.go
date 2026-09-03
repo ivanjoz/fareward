@@ -126,11 +126,16 @@ func (stub *muxDaemonStub) dropConnections() {
 }
 
 func makeStubReply(sequence uint64, status byte, detail uint16) []byte {
-	reply := make([]byte, farewardReplySize)
+	return makeStubReplyWithExtra(sequence, status, detail, nil)
+}
+
+func makeStubReplyWithExtra(sequence uint64, status byte, detail uint16, extra []byte) []byte {
+	reply := make([]byte, farewardReplyHeadSize, farewardReplyHeadSize+len(extra))
 	binary.BigEndian.PutUint16(reply[0:2], uint16(sequence))
 	reply[2] = status
 	binary.BigEndian.PutUint16(reply[3:5], detail)
-	return reply
+	reply[5] = byte(len(extra))
+	return append(reply, extra...)
 }
 
 func (stub *muxDaemonStub) client() *FarewardClient {
@@ -153,7 +158,7 @@ func TestAcquireAndReleaseFramesMatchTheRustVectors(t *testing.T) {
 	// Pinned byte for byte against service/auth.rs.
 	expected := []byte{
 		0x02, 0x00, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xD6, 0x03, 0x13, 0x88,
-		0x3A, 0x98, 0x10, 0x9D, 0x0A, 0xA7, 0x58, 0x22, 0xCB, 0xD1,
+		0x3A, 0x98, 0x4B, 0xC6, 0x3A, 0x2A, 0xB5, 0x50, 0x44, 0x63,
 	}
 	if frame := <-stub.frames; string(frame) != string(expected) {
 		t.Fatalf("acquire frame = % X; want % X", frame, expected)
@@ -207,7 +212,10 @@ func TestRepliesCorrelateToTheRightCallerOutOfOrder(t *testing.T) {
 
 	// A charge sent afterwards must be answered while the acquire still waits.
 	charged := make(chan error, 1)
-	go func() { charged <- client.Charge(context.Background(), 1, 1, 0, 2, 0, nil, false) }()
+	go func() {
+		_, chargeErr := client.Charge(context.Background(), 1, 1, 0, 2, 0, nil, false)
+		charged <- chargeErr
+	}()
 	select {
 	case err := <-charged:
 		if err != nil {
@@ -317,7 +325,7 @@ func TestAnAbandonedAcquireGrantedLateIsReleasedAutomatically(t *testing.T) {
 
 func TestConcurrentSendersKeepTheSequenceInLockstep(t *testing.T) {
 	// Taking a sequence and writing its frame must be atomic: interleaved writes would
-	// desynchronize the HMAC and every later frame would fail authentication.
+	// desynchronize the tag and every later frame would fail authentication.
 	stub := startMuxDaemonStub(t)
 	client := stub.client()
 
@@ -326,7 +334,7 @@ func TestConcurrentSendersKeepTheSequenceInLockstep(t *testing.T) {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			_ = client.Charge(context.Background(), 1, 1, 0, 1, 0, nil, false)
+			_, _ = client.Charge(context.Background(), 1, 1, 0, 1, 0, nil, false)
 		}()
 	}
 	waitGroup.Wait()

@@ -1,34 +1,43 @@
 //! The bridge's two authentication schemes, each keyed by a different config secret.
 //!
 //!   - The **browser** presents the session token the backend already issued
-//!     (`Authorization: Bearer <token>`). It is self-contained (colbin payload + HMAC), so
+//!     (`Authorization: Bearer <token>`). It is self-contained (colbin payload + tag), so
 //!     identity is verified without touching ScyllaDB. Keyed by `secret_phrase`, because
 //!     that is what signed it.
-//!   - The **backend** presents a timestamped HMAC header (`X-Bridge-Auth`). Keyed by
+//!   - The **backend** presents a timestamped signature (`X-Bridge-Auth`). Keyed by
 //!     `internal_apikey`, the project's service-to-service secret.
+//!
+//! Different primitives on purpose. The session token is a bearer credential held by an
+//! untrusted party, so its tag is keyed BLAKE2s-128 — 128 bits, because the tag *is* the
+//! credential. The service header is SipHash-2-4 like the raw-TCP frame tag: internal, verified
+//! by one peer, and valid for 300 seconds. Each has its own domain string.
 //!
 //! The bridge only establishes *identity*. Permissions stay in the backend, which already
 //! evaluated them when it accepted the turn.
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+use blake2::Blake2sMac;
+use blake2::digest::{KeyInit, Mac, consts::U16};
+use sha2::{Digest, Sha256};
+
 use crate::bridge::token::{TokenError, UserToken, decode_session_base64, decode_session_token};
+use crate::siphash::{SipHasher24, derive_key};
 
 pub const SERVICE_AUTH_HEADER: &str = "X-Bridge-Auth";
 
-/// Domain separation: keeps a service signature from ever validating against another HMAC
-/// the project computes with the same key.
-const SERVICE_AUTH_PREFIX: &str = "sse-bridge:v1|";
+/// Domain separation: keeps a service signature from ever validating against another tag
+/// the project computes with the same key. `:v2` is SipHash-2-4; `:v1` was HMAC-SHA256.
+const SERVICE_AUTH_PREFIX: &str = "sse-bridge:v2|";
 /// Tolerates clock drift between the Lambda and this host while keeping a captured header
 /// from being replayable forever.
 const SERVICE_AUTH_MAX_SKEW_SECONDS: i64 = 300;
-/// Domain separation for the session token, mirroring `core.ComputeUsuarioTokenHash`.
-const SESSION_TOKEN_DOMAIN: &[u8] = b"usrToken:v1";
-
-type HmacSha256 = Hmac<Sha256>;
+/// Domain separation for the session token, mirroring `core.ComputeUsuarioTokenHash`. `:v3` is
+/// keyed BLAKE2s-128; `:v1` was truncated HMAC-SHA256 and `:v2` SipHash-2-4, both 64-bit. A bump
+/// invalidates every token issued under the old one, so backend and daemon deploy together and
+/// every browser session logs in again.
+const SESSION_TOKEN_DOMAIN: &[u8] = b"usrToken:v3";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BridgeAuthError {
@@ -50,25 +59,28 @@ pub enum BridgeAuthError {
     InvalidServiceSignature,
 }
 
-/// Recomputes the session token's own HMAC. Exact mirror of
+/// Recomputes the session token's own keyed hash. Exact mirror of
 /// `core.ComputeUsuarioTokenHash`: any change on the backend must be replicated here, since
 /// a mismatch rejects every client.
-fn compute_user_token_hash(user_token: &UserToken, secret_phrase: &[u8]) -> u64 {
-    let mut mac = HmacSha256::new_from_slice(secret_phrase).expect("HMAC accepts any key length");
+///
+/// Keyed BLAKE2s-128, not the 64-bit tag the frame protocol uses. This token is a bearer
+/// credential held by an untrusted party and carrying no random component of its own, so the tag
+/// *is* the credential and 128 bits is its whole strength. The key is SHA-256 of the phrase:
+/// exactly the 32 bytes BLAKE2s takes at most, with every byte of a configuration string of any
+/// length reaching it.
+fn compute_user_token_hash(user_token: &UserToken, secret_phrase: &[u8]) -> [u8; 16] {
     let mut identity_bytes = [0_u8; 12];
     identity_bytes[0..4].copy_from_slice(&(user_token.company_id as u32).to_be_bytes());
     identity_bytes[4..8].copy_from_slice(&(user_token.id as u32).to_be_bytes());
     identity_bytes[8..12].copy_from_slice(&(user_token.created as u32).to_be_bytes());
+
+    let token_key = Sha256::digest(secret_phrase);
+    let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(&token_key)
+        .expect("BLAKE2s accepts a 32-byte key");
     mac.update(SESSION_TOKEN_DOMAIN);
     mac.update(&identity_bytes);
     mac.update(user_token.user.as_bytes());
-
-    let digest = mac.finalize().into_bytes();
-    u64::from_be_bytes(
-        digest[..8]
-            .try_into()
-            .expect("SHA-256 digests are 32 bytes"),
-    )
+    mac.finalize().into_bytes().into()
 }
 
 /// Verifies the `Authorization: Bearer <token>` header and returns the identity it proves.
@@ -93,11 +105,7 @@ pub fn authenticate_user(
     // Constant-time comparison: a byte-by-byte early exit would leak the expected hash to a
     // caller able to time many attempts.
     let expected_hash = compute_user_token_hash(&user_token, secret_phrase);
-    if !bool::from(
-        expected_hash
-            .to_be_bytes()
-            .ct_eq(&user_token.hash.to_be_bytes()),
-    ) {
+    if !bool::from(expected_hash.ct_eq(&user_token.hash)) {
         return Err(BridgeAuthError::InvalidSessionSignature);
     }
     Ok(user_token)
@@ -106,15 +114,10 @@ pub fn authenticate_user(
 /// Builds the value the backend sends on `X-Bridge-Auth`. Mirrored in
 /// `backend/agent/bridge.go`, which lives in another module and cannot import this one.
 pub fn make_service_auth_header(internal_apikey: &[u8], unix_seconds: i64) -> String {
-    let mut mac = HmacSha256::new_from_slice(internal_apikey).expect("HMAC accepts any key length");
-    mac.update(format!("{SERVICE_AUTH_PREFIX}{unix_seconds}").as_bytes());
-    let signature = mac.finalize().into_bytes();
-
-    let mut header = format!("{unix_seconds}.");
-    for byte in signature.iter() {
-        header.push_str(&format!("{byte:02x}"));
-    }
-    header
+    let mut hasher = SipHasher24::new(&derive_key(internal_apikey));
+    hasher.write(format!("{SERVICE_AUTH_PREFIX}{unix_seconds}").as_bytes());
+    // 16 hex characters, big-endian like every other tag the project puts on a wire.
+    format!("{unix_seconds}.{:016x}", hasher.finish())
 }
 
 /// Validates the backend's signature and its freshness.
@@ -156,9 +159,43 @@ mod tests {
 
     /// Vector 1 of the colbin set: company 7, user 42, created 1234, user "tester", whose
     /// Hash field was computed by Go's `core.ComputeUsuarioTokenHash` with TEST_SECRET. If
-    /// this passes, the Rust and Go session-token HMACs agree byte for byte. Printed by
+    /// this passes, the Rust and Go session-token hashes agree byte for byte. Printed by
     /// `go run ./fareward/vectors`, which is also where token.rs's vectors come from.
-    const GO_SESSION_TOKEN: &str = "Q5mjBvVTyUTj9mc7Ts4bJyNY1FI+iZwkAv4B";
+    const GO_SESSION_TOKEN: &str = "Q5mjBvVTyUQDaLS4vr/KsJBDHJKqXvm3lFUt5ZPISSLgHw==";
+
+    /// The official keyed BLAKE2s-128 vectors, taken from `golang.org/x/crypto/blake2s`'s own
+    /// `hashes128` test table: key `00 01 … 1f`, message `00 01 … n-1`.
+    ///
+    /// This is what proves `Blake2sMac<U16>` here and `blake2s.New128` in Go are the same
+    /// function. BLAKE2 folds the digest length and the key length into its parameter block, so
+    /// BLAKE2s-128 keyed is *not* BLAKE2s-256 truncated — a mismatch would be invisible until
+    /// every browser was rejected.
+    #[test]
+    fn matches_the_official_blake2s_128_keyed_vectors() {
+        const OFFICIAL_VECTORS: [(usize, &str); 11] = [
+        (0, "9536f9b267655743dee97b8a670f9f53"),
+        (1, "13bacfb85b48a1223c595f8c1e7e82cb"),
+        (2, "d47a9b1645e2feae501cd5fe44ce6333"),
+        (31, "d114cc11e7d5b33a360c45f18d4c7c6e"),
+        (32, "c43b5e836af88620a8a71b1652cb8640"),
+        (33, "9491c653e8867ed73c1b4ac6b5a9bb4d"),
+        (63, "ece382a8bd5018f1de5da44b72cea75b"),
+        (64, "f1efa90d2547036841ecd3627fafbc36"),
+        (65, "811ff8686d23a435ecbd0bdafcd27b1b"),
+        (127, "25887fab1422700d7fa3edc0b20206e2"),
+        (128, "8c09f698d03eaf88abf69f8147865ef6"),
+        ];
+
+        let key: [u8; 32] = core::array::from_fn(|index| index as u8);
+        for (length, expected_hex) in OFFICIAL_VECTORS {
+            let message: Vec<u8> = (0..length).map(|index| index as u8).collect();
+            let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(&key).unwrap();
+            mac.update(&message);
+            let tag: [u8; 16] = mac.finalize().into_bytes().into();
+            let tag_hex: String = tag.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(tag_hex, expected_hex, "length {length}");
+        }
+    }
 
     #[test]
     fn accepts_the_go_issued_session_token() {
@@ -175,6 +212,21 @@ mod tests {
         assert_eq!(
             authenticate_user(Some(&format!("Bearer {GO_SESSION_TOKEN}")), b"otro-secreto"),
             Err(BridgeAuthError::InvalidSessionSignature)
+        );
+    }
+
+    /// colbin omits a zero-valued field, so a token issued with an empty `Hash` carries no hash
+    /// at all. Decoding must refuse it outright: reading the absent field as sixteen zeros and
+    /// letting it reach the tag comparison is the one way widening the tag could be bypassed.
+    /// Printed by `go run ./fareward/vectors`.
+    #[test]
+    fn rejects_a_token_that_carries_no_hash() {
+        const HASHLESS_TOKEN: &str = "Q5mjBvVTyUQt5ZPISSLgHw~~";
+        assert_eq!(
+            authenticate_user(Some(&format!("Bearer {HASHLESS_TOKEN}")), TEST_SECRET),
+            Err(BridgeAuthError::MalformedSessionToken(
+                TokenError::SessionHashWidth
+            ))
         );
     }
 
@@ -197,7 +249,7 @@ mod tests {
     fn matches_the_go_service_auth_header() {
         assert_eq!(
             make_service_auth_header(TEST_SECRET, 1_700_000_000),
-            "1700000000.d91e72e6afca0954d2f0b3c4f6b6603ffb146cb022dd7fbd9205d4d01099250b"
+            "1700000000.7fde5fb0aac81f6e"
         );
     }
 

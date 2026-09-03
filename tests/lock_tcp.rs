@@ -26,9 +26,8 @@ use fareward::{
     lock::registry::{LockLimits, LockRegistry},
     reqlog::writer::RequestLogSink,
     service::server,
+    siphash::{SipHasher24, derive_key},
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -165,12 +164,12 @@ impl Client {
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> u16 {
         let mut frame = vec![opcode];
         frame.extend_from_slice(payload);
-        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET).unwrap();
-        mac.update(b"fareward:v7");
-        mac.update(&self.nonce);
-        mac.update(&self.sequence.to_be_bytes());
-        mac.update(&frame);
-        frame.extend_from_slice(&mac.finalize().into_bytes()[..8]);
+        let mut hasher = SipHasher24::new(&derive_key(SECRET));
+        hasher.write(b"fareward:v9");
+        hasher.write(&self.nonce);
+        hasher.write(&self.sequence.to_be_bytes());
+        hasher.write(&frame);
+        frame.extend_from_slice(&hasher.finish().to_be_bytes());
         let correlation = self.sequence as u16;
         self.sequence += 1;
         self.socket.write_all(&frame).await.unwrap();
@@ -178,9 +177,18 @@ impl Client {
     }
 
     /// Returns `(correlation, status, detail)` of whichever reply arrives next.
+    ///
+    /// The tail is consumed even though no lock test has one: leaving it in the socket would
+    /// desynchronize every reply after it, which is exactly the failure the length prefix exists
+    /// to make impossible.
     async fn read_reply(&mut self) -> (u16, u8, u16) {
-        let mut reply = [0_u8; 5];
+        let mut reply = [0_u8; 6];
         self.socket.read_exact(&mut reply).await.unwrap();
+        let extra_len = usize::from(reply[5]);
+        if extra_len > 0 {
+            let mut extra = vec![0_u8; extra_len];
+            self.socket.read_exact(&mut extra).await.unwrap();
+        }
         (
             u16::from_be_bytes([reply[0], reply[1]]),
             reply[2],

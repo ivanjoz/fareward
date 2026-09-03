@@ -1,12 +1,13 @@
 //! Opcode routing for the shared server-utilities TCP port.
 //!
-//! Every operation on this port is framed as `[opcode:1][payload][hmac:8]`. The opcode is a
+//! Every operation on this port is framed as `[opcode:1][payload][tag:8]`. The opcode is a
 //! routing header and nothing more: each operation owns its own payload layout, its own width,
 //! and its own codec in its own module. What the operations share is only the socket, the
-//! handshake nonce, and the frame sequence that binds each HMAC to that connection.
+//! handshake nonce, and the frame sequence that binds each tag to that connection.
 
 use crate::{
     limiter::access::INVALIDATE_ACCESS_PAYLOAD_SIZE,
+    limiter::access::MAX_REQUIRED_ACCESS,
     limiter::budget::MUTATE_BUDGET_PAYLOAD_SIZE,
     limiter::protocol::CHARGE_PAYLOAD_SIZE,
     lock::protocol::{ACQUIRE_PAYLOAD_SIZE, RELEASE_PAYLOAD_SIZE},
@@ -15,7 +16,12 @@ use crate::{
 
 pub const OPCODE_SIZE: usize = 1;
 pub const AUTH_TAG_SIZE: usize = 8;
-pub const REPLY_SIZE: usize = 5;
+/// Fixed head of every reply. The tail that may follow it is described by `extra_len`, the sixth
+/// byte, which is zero for every opcode but a charge that asked for authorization.
+pub const REPLY_HEAD_SIZE: usize = 6;
+
+/// Widest tail a reply may carry: `MAX_REQUIRED_ACCESS` slots of at most two sub bytes each.
+pub const REPLY_MAX_EXTRA_SIZE: usize = 2 * MAX_REQUIRED_ACCESS;
 /// Width of the length header a variable-payload opcode carries between the opcode and its
 /// payload. Only `LOG_REQUEST` uses one — every other operation describes a fixed record whose
 /// width the opcode already implies.
@@ -27,21 +33,29 @@ pub const LENGTH_PREFIX_SIZE: usize = 2;
 /// decide individually—instead of mistaking it for a real verdict.
 pub const UNAVAILABLE_STATUS: u8 = 0xFF;
 
-/// Builds the reply frame: `[correlation:u16][status:u8][detail:u16]`.
+/// Builds the reply frame: `[correlation:u16][status:u8][detail:u16][extra_len:u8][extra…]`.
 ///
 /// `correlation` is the low 16 bits of the request's frame sequence. Nothing new travels in the
 /// request to carry it — the sequence already exists, is already per-connection and monotonic,
-/// and both sides already track it for the HMAC. It is what lets a client match a reply to the
+/// and both sides already track it for the tag. It is what lets a client match a reply to the
 /// caller that is waiting for it once several requests are in flight at once; truncating to 16
 /// bits only becomes ambiguous past 65_535 concurrent requests on one connection.
 ///
 /// `status` keeps its per-opcode meaning, and zero is still success everywhere. `detail` carries
-/// the lock generation on a granted acquire and is zero otherwise.
-pub fn encode_reply(sequence: u64, status: u8, detail: u16) -> [u8; REPLY_SIZE] {
-    let mut reply = [0_u8; REPLY_SIZE];
-    reply[0..2].copy_from_slice(&((sequence & 0xFFFF) as u16).to_be_bytes());
-    reply[2] = status;
-    reply[3..5].copy_from_slice(&detail.to_be_bytes());
+/// the lock generation on a granted acquire, and on a charge it packs the authorization verdict:
+/// bits 0..2 the code, bits 3..6 which required slots were granted, bits 7..10 which of those
+/// contributed sub bytes to the tail.
+///
+/// `extra_len` costs one byte on every reply that has nothing to say, and buys a single framing
+/// that every opcode shares — the alternative was a per-opcode reply width, which the mux reader
+/// would have to know the opcode to parse, having already forgotten it by then.
+pub fn encode_reply(sequence: u64, status: u8, detail: u16, extra: &[u8]) -> Vec<u8> {
+    let mut reply = Vec::with_capacity(REPLY_HEAD_SIZE + extra.len());
+    reply.extend_from_slice(&((sequence & 0xFFFF) as u16).to_be_bytes());
+    reply.push(status);
+    reply.extend_from_slice(&detail.to_be_bytes());
+    reply.push(extra.len() as u8);
+    reply.extend_from_slice(extra);
     reply
 }
 
@@ -187,11 +201,29 @@ mod tests {
 
     #[test]
     fn the_reply_carries_the_truncated_sequence() {
-        assert_eq!(encode_reply(0, 0, 0), [0x00, 0x00, 0x00, 0x00, 0x00]);
-        assert_eq!(encode_reply(1, 27, 0), [0x00, 0x01, 0x1B, 0x00, 0x00]);
-        assert_eq!(encode_reply(7, 0, 300), [0x00, 0x07, 0x00, 0x01, 0x2C]);
+        // The sixth byte is extra_len, zero on every reply that has no tail — which is every
+        // opcode but a charge that asked for authorization.
+        assert_eq!(encode_reply(0, 0, 0, &[]), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(encode_reply(1, 27, 0, &[]), [0x00, 0x01, 0x1B, 0x00, 0x00, 0x00]);
+        assert_eq!(encode_reply(7, 0, 300, &[]), [0x00, 0x07, 0x00, 0x01, 0x2C, 0x00]);
         // Only the low 16 bits travel, so a client correlates on the same truncation.
-        assert_eq!(encode_reply(0x1_0002, 0, 0), [0x00, 0x02, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            encode_reply(0x1_0002, 0, 0, &[]),
+            [0x00, 0x02, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// The tail is length-prefixed rather than implied by the opcode, because the mux reader that
+    /// parses it has only the correlation id — by then it no longer knows which opcode this
+    /// answers.
+    #[test]
+    fn the_reply_tail_is_length_prefixed() {
+        assert_eq!(
+            encode_reply(7, 0, 0b0000_0100_1001, &[0x06, 0x81, 0x20]),
+            [0x00, 0x07, 0x00, 0x00, 0x49, 0x03, 0x06, 0x81, 0x20]
+        );
+        // A tail can never outgrow two sub bytes per required slot.
+        assert!(REPLY_MAX_EXTRA_SIZE <= usize::from(u8::MAX));
     }
 
     #[test]

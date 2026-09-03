@@ -13,7 +13,7 @@ import (
 // acknowledgement that a log was stored would put the daemon's latency on the critical path of
 // every request in the system. The client writes the frame and returns.
 //
-//	[opcode:1][length:u16][payload:length][hmac:8]
+//	[opcode:1][length:u16][payload:length][tag:8]
 //
 // The payload layout is mirrored in fareward/src/reqlog/protocol.rs. Every field is
 // big-endian, like the rest of this port.

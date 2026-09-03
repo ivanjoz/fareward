@@ -10,4 +10,5 @@ pub mod limiter;
 pub mod lock;
 pub mod reqlog;
 pub mod service;
+pub mod siphash;
 pub mod sysmetrics;

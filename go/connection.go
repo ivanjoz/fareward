@@ -2,8 +2,6 @@ package fareward
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,34 +10,45 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ivanjoz/fareward/go/siphash"
 )
 
 // One multiplexed TCP connection to the fareward daemon, shared by every operation in this
 // process: credit charges and locks alike.
 //
 // Requests travel in order and carry a sequence that both sides advance in lockstep for the
-// frame HMAC. Replies do not: an acquire can sit in a lock queue for seconds while charges sent
+// frame tag. Replies do not: an acquire can sit in a lock queue for seconds while charges sent
 // after it are answered immediately. Each reply therefore echoes the low 16 bits of its
 // request's sequence, and a single reader goroutine uses that to hand the answer to the right
 // caller. Nothing extra travels on the wire to make this work — the sequence already existed.
 //
 // The one hard rule: taking a sequence and writing its frame must be atomic. Two goroutines
-// taking 5 and 6 but writing 6, 5 would desynchronize the HMAC and every later frame would fail.
+// taking 5 and 6 but writing 6, 5 would desynchronize the tag and every later frame would fail.
 // That is what writeMu guards, and it is held for a socket write, never for a round trip.
 
 const (
 	farewardNonceSize   = 8
 	farewardAuthTagSize = 8
-	// Every reply is [correlation:u16][status:u8][detail:u16].
-	farewardReplySize = 5
+	// Every reply starts with [correlation:u16][status:u8][detail:u16][extra_len:u8]. The tail
+	// that follows is `extra_len` bytes and is empty for every opcode but a charge that asked for
+	// authorization, which answers with the sub-accesses of the required slots the user holds.
+	farewardReplyHeadSize = 6
+	// The widest tail: MAX_REQUIRED_ACCESS slots of at most two sub bytes each. A reply claiming
+	// more is a desynchronized stream, not a long answer, so it kills the connection rather than
+	// being read as payload.
+	farewardReplyMaxExtraSize = 2 * MaxRequiredAccess
 	// Names the framing of the whole port, request and reply, and is bumped on every wire change
 	// so a mismatched peer fails at the first frame instead of misreading bytes.
-	// `:v7` renamed the string itself from `genix-server-utils` to `fareward`. That is not a
-	// frame-format change, but it invalidates every tag a peer still on `:v6` produces, so it
-	// spends a bump rather than leaving two incompatible protocols both calling themselves `:v6`.
+	// `:v7` renamed the string itself from `genix-server-utils` to `fareward` and `:v8` replaced
+	// truncated HMAC-SHA256 with SipHash-2-4. Neither changed a frame's layout, but each
+	// invalidates every tag a peer on the old string produces, so both spend a bump rather than
+	// leaving two incompatible protocols under one name. `:v9` did change the layout: the reply
+	// grew a length-prefixed tail, so a mixed pair cannot read each other at all and must fail at
+	// the first frame instead of misparsing one.
 	// Mirrored byte for byte by DOMAIN in fareward/src/service/auth.rs; backend and daemon must
 	// cross this boundary in a single deploy.
-	farewardAuthDomain = "fareward:v7"
+	farewardAuthDomain = "fareward:v9"
 
 	opcodeChargeCredits = byte(0x01)
 	opcodeLockAcquire   = byte(0x02)
@@ -78,6 +87,10 @@ var ErrFarewardUnavailable = errors.New("fareward service is unavailable")
 type muxReply struct {
 	status byte
 	detail uint16
+	// extra is the reply's tail, empty on every opcode that has nothing more to say. On a charge
+	// it holds the sub-access bytes of the granted slots, verbatim as the daemon read them out of
+	// accesos_sub_computed.
+	extra []byte
 }
 
 type pendingRequest struct {
@@ -207,7 +220,7 @@ func (client *FarewardClient) requestOnce(
 // No pending entry is registered, which is the point: the reader would otherwise log every
 // unmatched reply, and a caller would be parked waiting for one that never comes. The frame
 // sequence still advances under writeMu in lockstep with the daemon's, because that is what the
-// HMAC is bound to — a fire-and-forget frame that skipped the sequence would invalidate every
+// tag is bound to — a fire-and-forget frame that skipped the sequence would invalidate every
 // frame after it on this connection.
 //
 // One retry, for the same reason a request gets one: a pooled connection the daemon closed while
@@ -371,13 +384,29 @@ func (connection *muxConnection) exchange(
 // several callers share the connection.
 func (connection *muxConnection) readLoop(client *FarewardClient) {
 	for {
-		reply := [farewardReplySize]byte{}
+		reply := [farewardReplyHeadSize]byte{}
 		if _, err := io.ReadFull(connection.conn, reply[:]); err != nil {
 			connection.fail(err)
 			return
 		}
 		correlation := binary.BigEndian.Uint16(reply[0:2])
 		answer := muxReply{status: reply[2], detail: binary.BigEndian.Uint16(reply[3:5])}
+
+		// The tail is read before anything is dispatched, because a stream left unread mid-frame
+		// desynchronizes every reply after it — including the ones nobody is waiting for.
+		if extraLen := int(reply[5]); extraLen > 0 {
+			if extraLen > farewardReplyMaxExtraSize {
+				connection.fail(fmt.Errorf(
+					"fareward reply claims a %d-byte tail, over the %d maximum",
+					extraLen, farewardReplyMaxExtraSize))
+				return
+			}
+			answer.extra = make([]byte, extraLen)
+			if _, err := io.ReadFull(connection.conn, answer.extra); err != nil {
+				connection.fail(err)
+				return
+			}
+		}
 
 		connection.pendingMu.Lock()
 		request, known := connection.pending[correlation]
@@ -477,17 +506,21 @@ func buildFarewardLengthPrefixedFrame(
 // farewardAuthTag signs one frame for one position in one connection's stream. Binding the
 // tag to both the server nonce and the frame sequence is what stops a captured frame from being
 // replayed, on this connection or any other.
+//
+// SipHash-2-4 is a 64-bit function, so the tag is the whole output rather than the front of a
+// digest, written big-endian like every other fixed-width field on this wire. Exact mirror of
+// fareward's src/service/auth.rs.
 func farewardAuthTag(
 	secret []byte, nonce *[farewardNonceSize]byte, sequence uint64, signed []byte,
 ) []byte {
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(farewardAuthDomain))
-	mac.Write(nonce[:])
+	hasher := siphash.New(siphash.DeriveKey(secret))
+	hasher.WriteString(farewardAuthDomain)
+	hasher.Write(nonce[:])
 	sequenceBytes := [8]byte{}
 	binary.BigEndian.PutUint64(sequenceBytes[:], sequence)
-	mac.Write(sequenceBytes[:])
-	mac.Write(signed)
-	return mac.Sum(nil)[:farewardAuthTagSize]
+	hasher.Write(sequenceBytes[:])
+	hasher.Write(signed)
+	return binary.BigEndian.AppendUint64(make([]byte, 0, farewardAuthTagSize), hasher.Sum64())
 }
 
 func writeCompleteFrame(connection net.Conn, frame []byte) error {

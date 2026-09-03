@@ -82,7 +82,7 @@ pub struct AppConfig {
     pub access_cache_seconds: i64,
     /// Signs the browser session tokens the SSE bridge verifies. Nothing else reads it.
     pub secret_phrase: Vec<u8>,
-    /// Service-to-service secret: the rate limiter's TCP frame HMAC and the bridge's
+    /// Service-to-service secret: the rate limiter's TCP frame tag and the bridge's
     /// `X-Bridge-Auth` header. Distinct from `secret_phrase` so token signing and
     /// inter-service authentication can be rotated independently.
     pub internal_apikey: Vec<u8>,

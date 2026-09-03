@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
 use crate::limiter::{
-    access::{AccessDenial, UserAccessState},
+    access::{AccessDenial, AccessVerdict, UserAccessState},
     aggregation::{COMPANY_AGGREGATE_USER_ID, UsageKey, UsageRecord, UsageSnapshot, merge_loaded},
     budget::{BudgetMutation, BudgetMutationReply, BudgetOperation},
     credits_blob::{Credits, RoutedCredits, decode, encode, sum},
@@ -28,9 +28,12 @@ const TOKEN_PERIOD: Duration = Duration::from_secs(10);
 /// Authorization and quota are separate refusals with separate HTTP answers on the Go side, so they
 /// are separate variants rather than one status byte: a 403 is not a 429 and must not be reported as
 /// one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    Allowed,
+    /// Carries the authorization verdict when the frame asked for one, so the reply can name which
+    /// required slots were granted and hand back their sub-accesses. `Default` — an all-zero
+    /// verdict — is what a frame that asked nothing gets.
+    Allowed(AccessVerdict),
     CreditViolation(LimitViolation),
     AccessDenied(AccessDenial),
 }
@@ -457,6 +460,7 @@ impl RateLimiter {
         // Authorization first, and on refusal nothing is charged: no usage row, no SubjectState, no
         // budget load. A 403 costs the tenant nothing, which is the deliberate trade — the work
         // being given away is one binary search over a cached list.
+        let mut access_verdict = AccessVerdict::default();
         if request.requests_authorization() {
             self.ensure_access(
                 &mut shard,
@@ -465,20 +469,23 @@ impl RateLimiter {
                 unix_seconds,
             )
             .await?;
-            let denial = shard
+            match shard
                 .access
                 .get(&(request.company_id, request.user_id))
                 .expect("user access initialized")
-                .verdict(&request.required_access);
-            if let Some(denial) = denial {
-                debug!(
-                    company_id = request.company_id,
-                    user_id = request.user_id,
-                    route_id = request.route_id,
-                    ?denial,
-                    "authorization refused"
-                );
-                return Ok(Decision::AccessDenied(denial));
+                .verdict(&request.required_access)
+            {
+                Ok(verdict) => access_verdict = verdict,
+                Err(denial) => {
+                    debug!(
+                        company_id = request.company_id,
+                        user_id = request.user_id,
+                        route_id = request.route_id,
+                        ?denial,
+                        "authorization refused"
+                    );
+                    return Ok(Decision::AccessDenied(denial));
+                }
             }
         }
 
@@ -650,7 +657,7 @@ impl RateLimiter {
         // paid for out of the pool was served like any other.
         increment_usage(&mut shard.usage, request, unix_seconds)?;
         increment_platform_usage(&mut platform_usage, request, unix_seconds)?;
-        Ok(Decision::Allowed)
+        Ok(Decision::Allowed(access_verdict))
     }
 
     pub async fn mutate_budget(&self, mutation: BudgetMutation) -> Result<BudgetMutationReply> {
@@ -1231,11 +1238,28 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::limiter::access::MAX_REQUIRED_ACCESS;
+    use crate::limiter::access::{AccessVerdict, MAX_REQUIRED_ACCESS};
     use crate::limiter::storage::{
         StoredBudget, StoredBudgetRow, StoredBudgetUsage, StoredExtraUsage, StoredUsage,
         StoredUserAccess,
     };
+
+    /// Most tests in this module drive the credit path, and a credit frame asks for no
+    /// authorization — so an allowed decision carries the empty verdict. Named rather than spelled
+    /// out at each of two dozen call sites.
+    fn allowed() -> Decision {
+        Decision::Allowed(AccessVerdict::default())
+    }
+
+    /// An allowed decision for a frame that *did* ask, naming which required slots were granted.
+    /// None of these fixtures grant a sub-access, so the tail is always empty.
+    fn allowed_slots(granted_mask: u8) -> Decision {
+        Decision::Allowed(AccessVerdict {
+            granted_mask,
+            has_subs_mask: 0,
+            sub_bytes: Vec::new(),
+        })
+    }
 
     impl Decision {
         /// The credit violation this decision carries, or a panic naming what it carried instead.
@@ -1282,7 +1306,10 @@ mod tests {
             self.users.lock().unwrap().insert(
                 (company_id, user_id),
                 StoredUserAccess {
-                    grants_blob: grants.iter().flat_map(|g| g.to_le_bytes()).collect(),
+                    // Big-endian, matching backend/core/accesos-blob.go. These fixtures grant no
+                    // sub-accesses, so every one of them belongs in the plain column.
+                    grants_blob: grants.iter().flat_map(|g| g.to_be_bytes()).collect(),
+                    sub_grants_blob: Vec::new(),
                     status,
                 },
             );
@@ -1487,7 +1514,7 @@ mod tests {
                 .admit_at(read_request(2, true), EXTRA_CLOCK, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
 
         let refused = limiter
@@ -1503,7 +1530,7 @@ mod tests {
                 .admit_at(read_request(2, true), EXTRA_CLOCK, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
     }
 
@@ -1518,7 +1545,7 @@ mod tests {
                     .admit_at(read_request(2, true), EXTRA_CLOCK, Instant::now())
                     .await
                     .unwrap(),
-                Decision::Allowed
+                allowed()
             );
         }
         // Two of entitlement plus four of pool are spent; the pool cannot cover a fourth read.
@@ -1562,7 +1589,7 @@ mod tests {
                 .admit_at(read_request(10, true), EXTRA_CLOCK, now)
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         let refused = limiter
             .admit_at(read_request(10, true), EXTRA_CLOCK, now)
@@ -1672,7 +1699,7 @@ mod tests {
                 .admit_at(read_request(2, true), EXTRA_CLOCK, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         let refused = limiter
             .admit_at(read_request(2, true), EXTRA_CLOCK, Instant::now())
@@ -1690,7 +1717,7 @@ mod tests {
                 .admit_at(read_request(2, true), next_day, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
     }
 
@@ -1739,7 +1766,7 @@ mod tests {
                 .admit_at(read_request(40, true), EXTRA_CLOCK, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         limiter.flush_dirty().await;
         let (usage, _) = store.budget_usage(7).unwrap();
@@ -1755,7 +1782,7 @@ mod tests {
                 .admit_at(read_request(10, true), EXTRA_CLOCK, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         let refused = limiter
             .admit_at(read_request(1, true), EXTRA_CLOCK, Instant::now())
@@ -1795,7 +1822,7 @@ mod tests {
                 .admit_at(request, 1_800_000_000, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         // Five usage rows plus the company's budget usage counters, which the same flush publishes.
         assert_eq!(limiter.flush_dirty().await, 6);
@@ -1839,7 +1866,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(result, Decision::Allowed);
+            assert_eq!(result, allowed());
         }
 
         limiter.flush_dirty().await;
@@ -1936,7 +1963,7 @@ mod tests {
         };
         assert_eq!(
             limiter.admit_at(request, 1_800_000_000, now).await.unwrap(),
-            Decision::Allowed
+            allowed()
         );
         let violation = limiter
             .admit_at(
@@ -1987,7 +2014,7 @@ mod tests {
                 .admit_at(request, unix_seconds, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         limiter.flush_dirty().await;
 
@@ -2026,7 +2053,7 @@ mod tests {
                 .admit_at(request, unix_seconds, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         limiter.flush_dirty().await;
         let (usage, writes) = store.budget_usage(7).unwrap();
@@ -2073,7 +2100,7 @@ mod tests {
                 .admit_at(request, evening, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         let violation = limiter
             .admit_at(request, after_utc_midnight, Instant::now())
@@ -2088,7 +2115,7 @@ mod tests {
                 .admit_at(request, next_business_day, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
     }
 
@@ -2115,7 +2142,7 @@ mod tests {
                     .admit_at(read_request(2, false), unix_seconds, Instant::now())
                     .await
                     .unwrap(),
-                Decision::Allowed
+                allowed()
             );
         }
         let violation = limiter
@@ -2153,7 +2180,7 @@ mod tests {
                 .admit_at(request, unix_seconds, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         let violation = limiter
             .admit_at(
@@ -2204,7 +2231,7 @@ mod tests {
                     )
                     .await
                     .unwrap(),
-                Decision::Allowed
+                allowed()
             );
         }
         let violation = limiter
@@ -2411,7 +2438,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed_slots(0b1)
         );
         // Admitted means charged: the usage rows exist.
         assert!(limiter.flush_dirty().await > 0);
@@ -2493,7 +2520,7 @@ mod tests {
                 .admit_at(request, 1_800_000_000, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed()
         );
         assert_eq!(store.user_reads.load(Ordering::Relaxed), 0);
     }
@@ -2581,7 +2608,7 @@ mod tests {
                 .admit_at(request, 1_800_000_000, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed_slots(0b1)
         );
         // User 43 was not named, so it is still holding the stale answer.
         assert_eq!(
@@ -2599,7 +2626,7 @@ mod tests {
                 .admit_at(other_user, 1_800_000_000, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed_slots(0b1)
         );
     }
 
@@ -2617,7 +2644,7 @@ mod tests {
                 .admit_at(request, 1_800_000_000, Instant::now())
                 .await
                 .unwrap(),
-            Decision::Allowed
+            allowed_slots(0b1)
         );
         // Zero credits still walk the quota path, so state exists — it just carries nothing.
         let shard = limiter.shards[0].lock().await;

@@ -20,11 +20,14 @@ pub struct StoredUsage {
 
 /// One user's authorization row, exactly as `users` holds it.
 ///
-/// `grants_blob` is the raw `accesos_computed` column and is **little-endian** u16s — see
-/// `decode_grants` in `access.rs` for why that is worth stating twice.
+/// Two blobs, and which one an access is in carries meaning: `grants_blob` (`accesos_computed`) is
+/// fixed-stride grant words for accesses with no sub-access, and `sub_grants_blob`
+/// (`accesos_sub_computed`) appends each grant's sub bytes. Both are **big-endian** — see
+/// `validate_grants` in `access.rs`, and `backend/core/accesos-blob.go`, which writes them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredUserAccess {
     pub grants_blob: Vec<u8>,
+    pub sub_grants_blob: Vec<u8>,
     pub status: i8,
 }
 
@@ -214,7 +217,10 @@ impl ScyllaLimiterStore {
         // `users` is partitioned by company_id and clustered by id, so this is a point read of one
         // row in one partition — the cheapest question ScyllaDB can be asked.
         let mut select_user_access = session
-            .prepare("SELECT accesos_computed, status FROM users WHERE company_id = ? AND id = ?")
+            .prepare(
+                "SELECT accesos_computed, accesos_sub_computed, status \
+                 FROM users WHERE company_id = ? AND id = ?",
+            )
             .await
             .context("failed to prepare users access read")?;
         select_user_access.set_is_idempotent(true);
@@ -482,14 +488,15 @@ impl LimiterStore for ScyllaLimiterStore {
             // status is nullable for the same reason every ORM column is: decoding either as
             // non-nullable would turn a legitimately empty user into a read failure, which fails
             // closed as a 503 rather than as the denial it actually is.
-            .rows::<(Option<Vec<u8>>, Option<i8>)>()
+            .rows::<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i8>)>()
             .context("users access row shape is invalid")?;
         let Some(row) = rows.next() else {
             return Ok(None);
         };
-        let (grants_blob, status) = row.context("users access row decode failed")?;
+        let (grants_blob, sub_grants_blob, status) = row.context("users access row decode failed")?;
         Ok(Some(StoredUserAccess {
             grants_blob: grants_blob.unwrap_or_default(),
+            sub_grants_blob: sub_grants_blob.unwrap_or_default(),
             status: status.unwrap_or(0),
         }))
     }

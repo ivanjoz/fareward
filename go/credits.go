@@ -11,7 +11,7 @@ import (
 
 const (
 	// Opcode 0x01: [opcode][company:u24][user:u24][route:u16][cpu:u16][inference:u16]
-	// [requiredAccess:4xu16][hmac:8].
+	// [requiredAccess:4xu16][tag:8].
 	creditChargePayloadSize = 12 + 2*MaxRequiredAccess
 
 	// MaxRequiredAccess is how many packed grants one frame can carry. access_list.yml maps at most
@@ -30,6 +30,10 @@ const (
 	// indistinguishable from the limiter being down and would produce the wrong 503 response.
 	maxChargeRouteID = 16_383
 
+	// subAccesoMoreBit terminates a sub-access run: set means another byte follows. The runs
+	// themselves are opaque here — see AccessGrant.
+	subAccesoMoreBit = 0x80
+
 	// extraCreditFlag rides in the high bit of the route field, which maxChargeRouteID leaves free.
 	// Set, it tells the daemon this charge is a read and may therefore fall back to the company's
 	// extra daily pool once normal quota refuses. Mirrored from EXTRA_CREDIT_FLAG in
@@ -43,9 +47,9 @@ const (
 
 var ErrCreditLimiterMissing = errors.New("credit rate limiter is not configured")
 
-// accessDeniedReason is the reply frame's detail field. Zero means no authorization was requested
-// and one means granted, which is why the refusals start at two — mirrored from
-// fareward/src/limiter/access.rs.
+// accessDeniedReason is the low three bits of the reply frame's detail field. Zero means no
+// authorization was requested and one means granted, which is why the refusals start at two —
+// mirrored from fareward/src/limiter/access.rs.
 type accessDeniedReason uint16
 
 const (
@@ -54,6 +58,33 @@ const (
 	accessReasonNoUser accessDeniedReason = 3
 	accessReasonStatus accessDeniedReason = 4
 )
+
+// How the daemon packs a granted verdict into the reply's sixteen-bit detail field. The code keeps
+// the low bits it always had; the two masks occupy space that used to be permanently zero.
+//
+//	bits  0..2  the code above
+//	bits  3..6  granted mask   — bit N = requiredAccess[N] is held
+//	bits  7..10 has-subs mask  — bit N = slot N contributed bytes to the reply tail
+const (
+	accessCodeMask     = 0b111
+	accessGrantedShift = 3
+	accessHasSubsShift = 7
+	accessSlotMask     = 0b1111
+)
+
+// AccessGrant is what one authorized route learned about the caller: which of the accesses it
+// required they hold, and the sub-accesses riding on each.
+//
+// The sub-access bytes stay in their wire form here on purpose. This package answers a verdict, not
+// a meaning — it holds no copy of the catalogue, so it cannot say what sub-access 3 of access 10
+// is, and "id 1 means Todos" is a rule for the side that does.
+type AccessGrant struct {
+	// GrantedSlots is a bitmask over the requiredAccess slice the caller passed in.
+	GrantedSlots uint8
+	// SubAccesoBytes maps a requiredAccess slot index to that access's sub-access run, in the
+	// `[1 bit MORE][7 bits flags]` encoding of accesos_sub_computed. Absent means no sub-accesses.
+	SubAccesoBytes map[int][]byte
+}
 
 // AccessDenied is the daemon's authorization refusal. Separate from CreditLimitExceeded because the
 // two are different answers: one says the tenant has spent its allowance, the other says this
@@ -160,10 +191,10 @@ func InferenceCredits(inputBytes, outputBytes int) (uint16, error) {
 func ChargeAPIUsage(
 	ctx context.Context, companyID, userID int32, routeID int16, method string, payloadBytes int,
 	requiredAccess []uint16,
-) error {
+) (*AccessGrant, error) {
 	cpuCredits, err := APICPUCredits(method, payloadBytes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Eligibility for the extra pool is derived here, from the same string that just chose the
 	// tariff, and is not a parameter. That is the point: a caller cannot mark a write as a read by
@@ -177,9 +208,9 @@ func ChargeAPIUsage(
 // the mapped ones open to any session.
 func ChargeAPIAccessOnly(
 	ctx context.Context, companyID, userID int32, routeID int16, requiredAccess []uint16,
-) error {
+) (*AccessGrant, error) {
 	if len(requiredAccess) == 0 {
-		return nil
+		return nil, nil
 	}
 	// No credits, so nothing could come out of any pool.
 	return chargeConfiguredCredits(ctx, companyID, userID, routeID, 0, 0, requiredAccess, false)
@@ -197,8 +228,10 @@ func ChargeAPICredits(
 	if cpuCredits == 0 {
 		return nil
 	}
-	return chargeConfiguredCredits(
+	// No required access, so there is no grant to hand back — only whether the charge landed.
+	_, err := chargeConfiguredCredits(
 		ctx, companyID, userID, routeID, cpuCredits, 0, nil, extraCreditsAllowed)
+	return err
 }
 
 type creditRateLimitIdentity struct {
@@ -235,9 +268,10 @@ func ChargeInferenceUsage(ctx context.Context, inputBytes, outputBytes int) erro
 	}
 	// Never eligible: the pool is CPU-only, and the daemon refuses to relax anything for a frame
 	// that asks for inference.
-	return chargeConfiguredCredits(
+	_, err = chargeConfiguredCredits(
 		ctx, identity.companyID, identity.userID, identity.routeID, 0, inferenceCredits, nil, false,
 	)
+	return err
 }
 
 // IsAccessDeniedError reports whether the daemon refused the request on authorization grounds.
@@ -273,27 +307,27 @@ func chargeConfiguredCredits(
 	cpuCredits, inferenceCredits uint16,
 	requiredAccess []uint16,
 	extraCreditsAllowed bool,
-) error {
+) (*AccessGrant, error) {
 	if companyID == CreditExemptCompanyID {
 		cpuCredits, inferenceCredits = 0, 0
 		// Nothing left to charge and nothing to authorize: encodeCharge rejects an empty frame,
 		// and sending one would turn every exempt read into a limiter error.
 		if len(requiredAccess) == 0 {
-			return nil
+			return nil, nil
 		}
 	}
 
 	client := farewardClient()
 	if client == nil {
 		logLine("credit rate limiter not configured, refusing request::", ErrCreditLimiterMissing)
-		return ErrCreditLimiterMissing
+		return nil, ErrCreditLimiterMissing
 	}
-	err := client.Charge(ctx, companyID, userID, routeID, cpuCredits, inferenceCredits,
+	accessGrant, err := client.Charge(ctx, companyID, userID, routeID, cpuCredits, inferenceCredits,
 		requiredAccess, extraCreditsAllowed)
 	if err != nil {
 		logLine("credit rate limiter refused request::", err)
 	}
-	return err
+	return accessGrant, err
 }
 
 // encodeCharge validates one charge and lays it out for the wire. Separate from Charge so the
@@ -364,45 +398,96 @@ func (client *FarewardClient) Charge(
 	cpuCredits, inferenceCredits uint16,
 	requiredAccess []uint16,
 	extraCreditsAllowed bool,
-) error {
+) (*AccessGrant, error) {
 	payload, err := encodeCharge(
 		companyID, userID, routeID, cpuCredits, inferenceCredits, requiredAccess,
 		extraCreditsAllowed)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// A charge is answered without queueing, so it needs no patience beyond the round trip.
 	reply, _, err := client.request(ctx, opcodeChargeCredits, payload, chargeWait(ctx), 0, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if reply.status != 0 {
-		return decodeCreditLimitResponse(reply.status)
+		return nil, decodeCreditLimitResponse(reply.status)
 	}
-	return decodeAccessResponse(reply.detail, len(requiredAccess) > 0)
+	return decodeAccessResponse(reply.detail, reply.extra, len(requiredAccess) > 0)
 }
 
-// decodeAccessResponse reads the authorization verdict out of the reply's detail field.
+// decodeAccessResponse reads the authorization verdict out of the reply's detail field and tail.
 //
 // A daemon that ignored the slots would answer zero. That is treated as unavailability rather than
 // as a grant: failing open here would silently unauthorize every gated route the moment the two
 // binaries drifted apart.
-func decodeAccessResponse(detail uint16, wasRequested bool) error {
+func decodeAccessResponse(detail uint16, extra []byte, wasRequested bool) (*AccessGrant, error) {
 	if !wasRequested {
-		return nil
+		return nil, nil
 	}
-	switch reason := accessDeniedReason(detail); reason {
+	switch reason := accessDeniedReason(detail & accessCodeMask); reason {
 	case accessGranted:
-		return nil
+		grant, err := decodeAccessGrant(detail, extra)
+		if err != nil {
+			return nil, err
+		}
+		return grant, nil
 	case accessReasonNone, accessReasonNoUser, accessReasonStatus:
-		return &AccessDenied{reason: reason}
+		return nil, &AccessDenied{reason: reason}
 	default:
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"%w: credit limiter did not answer the access check (detail %d)",
 			ErrFarewardUnavailable, detail)
 	}
+}
+
+// decodeAccessGrant splits the reply tail back out per slot.
+//
+// The two masks and the tail have to agree exactly: each slot in the has-subs mask consumes one
+// MORE-terminated run, in ascending slot order, and the tail must end precisely when the last one
+// does. A disagreement means the two binaries no longer share a layout, which is refused rather
+// than half-read — the alternative is attributing one access's sub-accesses to another.
+func decodeAccessGrant(detail uint16, extra []byte) (*AccessGrant, error) {
+	grantedSlots := uint8(detail>>accessGrantedShift) & accessSlotMask
+	hasSubsSlots := uint8(detail>>accessHasSubsShift) & accessSlotMask
+	if hasSubsSlots&^grantedSlots != 0 {
+		return nil, fmt.Errorf(
+			"%w: reply marks sub-accesses on a slot it did not grant (detail %d)",
+			ErrFarewardUnavailable, detail)
+	}
+
+	grant := &AccessGrant{GrantedSlots: grantedSlots}
+	offset := 0
+	for slotIndex := 0; slotIndex < MaxRequiredAccess; slotIndex++ {
+		if hasSubsSlots&(1<<slotIndex) == 0 {
+			continue
+		}
+		runStart := offset
+		for {
+			if offset >= len(extra) {
+				return nil, fmt.Errorf(
+					"%w: reply tail ends mid sub-access run for slot %d",
+					ErrFarewardUnavailable, slotIndex)
+			}
+			subByte := extra[offset]
+			offset++
+			if subByte&subAccesoMoreBit == 0 {
+				break
+			}
+		}
+		if grant.SubAccesoBytes == nil {
+			grant.SubAccesoBytes = make(map[int][]byte, 1)
+		}
+		grant.SubAccesoBytes[slotIndex] = extra[runStart:offset]
+	}
+	if offset != len(extra) {
+		return nil, fmt.Errorf(
+			"%w: reply tail has %d bytes left over after every marked slot",
+			ErrFarewardUnavailable, len(extra)-offset)
+	}
+	return grant, nil
 }
 
 // chargeWait keeps a charge inside the caller's own deadline when it has one.

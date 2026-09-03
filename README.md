@@ -48,10 +48,10 @@ but the coupling is **four contracts, not a language**.
 
 | # | Contract | Defined by | What a different backend has to do |
 |---|---|---|---|
-| 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` — eight-byte nonce at accept, then every frame tagged `HMAC-SHA256(fareward:v7 ‖ nonce ‖ sequence ‖ opcode ‖ payload)` truncated to 8 bytes, over fixed-width big-endian fields. |
+| 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` and `go/siphash/` — eight-byte nonce at accept, then every frame tagged `SipHash-2-4(SHA-256(internal_apikey)[..16], fareward:v8 ‖ nonce ‖ sequence ‖ opcode ‖ payload)`, big-endian, over fixed-width big-endian fields. |
 | 2 | The ScyllaDB schema | nobody here — the daemon issues no `CREATE TABLE` | Create the tables and columns below before first start. |
 | 3 | The `accesos_computed` packing | `src/limiter/access.rs` | Write `users.accesos_computed` as little-endian `u16` grants. |
-| 4 | The browser session token | `src/bridge/token.rs` | Issue a colbin-encoded `core.UsuarioToken`. **The only Go-shaped contract** — see below. |
+| 4 | The browser session token | `src/bridge/token.rs`, `src/bridge/auth.rs` | Issue a colbin-encoded `core.UsuarioToken`, its 16-byte `Hash` a keyed BLAKE2s-128 tag over `usrToken:v3`. **The only Go-shaped contract** — see below. |
 
 Contracts 1–3 belong to the raw-TCP half. Contract 4 belongs to the SSE bridge alone, and the bridge
 shares nothing with the rest but the config load and the tokio runtime — so a deployment that does
@@ -130,7 +130,7 @@ The module has **no dependencies beyond the standard library**, and that is wort
 the one piece of the system a backend links into its own binary, so its dependency list becomes
 somebody else's transitive dependency list.
 
-Its cross-language HMAC vectors sit next to the Rust ones they pin, in `go/credits_test.go` and
+Its cross-language tag vectors sit next to the Rust ones they pin, in `go/credits_test.go` and
 `go/locks_test.go`, so a change to `DOMAIN` fails both suites in the same repository.
 
 ### What is *not* a contract
@@ -152,15 +152,16 @@ for the first four; a different backend picks its own without touching this repo
 ## Layout
 
 `service/` owns everything the raw-TCP operations share — the listener, the handshake, the frame
-HMAC and the opcode table. Each operation's own codec and logic live in its own tree, so adding
+tag and the opcode table. Each operation's own codec and logic live in its own tree, so adding
 one touches the opcode table and nothing else:
 
 ```text
 src/
 ├── main.rs      # spawns both transports, one shared shutdown signal
 ├── config.rs    # the only thing they share
+├── siphash.rs   # SipHash-2-4: the keyed tag on both internal schemes (not the token)
 ├── service/     # the raw-TCP port: server (listener, handshake, opcode dispatch),
-│                # protocol (opcode table), auth (frame HMAC)
+│                # protocol (opcode table), auth (frame tag)
 ├── limiter/     # opcodes 0x01/0x05/0x06: charging, authorization, company-budget
 │                # mutation and grant-cache invalidation,
 │                # quota, protocol, aggregation, credits_blob, time_frame, storage
@@ -186,9 +187,9 @@ a database round trip:
 
 | Who proves what | How | Secret |
 |---|---|---|
-| Backend → raw-TCP port | An eight-byte random nonce written at accept, then every frame tagged with `HMAC-SHA256(fareward:v7 ‖ nonce ‖ sequence ‖ opcode ‖ payload)` truncated to 8 bytes. | `internal_apikey` |
-| Backend → SSE bridge | `X-Bridge-Auth: <unix seconds>.<hex signature>`, signed over `sse-bridge:v1\|<unix seconds>` and accepted within ±300 s of this host's clock. | `internal_apikey` |
-| Browser → SSE bridge | `Authorization: Bearer <session token>` — the colbin token the backend client issued, its own HMAC recomputed over `usrToken:v1 ‖ company ‖ user ‖ created ‖ username`. | `secret_phrase` |
+| Backend → raw-TCP port | An eight-byte random nonce written at accept, then every frame tagged with `SipHash-2-4(fareward:v8 ‖ nonce ‖ sequence ‖ opcode ‖ payload)`, big-endian. | `internal_apikey` |
+| Backend → SSE bridge | `X-Bridge-Auth: <unix seconds>.<16 hex characters>`, signed over `sse-bridge:v2\|<unix seconds>` and accepted within ±300 s of this host's clock. | `internal_apikey` |
+| Browser → SSE bridge | `Authorization: Bearer <session token>` — the colbin token the backend client issued, its own 128-bit keyed-BLAKE2s tag recomputed over `usrToken:v3 ‖ company ‖ user ‖ created ‖ username`. | `secret_phrase` |
 
 Both keys are root-level in `config.toml` and must match the backend client's byte for byte. Each use is
 domain-separated, so one key serving two protocols cannot produce interchangeable tags, and
@@ -219,7 +220,7 @@ read [CREDIT_LIMITER_WALKTHROUGH.md](CREDIT_LIMITER_WALKTHROUGH.md) first.** The
 the reference material it ties together.
 
 - Authenticates persistent TCP connections with an eight-byte server nonce and sequence-bound
-  HMAC-SHA256 frames.
+  SipHash-tagged frames.
 - Answers **two** questions per frame: whether the caller holds the access the route requires, and
   whether the tenant can afford the request. Authorization is resolved first and a refusal charges
   nothing.
@@ -254,7 +255,7 @@ example is in [`../config.example.toml`](../config.example.toml).
 # IP is never on its own interface, so binding it fails with EADDRNOTAVAIL. With public = false
 # the client ignores `host` and dials loopback.
 #
-# public = true puts the port on the open internet. Frames are HMAC-authenticated but NOT
+# public = true puts the port on the open internet. Frames are tag-authenticated but NOT
 # encrypted, so it is only worth it when the backend runs off-box (Lambda, for instance).
 [fareward]
 host   = "127.0.0.1"
@@ -428,8 +429,8 @@ navegador                     bridge                        backend (Lambda)
 |---|---|---|---|
 | `GET` | `/sse?ch=<token>` | session token | Opens the stream. First frame `{"Type":"bridgeReady"}`, keepalive comment every 20s. |
 | `POST` | `/in?ch=<token>` | session token | Browser reply `{ID,Type,Payload}`. Wakes the `/rpc` waiting on that `ID`. |
-| `POST` | `/publish` | service HMAC | `{Channel,Message,WaitMs}` → `{Delivered}`. Does not block. |
-| `POST` | `/rpc` | service HMAC | `{Channel,ID,Message,TimeoutMs,WaitMs}` → `{Kind,Payload}`. Blocks until the reply. |
+| `POST` | `/publish` | service tag | `{Channel,Message,WaitMs}` → `{Delivered}`. Does not block. |
+| `POST` | `/rpc` | service tag | `{Channel,ID,Message,TimeoutMs,WaitMs}` → `{Kind,Payload}`. Blocks until the reply. |
 | `GET` | `/health` | — | `{Ok,Channels,UptimeSeconds}`. |
 
 Messages are opaque JSON and **nothing is buffered**: a message for a disconnected tab is
@@ -459,7 +460,7 @@ The format is mirrored in `src/bridge/token.rs`, `backend/agent/channel.go`, and
 ## TCP contract
 
 After accepting a connection, the server writes an eight-byte random nonce. Every subsequent
-request is `[opcode:1][payload][hmac:8]`, big-endian. The opcode routes the payload; it is not a
+request is `[opcode:1][payload][tag:8]`, big-endian. The opcode routes the payload; it is not a
 shared frame shape, and the three operations have no field in common.
 
 | Op | Name | Payload | Frame |
@@ -486,7 +487,7 @@ Three properties vary by opcode, and every variation is deliberate:
 more than the ceiling still closes the connection. Neither it nor `0x06` is answered — waiting on
 "the log row was stored" would put this daemon on the critical path of every request in the system,
 and the grant cache's TTL already bounds a lost invalidation — but both still advance the sequence,
-which is what the HMAC is bound to. Only `0x04` survives a decode failure: the others decide whether
+which is what the tag is bound to. Only `0x04` survives a decode failure: the others decide whether
 a request is admitted, and a log row is not worth taking down the charges and locks sharing that
 socket.
 
@@ -515,10 +516,10 @@ bits 13..0  route id           MAX_ROUTE_ID is fourteen bits
 Those top two bits were always dead space both sides validated as zero, and the flag is stripped
 before the range check both sides already ran — so anything left above fourteen bits is an error.
 
-The HMAC covers the opcode and payload plus the connection nonce and the frame sequence, so a frame
+The tag covers the opcode and payload plus the connection nonce and the frame sequence, so a frame
 can be replayed neither as itself nor as a different operation. Authentication, malformed-frame,
 unknown-opcode, initialization and transport failures close the connection. The domain string is
-bumped on every wire change — `fareward:v7` today — because replies are not authenticated:
+bumped on every wire change — `fareward:v8` today — because replies are not authenticated:
 without the bump an old client would authenticate fine and then misread a reply that grew under it.
 
 ### Replies are multiplexed
@@ -532,7 +533,7 @@ charges sent after it are answered immediately. Every reply is therefore five by
 
 | Field | Carries |
 |---|---|
-| `correlation` | The low 16 bits of the request's frame sequence, echoed back. The sequence already exists for the HMAC, so nothing extra travels on the wire — and it is what lets one connection serve many callers at once. |
+| `correlation` | The low 16 bits of the request's frame sequence, echoed back. The sequence already exists for the tag, so nothing extra travels on the wire — and it is what lets one connection serve many callers at once. |
 | `status` | `0` is success for every opcode. |
 | `detail` | The lock generation on a granted acquire, the authorization verdict on a charge, `0` everywhere else. |
 
@@ -561,7 +562,7 @@ A 429 and a 403 can never both be set — authorization resolves first and retur
 so a client reads `status` for the credit answer and `detail` for the access one. Credit charges and
 budget mutations fail closed; lock call sites keep their operation-specific policy. The client must
 assign a sequence and write its frame atomically: two callers taking 5 and 6 but writing 6, 5 would
-desynchronize the HMAC and every later frame would fail.
+desynchronize the tag and every later frame would fail.
 
 ## Access management and authorization
 
@@ -759,7 +760,7 @@ For a self-hosted backend, select both components (`237` or `238`) and choose Ba
 `2`: the dispatcher then installs this daemon without its public SSE Nginx vhost and does not
 require `sse_bridge.url`, since the backend already serves `/agent/stream`.
 
-Keep the raw TCP listener on loopback or a private network. HMAC authenticates messages but does not
+Keep the raw TCP listener on loopback or a private network. The frame tag authenticates messages but does not
 encrypt them, and the bridge's HTTP port speaks plain HTTP with Nginx terminating TLS in front.
 
 ## Charging rules in the Go client

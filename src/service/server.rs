@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     limiter::{
-        access::{INVALIDATE_ACCESS_PAYLOAD_SIZE, parse_access_invalidation},
+        access::{AccessVerdict, INVALIDATE_ACCESS_PAYLOAD_SIZE, parse_access_invalidation},
         budget::{MUTATE_BUDGET_PAYLOAD_SIZE, parse_budget_mutation},
         protocol::{CHARGE_PAYLOAD_SIZE, parse_charge},
         quota::{Decision, RateLimiter},
@@ -38,7 +38,7 @@ use crate::{
         auth,
         protocol::{
             AUTH_TAG_SIZE, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE, OPCODE_SIZE, Opcode, PayloadWidth,
-            REPLY_SIZE, UNAVAILABLE_STATUS, encode_reply,
+            UNAVAILABLE_STATUS, encode_reply,
         },
     },
 };
@@ -165,7 +165,7 @@ async fn handle_connection(
     // Bounded on purpose. One request per socket used to provide backpressure for free;
     // multiplexing removes it, so replies and in-flight work each need an explicit ceiling or one
     // authenticated client could spawn tasks and buffer replies without limit.
-    let (reply_sender, mut reply_receiver) = mpsc::channel::<[u8; REPLY_SIZE]>(max_inflight);
+    let (reply_sender, mut reply_receiver) = mpsc::channel::<Vec<u8>>(max_inflight);
     let writer_task = tokio::spawn(async move {
         while let Some(reply) = reply_receiver.recv().await {
             if writer.write_all(&reply).await.is_err() {
@@ -284,13 +284,7 @@ async fn handle_connection(
         received_tag.copy_from_slice(&frame[tag_offset..frame_size]);
         // The opcode is inside the signed bytes, so a frame cannot be replayed as another
         // operation, and the sequence keeps it from being replayed as itself.
-        if !auth::verify_hash(
-            secret,
-            &nonce,
-            sequence,
-            &frame[..tag_offset],
-            &received_tag,
-        )? {
+        if !auth::verify_hash(secret, &nonce, sequence, &frame[..tag_offset], &received_tag) {
             warn!(%peer, sequence, opcode = frame[0], "frame authentication failed");
             break Ok(());
         }
@@ -330,18 +324,27 @@ async fn handle_connection(
                     // `detail`, which was always zero for a charge until now. Because denial
                     // short-circuits the charge, the two can never both be set and cannot
                     // contradict each other.
-                    let (status, detail) = match limiter.admit(request).await {
-                        Ok(Decision::Allowed) => (0, u16::from(request.requests_authorization())),
-                        Ok(Decision::CreditViolation(violation)) => (violation.response_byte(), 0),
-                        Ok(Decision::AccessDenied(denial)) => (0, denial.detail_code()),
+                    let (status, detail, extra) = match limiter.admit(request).await {
+                        Ok(Decision::Allowed(verdict)) => {
+                            if request.requests_authorization() {
+                                (0, encode_access_detail(&verdict), verdict.sub_bytes)
+                            } else {
+                                (0, 0, Vec::new())
+                            }
+                        }
+                        Ok(Decision::CreditViolation(violation)) => {
+                            (violation.response_byte(), 0, Vec::new())
+                        }
+                        Ok(Decision::AccessDenied(denial)) => (0, denial.detail_code(), Vec::new()),
                         Err(admit_error) => {
                             // Including a failed grant read: "I could not answer" is already a
                             // status the client fails closed on, so it needs no code of its own.
                             warn!(error = %admit_error, "charge admission failed");
-                            (UNAVAILABLE_STATUS, 0)
+                            (UNAVAILABLE_STATUS, 0, Vec::new())
                         }
                     };
-                    send_reply(&reply_sender, frame_sequence, status, detail).await;
+                    send_reply_with_extra(&reply_sender, frame_sequence, status, detail, &extra)
+                        .await;
                 });
             }
             Opcode::MutateCompanyBudget => {
@@ -526,12 +529,31 @@ fn drop_expired(held: &mut HashMap<LockKey, HeldLock>, peer: SocketAddr) {
     });
 }
 
-async fn send_reply(
-    sender: &mpsc::Sender<[u8; REPLY_SIZE]>,
+/// Packs a granted verdict into the reply's `detail`.
+///
+/// Code 1 ("granted") stays where it was, in the low three bits, so the two masks occupy space that
+/// was previously always zero. The daemon never learns what a sub-access *is*: these are the raw
+/// bits the blob held, and "id 1 means all" is expanded on the Go side.
+fn encode_access_detail(verdict: &AccessVerdict) -> u16 {
+    const GRANTED_CODE: u16 = 1;
+    GRANTED_CODE | (u16::from(verdict.granted_mask) << 3) | (u16::from(verdict.has_subs_mask) << 7)
+}
+
+async fn send_reply(sender: &mpsc::Sender<Vec<u8>>, sequence: u64, status: u8, detail: u16) {
+    send_reply_with_extra(sender, sequence, status, detail, &[]).await;
+}
+
+/// The charge path is the only caller that has a tail: the sub-access bytes of the required slots
+/// the user turned out to hold.
+async fn send_reply_with_extra(
+    sender: &mpsc::Sender<Vec<u8>>,
     sequence: u64,
     status: u8,
     detail: u16,
+    extra: &[u8],
 ) {
     // A closed channel means the connection is already going away, so the reply has nowhere to go.
-    let _ = sender.send(encode_reply(sequence, status, detail)).await;
+    let _ = sender
+        .send(encode_reply(sequence, status, detail, extra))
+        .await;
 }

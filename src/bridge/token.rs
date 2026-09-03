@@ -21,6 +21,8 @@ pub enum TokenError {
     SessionBase64,
     #[error("session token is not a valid colbin message: {0}")]
     Session(#[from] colbin::Error),
+    #[error("session token does not carry a 16-byte hash")]
+    SessionHashWidth,
     #[error("channel token is not valid unpadded base64url")]
     ChannelBase64,
     #[error("channel token does not contain a company id")]
@@ -42,7 +44,7 @@ pub struct UserToken {
     pub company_id: i32,
     pub id: i32,
     pub created: i32,
-    pub hash: u64,
+    pub hash: [u8; 16],
     pub user: String,
 }
 
@@ -55,7 +57,7 @@ const SESSION_FIELDS: [(&str, Kind); 5] = [
     ("CompanyID", Kind::Int32),
     ("ID", Kind::Int32),
     ("Created", Kind::Int32),
-    ("Hash", Kind::Uint64),
+    ("Hash", Kind::Bytes),
     ("User", Kind::String),
 ];
 
@@ -94,7 +96,14 @@ pub fn decode_session_token(payload: &[u8]) -> Result<UserToken, TokenError> {
         company_id: record.i64(company_id) as i32,
         id: record.i64(id) as i32,
         created: record.i64(created) as i32,
-        hash: record.u64(hash),
+        // A wrong-width hash is refused here rather than compared: colbin omits a zero-valued
+        // field entirely, so a token with no hash at all would otherwise arrive as sixteen zeros
+        // and reach the tag comparison as if it had claimed something.
+        hash: record
+            .get(hash)
+            .and_then(colbin::Value::as_bytes)
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            .ok_or(TokenError::SessionHashWidth)?,
         user: record.str(user).to_owned(),
     })
 }
@@ -221,62 +230,74 @@ mod tests {
     fn decodes_the_go_colbin_vectors() {
         let vectors: [(&str, UserToken); 6] = [
             (
-                "Q5mjBvVTyUTj9mc7Ts4bJyNY1FI+iZwkAv4B",
+                "Q5mjBvVTyUQDaLS4vr/KsJBDHJKqXvm3lFUt5ZPISSLgHw==",
                 UserToken {
                     company_id: 7,
                     id: 42,
                     created: 1234,
-                    hash: 12_720_753_295_591_565_293,
+                    hash: [
+                        0xa3, 0xc5, 0xf5, 0xfd, 0x55, 0x86, 0x85, 0x1c, 0xe2, 0x90, 0x54, 0xf5, 0xca, 0xbf, 0xa5, 0xac,
+                    ],
                     user: "tester".to_owned(),
                 },
             ),
             (
-                "Q5mghkDj5lNrpi+bQtZV/gE=",
+                "Q5mghkADCNPRCYmQk5b5xyv4qUIfbe8f",
                 UserToken {
                     company_id: 1,
                     id: 1,
                     created: 0,
-                    hash: 12_633_170_512_914_502_605,
+                    hash: [
+                        0x98, 0x8e, 0x4e, 0x48, 0x84, 0x9c, 0xb4, 0xcc, 0x3f, 0x5e, 0xc1, 0x4f, 0x15, 0xfa, 0x68, 0x7b,
+                    ],
                     user: String::new(),
                 },
             ),
             (
-                "Q/n////9a/7//9//8/////01lvxsZq/h4LKGRg0B7x8=",
+                "Q/n////9a/7//9//8/////01gKbDJxSYVBmVZ0PdhsmDf4DVEPD+AQ==",
                 UserToken {
                     company_id: 2_147_483_647,
                     id: 2_147_483_647,
                     created: 2_147_483_647,
-                    hash: 15_107_712_816_652_668_818,
+                    hash: [
+                        0xd3, 0xe1, 0x13, 0x0a, 0x4c, 0xaa, 0x8c, 0xca, 0xb3, 0xa1, 0x6e, 0xc3, 0xe4, 0xc1, 0x3f, 0xc0,
+                    ],
                     user: "x".to_owned(),
                 },
             ),
             (
-                "Q9k/gr7mHDA+Byh/SllD8XY5s6D/dwNQLa4dgzZ675BcwN4iXoVj4B8=",
+                "Q9k/gr7mHDA+Byh/SlkD6A2P5Fz4vod2iKIuSuLE/kQtrh2DNnrvkFzA3iJehWPgHw==",
                 UserToken {
                     company_id: 999_999,
                     id: 12_345,
                     created: 1_700_000_000,
-                    hash: 2_309_713_256_132_687_586,
+                    hash: [
+                        0x6f, 0x78, 0x24, 0xe7, 0xc2, 0xf7, 0x3d, 0xb4, 0x43, 0x14, 0x75, 0x51, 0x12, 0x27, 0xf6, 0x27,
+                    ],
                     user: "ñandú@example.com".to_owned(),
                 },
             ),
             (
-                "QzlAavrjcwAANQ5srbRnIHH9xEctWeBXEvFfrplPJYm/AUZ+cfFbNOb5k8iJmuEf",
+                "QzlAavrjcwAANYCcfIfRFk+e5SeFiPDUXJkf1ZIFfiUR/+Wa+VSS+Btg5BcXv0Vjnj+JnKgZ/gE=",
                 UserToken {
                     company_id: 128,
                     id: 127,
                     created: 65_536,
-                    hash: 17_959_986_980_219_835_777,
+                    hash: [
+                        0x4e, 0xbe, 0xc3, 0x68, 0x8b, 0x27, 0xcf, 0xf2, 0x93, 0x42, 0x44, 0x78, 0x6a, 0xae, 0xcc, 0x8f,
+                    ],
                     user: "a-very-long-user-name-for-width-testing".to_owned(),
                 },
             ),
             (
-                "QRmjBuSTRMPrKiA5fv1uj00Nw63s7B8=",
+                "QRmjBuSTRAMI5E0wEZIo+JdL4aTJg9YmTg3DrezsHw==",
                 UserToken {
                     company_id: 3,
                     id: 4,
                     created: -5,
-                    hash: 1_962_856_781_231_164_119,
+                    hash: [
+                        0x20, 0x6f, 0x82, 0x89, 0x90, 0x44, 0xc1, 0xbf, 0x5c, 0x0a, 0x27, 0x4d, 0x1e, 0xb4, 0x36, 0x71,
+                    ],
                     user: "neg".to_owned(),
                 },
             ),
