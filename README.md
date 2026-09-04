@@ -571,22 +571,40 @@ process: on Lambda every execution environment starts empty and a large share of
 somebody's first, so caching there would pay a ScyllaDB round trip on the authorization path before
 the handler runs. The frame was going out regardless.
 
-**A grant is one `u16`**, and the level lives in the low two bits:
+**A grant is one big-endian `u16`**, and the level lives in the low two bits:
 
 ```
-bits 15..2  acceso_id
-bits  1..0  nivel - 1    nivel is 1..4; a read needs 1, a write 2
+bits 15..2  acceso_id               1..16383
+bits  1..0  nivel - 1               nivel is 1..4; a read needs 1, a write 2
 ```
 
-A required grant is satisfied by any level **at or above** it inside the same id: binary search for
-the exact value, then one look at the next element to see whether it is still under that id's ceiling
-(`required | 0b11`). This is `hasPackedAccesoInRange` from `backend/core/responses.go`, ported
-unchanged, so the two processes cannot drift into disagreeing about what a grant means.
+A required grant is satisfied by any level **at or above** it inside the same id: resolve the entry,
+then compare `granted_nivel >= required_nivel`. The encoder is
+`backend/core/accesos-blob.go::MakeAccesoNivelPacked` and this is its only other reader, so the two
+processes cannot drift into disagreeing about what a grant means.
 
-- **What is cached.** Per `(company, user)`: the sorted grants, `users.status`, and whether the row
-  exists at all. Two bytes per grant, so a user holding every access in today's catalogue costs 68
-  bytes. It sits in the same shard, mutex and key as the quota state, so a request that both
-  authorizes and charges takes one lock.
+**Grants arrive in two columns**, and which one an access is in *is* a bit of information:
+
+| Column | Holds | Shape |
+| --- | --- | --- |
+| `accesos_computed` | accesses with **no** granted sub-access | grant words only, fixed 2-byte stride, binary searched |
+| `accesos_sub_computed` | accesses with **at least one** | every grant word followed by `[1 bit MORE][7 bits flags]` sub bytes, variable width, scanned linearly with an early exit |
+
+Nothing in the second column flags that sub bytes follow, because the column is the flag — which is
+what lets the id keep all 14 of its bits in both. The consequence for this daemon: **an access lives
+in exactly one column**, so a lookup that misses the first must try the second, and `verdict()`
+resolves all `MAX_REQUIRED_ACCESS` slots against both.
+
+The daemon holds no copy of `access.toml` and does not know what any sub-access *means*. It reports
+which slots were granted, which contributed sub bytes, and copies those bytes into the reply tail
+verbatim; "sub-access id 1 means all" is expanded in Go and in the browser. See
+`RATIONALE.md` for why the tail is length-prefixed and shared by every opcode.
+
+- **What is cached.** Per `(company, user)`: both grant blobs as `Box<[u8]>` verbatim — no
+  conversion, since ScyllaDB already hands them over as bytes — plus `users.status` and whether the
+  row exists at all. Two bytes per grant with no sub-accesses, three or four with, so a user holding
+  every access in today's catalogue costs under 80 bytes. It sits in the same shard, mutex and key
+  as the quota state, so a request that both authorizes and charges takes one lock.
 - **Identity before permission.** The verdict resolves in that order — no such user, then
   `status != 1`, then grants — because the three become different HTTP answers, and collapsing them
   would tell a user this company no longer has that it merely lacks permission. `1` is the only
@@ -594,10 +612,16 @@ unchanged, so the two processes cannot drift into disagreeing about what a grant
   refused.
 - **Refusal precedes charging.** A refusal touches no usage, allocates no quota state and loads no
   budget. A 403 is free; the work given away is one binary search.
-- **The blob is little-endian.** `accesos_computed` is written by
-  `backend/genix-orm/scylla/converter.go` with `binary.LittleEndian.PutUint16`, while every integer
-  in this protocol is big-endian. Reading it the wrong way round would not fail — it would authorize
-  the wrong things.
+- **Both blobs are big-endian**, like every other integer in this protocol. They used to be the one
+  exception — `accesos_computed` was a little-endian `[]uint16` written by the ORM's converter — and
+  that exception carried a standing warning, because reading it the wrong way round does not fail:
+  it authorizes the wrong things. The bytes are now written by `backend/core/accesos-blob.go` and
+  the ORM only copies them, so the exception is gone.
+- **Ordering is validated, not repaired.** The reader used to sort and dedup defensively on load, so
+  an out-of-order blob degraded into a wrong answer for one user rather than a broken binary search.
+  That cannot survive on a variable-width column where position is load-bearing, so both blobs are
+  instead checked while they are walked — ascending ids, whole grant words, terminated sub runs, no
+  empty mask — and a bad one is refused loudly.
 - **Freshness.** `rate_limit.access_cache_seconds` (default 600) is a backstop, not the mechanism.
   `INVALIDATE_USER_ACCESS` is sent right after the column is rewritten — per user from `POST.users`,
   once per affected user from `POST.perfiles` — so a revoked access stops working immediately; the

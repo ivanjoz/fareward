@@ -1,3 +1,34 @@
+## The `:v9` reply frame carries a length-prefixed tail on every opcode
+
+**Context** — Sub-accesses meant the charge reply had to carry more than a verdict: per required
+slot, the sub-access bytes that slot holds. The reply was a fixed 5 bytes
+(`[correlation:u16][status:u8][detail:u16]`), one buffer type all the way down to the
+`mpsc::Sender<[u8; REPLY_SIZE]>` the connection writer reads from. A variable tail had to go
+somewhere, and the alternatives were a second opcode-specific frame shape or widening `detail`.
+
+**Decision** — One shape for every reply: `[correlation:u16][status:u8][detail:u16][extra_len:u8]`
+plus `extra_len` bytes. Locks, budget mutations and charges that requested no authorization pay one
+byte of `extra_len = 0` and keep their exact `status`/`detail` meaning — locks still carry their
+generation in `detail`, which is why `detail` is a `u16` at all. On a charge, `detail` bits 0..2 are
+the verdict, 3..6 the granted-slot mask and 7..10 the has-subs mask, and the tail is those slots'
+sub-byte runs in ascending slot order, capped at 8 bytes. `DOMAIN` went `fareward:v8` →
+`fareward:v9`; SipHash-2-4 itself is unchanged.
+
+**Rationale** — A per-opcode frame shape puts the length in the reader's head instead of in the
+bytes: the client would have to know which opcode a correlation id belongs to before it can know how
+many bytes to consume, and getting that wrong desynchronizes every later reply on the connection
+rather than failing one. `extra_len` costs one byte on the replies that have nothing to say and buys
+a reader that can always skip what it does not understand. Bumping only the domain separator is what
+makes a mixed backend/daemon pair fail at the *first* frame, loudly, instead of misparsing the new
+layout — which is also the cost: backend and daemon must deploy together.
+
+**The tail is copied verbatim out of the cached blob.** The daemon re-encodes nothing and still
+knows nothing about what a sub-access means: it holds no copy of `access.toml`, so "id 1 means all"
+is expanded in Go and in TypeScript, and this side only reports which slots contributed bytes.
+Re-encoding would have required it to parse the mask, which is exactly the knowledge it is
+deliberately without — and `accesos_sub_computed` runs are already self-terminating on their `MORE`
+bit, so there is nothing to reframe.
+
 ## SipHash-2-4 for the internal tags, keyed BLAKE2s-128 for the session token
 
 **Context** — Three relationships were authenticated with HMAC-SHA256 and none of them wanted a
