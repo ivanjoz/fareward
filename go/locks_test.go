@@ -21,6 +21,9 @@ type muxDaemonStub struct {
 	// answer decides the reply for one request. Returning ok=false withholds the reply entirely,
 	// which is how a queued acquire is simulated.
 	answer func(sequence uint64, opcode byte, payload []byte) (status byte, detail uint16, ok bool)
+	// answerExtra supplies the reply's tail. Nil means no tail, which is every opcode but a charge
+	// that asked for authorization and a sequence reservation.
+	answerExtra func(sequence uint64, opcode byte, payload []byte) []byte
 	// deferred holds replies the stub chose to withhold, so a test can release them later.
 	deferred []deferredReply
 	conns    []net.Conn
@@ -80,16 +83,34 @@ func (stub *muxDaemonStub) handle(connection net.Conn) {
 		if _, err := io.ReadFull(connection, opcode); err != nil {
 			return
 		}
-		body := make([]byte, frameSizeFor(opcode[0])-1)
-		if _, err := io.ReadFull(connection, body); err != nil {
-			return
+		// A length-prefixed opcode states its own width; every other one has it fixed by the
+		// opcode alone.
+		var body, payload []byte
+		if opcodeIsLengthPrefixed(opcode[0]) {
+			header := make([]byte, farewardLengthPrefixSize)
+			if _, err := io.ReadFull(connection, header); err != nil {
+				return
+			}
+			declared := int(binary.BigEndian.Uint16(header))
+			rest := make([]byte, declared+farewardAuthTagSize)
+			if _, err := io.ReadFull(connection, rest); err != nil {
+				return
+			}
+			body = append(header, rest...)
+			payload = rest[:declared]
+		} else {
+			body = make([]byte, frameSizeFor(opcode[0])-1)
+			if _, err := io.ReadFull(connection, body); err != nil {
+				return
+			}
+			payload = body[:len(body)-farewardAuthTagSize]
 		}
 		stub.frames <- append(opcode, body...)
 
 		stub.mu.Lock()
 		answer := stub.answer
+		answerExtra := stub.answerExtra
 		stub.mu.Unlock()
-		payload := body[:len(body)-farewardAuthTagSize]
 		status, detail, ok := answer(sequence, opcode[0], payload)
 		if !ok {
 			stub.mu.Lock()
@@ -98,7 +119,12 @@ func (stub *muxDaemonStub) handle(connection net.Conn) {
 			stub.mu.Unlock()
 			continue
 		}
-		if _, err := connection.Write(makeStubReply(sequence, status, detail)); err != nil {
+		var extra []byte
+		if answerExtra != nil {
+			extra = answerExtra(sequence, opcode[0], payload)
+		}
+		if _, err := connection.Write(
+			makeStubReplyWithExtra(sequence, status, detail, extra)); err != nil {
 			return
 		}
 	}

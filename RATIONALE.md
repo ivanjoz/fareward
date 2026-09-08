@@ -1,3 +1,112 @@
+## Moving a counter is an opcode, because a block outlives the value it came from
+
+**Context** — `ResetCounter` in genix-orm realigns a counter with the rows a partition actually
+holds, and `RestoreBackup` calls it per table from a live HTTP handler. Once the daemon allocates in
+blocks, that write is no longer a peer of the daemon's own: the daemon may be serving ids from a
+range it derived from the value being erased. It keeps issuing them, so the durable counter stops
+bounding what has been handed out, and the next block it claims overlaps what the abandoned one
+already gave away. Waiting for the daemon to be "idle" is not a mitigation — a block is only
+re-derived when it is exhausted, so an idle counter is precisely one holding a stale block forever.
+
+**Decision** — Opcode `0x08 SET_SEQUENCE`: absolute `i64` plus counter name, same length-prefixed
+shape as a reservation. The daemon takes the same per-name lock, applies the delta the counter
+column requires, and marks its in-memory block spent in the same critical section. It answers with
+the value it replaced. genix-orm gained a paired `SetCounterValue` hook that `ResetCounter` uses
+when one is installed, and Genix installs both hooks together in `db/autoincrement.go`.
+
+**Rationale** — Dropping the block is the actual fix; moving the counter is the easy half. Doing
+both under one lock is what makes them atomic with respect to an in-flight reservation, and no
+amount of care on the client side could have achieved that from outside the daemon. Costs: the
+abandoned block's unused tail is burned on every reset, which is the same gap a restart produces and
+just as harmless; and the two hooks are now a pair that must be installed together, since an
+allocator that reserves ranges but does not own the resets is worse than either extreme. The reply
+carries the previous value because after a destructive repair that figure exists nowhere else, and
+that is also why the client uses `requestOnce` — a retry would report the value the first attempt
+had already written.
+
+## Sequence reservations claim blocks up front and the daemon owns the row
+
+**Context** — The reservation had to be durable and safe against concurrent callers. Cassandra
+counters make an increment atomic but will not report the result of your own increment, so any
+allocator built on them has to read separately — which is exactly the race that moved this here.
+Two shapes were available: keep the `counter` column and make one process the only writer, or
+migrate `sequences.current_value` to a bigint and reserve with an LWT compare-and-set.
+
+**Decision** — Hi-lo blocks over the existing `counter` column. Under a per-name mutex the daemon
+bumps the durable counter by a whole block, reads back where that landed, owns `(V-block, V]`, and
+serves from memory until it is spent. `block_size` defaults to 64. A counter found non-positive is
+repaired to restart at 1, mirroring `nextCounterRange` in genix-orm's `scylla/main.go`.
+
+**Rationale** — No schema migration of a live table and no Paxos on the write path, and the
+read-back is sound because nothing else writes the row. Two costs, both real. The daemon must be
+the *only* writer — a client still on the ORM's direct path would read a value the daemon is about
+to claim — which is why Genix wires the ORM to the daemon unconditionally rather than behind a
+setting. And a restart burns each live block's tail; `block_size` stays small because
+`updated_version` packs into a
+delta-view digit slot as narrow as 10⁸ per partition, so that headroom is not free. Re-deriving the
+range from the durable value on every block rather than caching one at startup is what keeps a
+counter repaired underneath the daemon (`ResetCounter`) from needing a restart to be seen.
+
+## `RESERVE_SEQUENCE` carries the counter name as a string, not a hash
+
+**Context** — Every other opcode identifies its subject with fixed-width integers, and the lock
+service in particular takes an opaque `(action u16, identifier i64)` the daemon never interprets.
+The obvious parallel was to SipHash the counter name into a `u64` and keep the frame fixed-width;
+the crate already has SipHash for the frame tags.
+
+**Decision** — The name travels verbatim as length-prefixed UTF-8, capped at 128 bytes, making
+`0x07` the second length-prefixed opcode and the first that is also answered.
+
+**Rationale** — The daemon does not merely route on this value, it writes it into a `sequences` row
+key that the ORM, `deploy.go`'s `ResetCounter` and a person at a CQL prompt all address by that same
+name. A hash would have forced either a second key space nothing else can read, or a name the
+daemon does not have. What it costs is a variable-width frame and a 128-byte ceiling that closes the
+connection when exceeded — the same bound, and the same reason, as the request log's.
+
+## A refused reservation fails the write instead of falling back
+
+**Context** — Every other client-side operation here has a fallback: a charge that gets no answer
+proceeds, a lock that cannot be taken lets each call site decide. A reservation could likewise have
+fallen back to the ORM's own `GetCounter` whenever the daemon was unreachable, which would keep
+inserts working through a daemon restart.
+
+**Decision** — `ReserveCounterRange` returns its error verbatim and genix-orm propagates it; there
+is no fallback path. `ReserveSequence` also rejects a success carrying no tail, a short tail, or a
+non-positive value.
+
+**Rationale** — The fallback is the failure. The daemon claims ranges of a counter in advance, so
+the direct path would read a value the daemon already considers its own and hand out ids inside that
+range — the fallback would mint duplicate primary keys precisely when it fired. A failed insert is
+recoverable and visible; a silently overwritten record is neither. The extra reply validation is the
+same reasoning applied to a daemon that disagrees with the client about the wire.
+
+## The operator company is exempt from the refusal, not from the charge
+
+**Context** — `CreditExemptCompanyID` implemented the operator exemption by zeroing `cpuCredits`
+and `inferenceCredits` inside `chargeConfiguredCredits`, and returning before sending a frame at all
+when the route required no access. The daemon therefore never saw a charge for company 1: no
+`credit_usage_user` / `credit_usage_company` row was ever written, `company_credit_budget.day_cpu_used`
+stayed at 0, and the whole Créditos panel read zero for the operator with nothing to explain it.
+The requirement is both halves: meter it, never block it.
+
+**Decision** — Renamed to `OperatorCompanyID` and the zeroing is gone; the operator's frames carry
+real credits and are charged like any tenant's. `TolerateCreditRefusal(companyID, err)` is the new
+seam: true for the operator on anything that is not an `AccessDenied`. The API path applies it in
+`enforceAccessAndCredits`, `ChargeInferenceUsage` applies it to itself. The one bypass left inside
+`chargeConfiguredCredits` is a missing daemon, and only for a frame carrying no required access.
+
+**Rationale** — Doing it in the daemon instead (skip the quota gates for one company ID, keep
+`increment_usage`) would have meant a Rust change, a second place that has to know which company is
+the operator, and giving up the property that the operator still gets in when the daemon is down —
+which is the reason the exemption exists. Keeping it client-side costs one thing: a refused frame
+returns no `AccessGrant`, so tolerating it needs a follow-up authorize-only frame to recover the
+grant, or the operator's sub-accesses would silently blank out at exactly the moment its budget ran
+out. That second frame is safe by construction — `exceeds(current, 0, limit)` is `current > limit`,
+and since a refusal charges nothing the accumulated usage never passes the ceiling — so a
+zero-credit frame can never itself be refused on quota. The cost of leaving "a refusal charges
+nothing" alone: the specific request that got tolerated is not counted. That is deliberate, so the
+usage reports keep meaning "what the daemon actually admitted".
+
 ## The `:v9` reply frame carries a length-prefixed tail on every opcode
 
 **Context** — Sub-accesses meant the charge reply had to carry more than a verdict: per required

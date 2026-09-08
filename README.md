@@ -69,11 +69,14 @@ tables sits with whoever runs the migrations; in the Genix deployment that is th
 | `company_credit_budget` | read + write | the extra-credit pool, its ceiling and the activated month |
 | `user_logs`, `request_errors` | write | the request log |
 | `server_metrics` | write | the metrics collector |
+| `sequences` | read + write | the autoincrement counters behind `RESERVE_SEQUENCE` and `SET_SEQUENCE` |
 
 The split matters at startup. The limiter loads usage before admitting anything and **exits** if it
-cannot, so its four tables are a hard precondition. The last three are written by the two services
-that fail open: a missing column leaves `ensure_prepared` retrying once a minute and dropping rows,
-and the process stays up.
+cannot, so its four tables are a hard precondition. `sequences` joins them: its statements are
+prepared at startup and a failure there **exits**, because a backend configured to reserve its ids
+here has no second way to get one. The remaining three are written by the two services that fail
+open: a missing column leaves `ensure_prepared` retrying once a minute and dropping rows, and the
+process stays up.
 
 ### Could a Rust or Node backend drive this?
 
@@ -299,6 +302,16 @@ max_total_waiters = 4096
 max_lease_ms      = 60000
 ```
 
+The sequence allocator adds two knobs, both defaulted. Neither says which counters exist: the
+daemon learns a name the first time a client asks for it.
+
+```toml
+# Purpose: Size the id blocks reserved per durable bump, and bound the map that tracks them.
+[sequence]
+block_size        = 64
+max_tracked_names = 200000
+```
+
 The request log adds a section where every key has a default, so omitting it entirely means "on,
 with these" rather than a refusal to start:
 
@@ -471,8 +484,10 @@ shared frame shape, and the three operations have no field in common.
 | `0x04` | `LOG_REQUEST` | `[length:u16]` then date `i16` · request `i64` · route `i16` · frame `u8` · company `u24` · user `i32` · elapsed `u16` · errors `u8`, then per error: id `i32` · line `u8`+bytes · text `u16`+bytes | ≤ 1 110 |
 | `0x05` | `MUTATE_COMPANY_BUDGET` | company `u24` · operation `u8` · CPU `u64` · inference `u64` | 29 |
 | `0x06` | `INVALIDATE_USER_ACCESS` | company `u24` · user `u24` (`0` = every user of the company) | 15 |
+| `0x07` | `RESERVE_SEQUENCE` | `[length:u16]` then increment `u32` · counter name (UTF-8, ≤ 128 B) | ≤ 143 |
+| `0x08` | `SET_SEQUENCE` | `[length:u16]` then value `i64` · counter name (UTF-8, ≤ 128 B) | ≤ 147 |
 
-`0x00` stays unassigned so an all-zero frame cannot route. 249 opcodes remain free; new *use
+`0x00` stays unassigned so an all-zero frame cannot route. 247 opcodes remain free; new *use
 cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
 
 Three properties vary by opcode, and every variation is deliberate:
@@ -482,14 +497,19 @@ Three properties vary by opcode, and every variation is deliberate:
 | `0x01` `0x02` `0x03` `0x05` | yes | fixed width | closes the connection |
 | `0x04` `LOG_REQUEST` | **never** | `u16` length prefix | warning, connection survives |
 | `0x06` `INVALIDATE_USER_ACCESS` | **never** | fixed width | closes the connection |
+| `0x07` `RESERVE_SEQUENCE` `0x08` `SET_SEQUENCE` | yes | `u16` length prefix | refused with a status, connection survives |
 
-`0x04` carries strings, hence the prefix; its length is inside the signed bytes, and one declaring
-more than the ceiling still closes the connection. Neither it nor `0x06` is answered — waiting on
-"the log row was stored" would put this daemon on the critical path of every request in the system,
-and the grant cache's TTL already bounds a lost invalidation — but both still advance the sequence,
-which is what the tag is bound to. Only `0x04` survives a decode failure: the others decide whether
-a request is admitted, and a log row is not worth taking down the charges and locks sharing that
-socket.
+`0x04`, `0x07` and `0x08` carry strings, hence the prefix; the length is inside the signed bytes, and one
+declaring more than the ceiling still closes the connection. Neither `0x04` nor `0x06` is answered
+— waiting on "the log row was stored" would put this daemon on the critical path of every request
+in the system, and the grant cache's TTL already bounds a lost invalidation — but both still
+advance the sequence, which is what the tag is bound to. The two sequence opcodes are
+length-prefixed and *answered*, because the value each returns is the whole point of the call.
+
+Two opcodes survive a decode failure, for opposite reasons. A log row is not worth taking down the
+charges and locks sharing that socket, so `0x04` warns and moves on. A sequence call has a caller
+parked waiting for a value, so `0x07` and `0x08` answer with a non-zero status rather than staying
+silent and hanging it until its own timeout. The rest decide whether a request is admitted at all.
 
 ### The charge frame asks two independent questions
 
@@ -707,6 +727,59 @@ Locks are in-memory: a restart drops all of them, and two daemon instances would
 to two holders. Single active process, same as the limiter. And a lock orders callers; it does not
 make them safe — a partition can free a key while its holder still works, so work inside one must
 remain safe to run twice.
+
+## Sequence behavior
+
+Two opcodes, one counter table. `RESERVE_SEQUENCE` (`0x07`) hands back the first of `increment`
+consecutive values on a named counter — the same contract, the same counter names and the same
+`sequences` table as the Go ORM's own `GetCounter`. `SET_SEQUENCE` (`0x08`) moves a counter to an
+absolute value, which is the repair path a restore needs. Only who advances the row changes.
+
+**Why it moved here.** The ORM reads the counter, then increments it, with nothing in between. A
+Cassandra counter makes the increment atomic but will not report the result of *your* increment, so
+two concurrent writers read the same value and mint the same id. That is a silently overwritten
+record when the id is a primary key. Serializing the reservation in one process is what removes it,
+and this daemon is already the project's single active process.
+
+**Hi-lo blocks.** A reservation that fits the range the daemon already owns is answered from memory
+with no I/O at all. When it does not, the daemon bumps the durable counter by a whole block, reads
+back where that landed, and owns the range it just created:
+
+```text
+UPDATE sequences SET current_value = current_value + block WHERE name = ?
+SELECT current_value  ->  V        owns (V-block, V]
+```
+
+Two properties follow from bumping **before** handing anything out. The durable value is always at
+or above the highest value ever issued, so a crash loses a block's unused tail — a gap, never a
+reuse. And because the range is re-derived from the durable value on every block rather than from
+one cached at startup, a counter repaired underneath the daemon is picked up on the next block
+instead of needing a restart.
+
+**Exclusivity is the price.** The read-back is only sound while nothing else writes those rows. A
+client still on the ORM's direct path would read a value the daemon is about to claim and hand out
+ids from inside the daemon's own range. There is deliberately no switch for this in Genix — the ORM
+is wired to the daemon in `backend/db/autoincrement.go`'s package init, so no entry point can be
+left on the direct path — and a refusal here is fatal to the write rather than a reason to fall
+back. A failed insert is recoverable; a duplicate primary key is not.
+
+**`SET_SEQUENCE` is why exclusivity extends to repairs too.** Restoring a backup realigns a counter
+with the rows that survived, which means moving it to an absolute value — often *downwards*. Doing
+that behind the daemon's back is worse than an ordinary concurrent write: the daemon keeps serving a
+block it derived from the value that just disappeared, so the durable counter no longer bounds what
+has been issued, and the next block it claims hands out ids the abandoned one already gave away.
+`0x08` moves the counter and drops the block under the same per-name lock, which is the only way the
+two can be atomic with respect to each other. It answers with the value it replaced, since after a
+destructive repair that figure exists nowhere else. A counter is set with an absolute value even
+though the column is increment-only: the daemon reads and applies the delta, which is safe for the
+same reason the reserve path's read-back is.
+
+**Tuning.** `sequence.block_size` (default 64) trades restart burn against round trips. It stays
+modest because the ORM's `updated_version` packs into a fixed digit slot in its delta views — as
+narrow as 10⁸ per partition — so burned blocks eat headroom that is not free.
+`sequence.max_tracked_names` (default 200 000) bounds the in-memory map; real cardinality is
+companies × tables, and entries whose block is already spent are dropped first, since evicting a
+live one would burn its tail.
 
 ## Request log behavior
 

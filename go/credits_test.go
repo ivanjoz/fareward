@@ -3,8 +3,10 @@ package fareward
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
+	"time"
 )
 
 // These twenty bytes are the contract with the Rust decoder, which reads them by offset. The
@@ -323,41 +325,75 @@ func TestAccessInvalidationFrameMatchesTheRustAuthVector(t *testing.T) {
 	}
 }
 
-// The operator's own company runs without a budget. With no daemon configured, an exempt
-// charge has to come back nil where any other company gets ErrCreditLimiterMissing — that
-// difference is the whole exemption, and it is what keeps company 1 usable when the limiter
-// says the tenant is out of credit.
-func TestTheOperatorCompanyIsExemptFromCreditBudgets(t *testing.T) {
+// The regression this replaces: the operator's credits used to be zeroed here before the frame was
+// built, so the daemon never saw a charge, never wrote a credit_usage row, and every number on the
+// operator's own usage report sat at zero with nothing to explain it. The frame must carry the real
+// amounts — what the operator is spared is the refusal, and that lives in the router.
+func TestTheOperatorCompanyIsChargedLikeAnyTenant(t *testing.T) {
+	stub := startMuxDaemonStub(t)
+	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return 0, 0, true }
+	installStubAsConfiguredFareward(t, stub)
+
 	if _, err := chargeConfiguredCredits(
-		context.Background(), CreditExemptCompanyID, 1, 10, 5, 0, nil, false,
+		context.Background(), OperatorCompanyID, 1, 10, 300, 25, nil, false,
 	); err != nil {
-		t.Fatalf("the exempt company must not be charged, got %v", err)
+		t.Fatalf("the operator charge was refused: %v", err)
 	}
 
-	// Any other tenant still reaches the limiter, so the exemption is not a global bypass.
-	if _, err := chargeConfiguredCredits(
-		context.Background(), CreditExemptCompanyID+1, 1, 10, 5, 0, nil, false,
-	); err == nil {
-		t.Fatal("a non-exempt company must still be metered")
+	// Read with a deadline rather than blocking: the regression's shape was "no frame at all", and
+	// a test that hangs on it reports a timeout instead of the assertion that failed.
+	var frame []byte
+	select {
+	case frame = <-stub.frames:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no charge frame reached the daemon for the operator company")
 	}
 
-	// Inference credits go through the same seam, so the agent is exempt too.
-	if _, err := chargeConfiguredCredits(
-		context.Background(), CreditExemptCompanyID, 1, 10, 0, 500, nil, false,
-	); err != nil {
-		t.Fatalf("inference credits must be exempt as well, got %v", err)
+	// frame[0] is the opcode, so the payload offsets shift by one.
+	if cpuCredits := binary.BigEndian.Uint16(frame[9:11]); cpuCredits != 300 {
+		t.Fatalf("cpu credits on the wire = %d; want the 300 that were asked for", cpuCredits)
+	}
+	if inferenceCredits := binary.BigEndian.Uint16(frame[11:13]); inferenceCredits != 25 {
+		t.Fatalf("inference credits on the wire = %d; want the 25 that were asked for", inferenceCredits)
 	}
 }
 
-// Exemption is from the budget, not from permissions: a frame that still has an access to
-// check must reach the daemon rather than be short-circuited to nil.
-func TestTheExemptCompanyIsStillAuthorized(t *testing.T) {
-	_, err := chargeConfiguredCredits(
-		context.Background(), CreditExemptCompanyID, 1, 10, 5, 0, []uint16{9}, false)
-	if err == nil {
-		t.Fatal("an access check must still be sent for the exempt company")
+// installStubAsConfiguredFareward points the process-wide client at the stub and puts it back
+// afterwards: the tests around this one assert what happens with no daemon at all.
+func installStubAsConfiguredFareward(t *testing.T, stub *muxDaemonStub) {
+	t.Helper()
+	if err := ConfigureFareward(stub.listener.Addr().String(), "test-secret"); err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, ErrCreditLimiterMissing) {
-		t.Fatalf("expected the frame to reach the limiter, got %v", err)
+	t.Cleanup(func() {
+		configuredFarewardMu.Lock()
+		configuredFareward = nil
+		configuredFarewardMu.Unlock()
+	})
+}
+
+// With no daemon there is no decision, so the charge fails closed — except for the operator on a
+// frame that asks for no authorization, which is the one bypass left: being locked out by the very
+// process that needs fixing is the failure it allows for.
+func TestAMissingDaemonOnlyLetsTheOperatorThrough(t *testing.T) {
+	if _, err := chargeConfiguredCredits(
+		context.Background(), OperatorCompanyID, 1, 10, 5, 0, nil, false,
+	); err != nil {
+		t.Fatalf("the operator must get through a dead daemon, got %v", err)
+	}
+
+	// Any other tenant is refused, so the bypass is not a global one.
+	if _, err := chargeConfiguredCredits(
+		context.Background(), OperatorCompanyID+1, 1, 10, 5, 0, nil, false,
+	); !errors.Is(err, ErrCreditLimiterMissing) {
+		t.Fatalf("a tenant must still fail closed, got %v", err)
+	}
+
+	// An unenforced permission is not a degraded mode: a frame carrying accesses is refused even
+	// for the operator, because there is nothing here that could check them.
+	if _, err := chargeConfiguredCredits(
+		context.Background(), OperatorCompanyID, 1, 10, 5, 0, []uint16{9}, false,
+	); !errors.Is(err, ErrCreditLimiterMissing) {
+		t.Fatalf("an access check cannot be skipped for the operator, got %v", err)
 	}
 }

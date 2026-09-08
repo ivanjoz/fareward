@@ -12,6 +12,9 @@ use crate::{
     limiter::protocol::CHARGE_PAYLOAD_SIZE,
     lock::protocol::{ACQUIRE_PAYLOAD_SIZE, RELEASE_PAYLOAD_SIZE},
     reqlog::protocol::REQUEST_LOG_MAX_PAYLOAD_SIZE,
+    sequence::protocol::{
+        SEQUENCE_REPLY_EXTRA_SIZE, SEQUENCE_RESERVE_MAX_PAYLOAD_SIZE, SEQUENCE_SET_MAX_PAYLOAD_SIZE,
+    },
 };
 
 pub const OPCODE_SIZE: usize = 1;
@@ -20,8 +23,15 @@ pub const AUTH_TAG_SIZE: usize = 8;
 /// byte, which is zero for every opcode but a charge that asked for authorization.
 pub const REPLY_HEAD_SIZE: usize = 6;
 
-/// Widest tail a reply may carry: `MAX_REQUIRED_ACCESS` slots of at most two sub bytes each.
-pub const REPLY_MAX_EXTRA_SIZE: usize = 2 * MAX_REQUIRED_ACCESS;
+/// Widest tail a reply may carry, over every opcode that has one: `MAX_REQUIRED_ACCESS` slots of at
+/// most two sub bytes each for a charge, and one `i64` for a sequence reservation. The two are the
+/// same width today, which is exactly why this is a `max` — a narrower `MAX_REQUIRED_ACCESS` would
+/// otherwise silently truncate a reserved value.
+pub const REPLY_MAX_EXTRA_SIZE: usize = if 2 * MAX_REQUIRED_ACCESS > SEQUENCE_REPLY_EXTRA_SIZE {
+    2 * MAX_REQUIRED_ACCESS
+} else {
+    SEQUENCE_REPLY_EXTRA_SIZE
+};
 /// Width of the length header a variable-payload opcode carries between the opcode and its
 /// payload. Only `LOG_REQUEST` uses one — every other operation describes a fixed record whose
 /// width the opcode already implies.
@@ -72,11 +82,24 @@ const LARGEST_FIXED_PAYLOAD_SIZE: usize =
     } else {
         PREVIOUS_LARGEST_FIXED_PAYLOAD_SIZE
     };
+// A set carries an i64 where a reservation carries a u32, so it is the wider of the two.
+const LARGEST_SEQUENCE_PAYLOAD_SIZE: usize =
+    if SEQUENCE_RESERVE_MAX_PAYLOAD_SIZE > SEQUENCE_SET_MAX_PAYLOAD_SIZE {
+        SEQUENCE_RESERVE_MAX_PAYLOAD_SIZE
+    } else {
+        SEQUENCE_SET_MAX_PAYLOAD_SIZE
+    };
+const LARGEST_LENGTH_PREFIXED_PAYLOAD_SIZE: usize =
+    if REQUEST_LOG_MAX_PAYLOAD_SIZE > LARGEST_SEQUENCE_PAYLOAD_SIZE {
+        REQUEST_LOG_MAX_PAYLOAD_SIZE
+    } else {
+        LARGEST_SEQUENCE_PAYLOAD_SIZE
+    };
 const LARGEST_PAYLOAD_SIZE: usize =
-    if LARGEST_FIXED_PAYLOAD_SIZE > LENGTH_PREFIX_SIZE + REQUEST_LOG_MAX_PAYLOAD_SIZE {
+    if LARGEST_FIXED_PAYLOAD_SIZE > LENGTH_PREFIX_SIZE + LARGEST_LENGTH_PREFIXED_PAYLOAD_SIZE {
         LARGEST_FIXED_PAYLOAD_SIZE
     } else {
-        LENGTH_PREFIX_SIZE + REQUEST_LOG_MAX_PAYLOAD_SIZE
+        LENGTH_PREFIX_SIZE + LARGEST_LENGTH_PREFIXED_PAYLOAD_SIZE
     };
 pub const MAX_FRAME_SIZE: usize = OPCODE_SIZE + LARGEST_PAYLOAD_SIZE + AUTH_TAG_SIZE;
 
@@ -89,6 +112,8 @@ pub enum Opcode {
     LogRequest = 0x04,
     MutateCompanyBudget = 0x05,
     InvalidateUserAccess = 0x06,
+    ReserveSequence = 0x07,
+    SetSequence = 0x08,
 }
 
 /// How the reader learns where a frame's payload ends.
@@ -115,6 +140,8 @@ impl Opcode {
             0x04 => Some(Self::LogRequest),
             0x05 => Some(Self::MutateCompanyBudget),
             0x06 => Some(Self::InvalidateUserAccess),
+            0x07 => Some(Self::ReserveSequence),
+            0x08 => Some(Self::SetSequence),
             _ => None,
         }
     }
@@ -129,6 +156,16 @@ impl Opcode {
             },
             Self::MutateCompanyBudget => PayloadWidth::Fixed(MUTATE_BUDGET_PAYLOAD_SIZE),
             Self::InvalidateUserAccess => PayloadWidth::Fixed(INVALIDATE_ACCESS_PAYLOAD_SIZE),
+            // Length-prefixed for the same reason as the request log: it carries a counter name,
+            // and a name is a string. The ceiling is what bounds what an unauthenticated peer can
+            // ask the daemon to buffer.
+            Self::ReserveSequence => PayloadWidth::LengthPrefixed {
+                maximum: SEQUENCE_RESERVE_MAX_PAYLOAD_SIZE,
+            },
+            // Same shape as a reservation, one field wider: an absolute i64 instead of a u32 count.
+            Self::SetSequence => PayloadWidth::LengthPrefixed {
+                maximum: SEQUENCE_SET_MAX_PAYLOAD_SIZE,
+            },
         }
     }
 
@@ -165,6 +202,8 @@ mod tests {
             Opcode::LogRequest,
             Opcode::MutateCompanyBudget,
             Opcode::InvalidateUserAccess,
+            Opcode::ReserveSequence,
+            Opcode::SetSequence,
         ] {
             let widest = match opcode.payload_width() {
                 PayloadWidth::Fixed(payload) => OPCODE_SIZE + payload + AUTH_TAG_SIZE,
@@ -177,13 +216,26 @@ mod tests {
     }
 
     #[test]
-    fn only_the_request_log_is_length_prefixed_and_two_opcodes_are_unanswered() {
+    fn the_string_carrying_opcodes_are_length_prefixed_and_two_are_unanswered() {
+        // Both of these carry a string, which is the only reason an opcode may state its own
+        // length: the width cannot be implied by the operation.
+        for opcode in [Opcode::LogRequest, Opcode::ReserveSequence, Opcode::SetSequence] {
+            assert!(matches!(
+                opcode.payload_width(),
+                PayloadWidth::LengthPrefixed { .. }
+            ));
+            assert_eq!(opcode.fixed_frame_size(), None);
+        }
         assert_eq!(Opcode::from_byte(0x04), Some(Opcode::LogRequest));
-        assert!(matches!(
-            Opcode::LogRequest.payload_width(),
-            PayloadWidth::LengthPrefixed { .. }
-        ));
-        assert_eq!(Opcode::LogRequest.fixed_frame_size(), None);
+        assert_eq!(Opcode::from_byte(0x07), Some(Opcode::ReserveSequence));
+        assert_eq!(Opcode::from_byte(0x08), Some(Opcode::SetSequence));
+        // A reservation is length-prefixed but still answered — the reserved value is the point of
+        // the call, so unlike the request log a client does park a caller waiting for it.
+        assert!(Opcode::ReserveSequence.expects_reply());
+        // A set is answered too: it reports the value it replaced, which is the caller's only
+        // record of what the counter held before a destructive repair.
+        assert!(Opcode::SetSequence.expects_reply());
+
         // Nothing is sent back for either of these, so a client must not park a caller waiting.
         assert!(!Opcode::LogRequest.expects_reply());
         assert_eq!(Opcode::from_byte(0x06), Some(Opcode::InvalidateUserAccess));
@@ -197,6 +249,13 @@ mod tests {
             assert!(opcode.expects_reply());
             assert!(matches!(opcode.payload_width(), PayloadWidth::Fixed(_)));
         }
+    }
+
+    /// The reserved value is an `i64`, so a reply tail that could not carry eight bytes would
+    /// truncate an id into a different, valid-looking id.
+    #[test]
+    fn the_reply_tail_can_carry_a_reserved_value() {
+        assert!(REPLY_MAX_EXTRA_SIZE >= SEQUENCE_REPLY_EXTRA_SIZE);
     }
 
     #[test]
@@ -241,6 +300,7 @@ mod tests {
         assert_eq!(Opcode::LockRelease.fixed_frame_size(), Some(21));
         // Unassigned bytes must not resolve, or a garbage frame would be dispatched.
         assert_eq!(Opcode::from_byte(0x00), None);
+        assert_eq!(Opcode::from_byte(0x09), None);
         assert_eq!(Opcode::from_byte(0xFF), None);
     }
 }

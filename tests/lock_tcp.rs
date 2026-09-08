@@ -25,6 +25,10 @@ use fareward::{
     },
     lock::registry::{LockLimits, LockRegistry},
     reqlog::writer::RequestLogSink,
+    sequence::{
+        allocator::{SequenceAllocator, SequenceLimits},
+        store::SequenceStore,
+    },
     service::server,
     siphash::{SipHasher24, derive_key},
 };
@@ -38,10 +42,24 @@ use tokio::{
 const SECRET: &[u8] = b"lock-test-secret";
 const ACTION: u16 = 7;
 
-/// The limiter is not under test here, but `server::run` needs one, and it must not touch a
-/// database.
+/// Neither the limiter nor the sequence allocator is under test here, but `server::run` needs
+/// both, and neither may touch a database.
 #[derive(Default)]
 struct EmptyStore;
+
+#[derive(Default)]
+struct MemorySequenceStore(std::sync::Mutex<std::collections::HashMap<String, i64>>);
+
+#[async_trait]
+impl SequenceStore for MemorySequenceStore {
+    async fn bump(&self, name: &str, by: i64) -> Result<()> {
+        *self.0.lock().unwrap().entry(name.to_owned()).or_insert(0) += by;
+        Ok(())
+    }
+    async fn read(&self, name: &str) -> Result<i64> {
+        Ok(*self.0.lock().unwrap().get(name).unwrap_or(&0))
+    }
+}
 
 #[async_trait]
 impl LimiterStore for EmptyStore {
@@ -129,6 +147,14 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
         // These tests drive locks and charges; request logs would be written to a database this
         // harness does not have, so the sink accepts and discards.
         RequestLogSink::disabled(),
+        Arc::new(SequenceAllocator::new(
+            Arc::new(MemorySequenceStore::default()),
+            2,
+            SequenceLimits {
+                block_size: 64,
+                max_tracked_names: 64,
+            },
+        )),
         Arc::new(SECRET.to_vec()),
         frame_timeout,
         64,

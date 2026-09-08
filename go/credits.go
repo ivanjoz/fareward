@@ -271,6 +271,14 @@ func ChargeInferenceUsage(ctx context.Context, inputBytes, outputBytes int) erro
 	_, err = chargeConfiguredCredits(
 		ctx, identity.companyID, identity.userID, identity.routeID, 0, inferenceCredits, nil, false,
 	)
+	// The tolerance is applied here and not by the caller, which is the one place that differs from
+	// the API path: the identity travels in the context, so this is the only code that knows whose
+	// company was charged. Nothing is lost by swallowing it — there is no access grant in an
+	// inference frame, and the provider call already succeeded.
+	if TolerateCreditRefusal(identity.companyID, err) {
+		logLine("credit refusal tolerated for the operator company::", err)
+		return nil
+	}
 	return err
 }
 
@@ -290,16 +298,29 @@ func IsCreditRateLimitError(err error) bool {
 		strings.Contains(err.Error(), "credit rate limiter")
 }
 
-// chargeConfiguredCredits fails closed: no authenticated decision means no API work is allowed.
-// CreditExemptCompanyID is the platform operator's own company, seeded as ID 1 by fn-init. It
-// runs without a credit budget: the limiter exists to meter tenants, and metering the operator
-// would lock the software exactly when someone needs to get in and fix it.
+// OperatorCompanyID is the platform operator's own company, seeded as ID 1 by fn-init.
 //
-// The exemption is from the *budget*, not from permissions. The access frame still goes out and
-// is still enforced, which is the same split ChargeAPIAccessOnly already makes for the
-// credit-exempt routes.
-const CreditExemptCompanyID int32 = 1
+// It is charged and metered exactly like a tenant: the usage reports and the budget row are the
+// only way to see what the platform itself costs, and zeroing its charges here — which is what
+// this constant used to do — left every one of those numbers at zero with nothing to say why.
+//
+// What it is exempt from is the *refusal*, not the charge. See TolerateCreditRefusal.
+const OperatorCompanyID int32 = 1
 
+// TolerateCreditRefusal reports whether a refusal stays in the log instead of reaching the caller.
+// Only the operator's company, and only when the refusal is about credit.
+//
+// The charge still goes out and is still metered — being metered is the point — but running out of
+// budget must not lock out the one session that has to get in and raise it. It covers all three
+// ceilings alike: the 10s burst, the hour and the day, plus a transport failure, because none of
+// them is a reason to shut the operator out of its own platform.
+//
+// An AccessDenied is never tolerated: what is exempt is the credit, not the permission.
+func TolerateCreditRefusal(companyID int32, err error) bool {
+	return err != nil && companyID == OperatorCompanyID && !IsAccessDeniedError(err)
+}
+
+// chargeConfiguredCredits fails closed: no authenticated decision means no API work is allowed.
 func chargeConfiguredCredits(
 	ctx context.Context,
 	companyID, userID int32,
@@ -308,17 +329,15 @@ func chargeConfiguredCredits(
 	requiredAccess []uint16,
 	extraCreditsAllowed bool,
 ) (*AccessGrant, error) {
-	if companyID == CreditExemptCompanyID {
-		cpuCredits, inferenceCredits = 0, 0
-		// Nothing left to charge and nothing to authorize: encodeCharge rejects an empty frame,
-		// and sending one would turn every exempt read into a limiter error.
-		if len(requiredAccess) == 0 {
-			return nil, nil
-		}
-	}
-
 	client := farewardClient()
 	if client == nil {
+		// The operator gets through a dead daemon, but only on a frame that asks for no
+		// authorization: there is no permission to skip, and being locked out by the very process
+		// that needs fixing is the failure this allows for. A frame that does carry accesses is
+		// still refused — an unenforced permission is not a degraded mode, it is a hole.
+		if companyID == OperatorCompanyID && len(requiredAccess) == 0 {
+			return nil, nil
+		}
 		logLine("credit rate limiter not configured, refusing request::", ErrCreditLimiterMissing)
 		return nil, ErrCreditLimiterMissing
 	}

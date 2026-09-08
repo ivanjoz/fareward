@@ -9,6 +9,7 @@ pub mod config;
 pub mod limiter;
 pub mod lock;
 pub mod reqlog;
+pub mod sequence;
 pub mod service;
 pub mod siphash;
 pub mod sysmetrics;

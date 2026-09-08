@@ -15,6 +15,7 @@ use fareward::{
     limiter::{quota::RateLimiter, storage::ScyllaLimiterStore},
     lock::registry::LockRegistry,
     reqlog::writer::{RequestLogSink, RequestLogWriter, connect_session},
+    sequence::{allocator::SequenceAllocator, store::ScyllaSequenceStore},
     service::server,
     sysmetrics::writer::ServerMetricsWriter,
 };
@@ -46,6 +47,16 @@ async fn main() -> Result<()> {
     // Purely in-memory, unlike the limiter: locks are not loaded from anywhere and do not
     // survive a restart.
     let locks = Arc::new(LockRegistry::new(config.shard_count, config.locks));
+    // Fails at startup rather than at the first insert, unlike the request log and the metrics
+    // collector: a backend configured to reserve its ids here has no second way to get one, so a
+    // daemon that silently came up unable to serve them would break every write instead of a log
+    // row. The `sequences` table is the ORM's, and a keyspace without it has no tables to number.
+    let sequence_store = Arc::new(ScyllaSequenceStore::with_session(session.clone()).await?);
+    let sequences = Arc::new(SequenceAllocator::new(
+        sequence_store,
+        config.shard_count,
+        config.sequences,
+    ));
     let listener = TcpListener::bind(config.listen_address)
         .await
         .with_context(|| format!("failed to bind {}", config.listen_address))?;
@@ -119,6 +130,7 @@ async fn main() -> Result<()> {
         limiter.clone(),
         locks,
         request_logs,
+        sequences,
         internal_apikey.clone(),
         config.frame_timeout,
         config.max_connections,

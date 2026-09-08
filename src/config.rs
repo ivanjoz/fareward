@@ -8,6 +8,7 @@ use toml::{Table, Value};
 use crate::{
     limiter::quota::{CreditLimits, LimitPolicy, ScopeLimits},
     lock::registry::LockLimits,
+    sequence::allocator::SequenceLimits,
 };
 
 const DEFAULT_LISTEN_PORT: u16 = 14013;
@@ -25,6 +26,16 @@ const DEFAULT_LOCK_MAX_TOTAL_WAITERS: u64 = 4_096;
 /// The wire carries the lease as a `u16` of milliseconds, so no ceiling above 65_535 is
 /// reachable in the first place.
 const DEFAULT_LOCK_MAX_LEASE_MS: u64 = 60_000;
+/// Values reserved per durable counter bump. The trade is restart burn against round trips: a
+/// daemon that stops mid-block loses the block's unused tail, so this stays small enough that the
+/// loss is invisible against the `updated_version` delta-view ceiling (10^8 writes per partition at
+/// its narrowest) and large enough that a busy counter is not writing to ScyllaDB on every insert.
+const DEFAULT_SEQUENCE_BLOCK_SIZE: u32 = 64;
+/// Counter names held in memory at once. Real cardinality is companies × tables × parts, and each
+/// entry is a short string and two integers, so this is a backstop against pathology rather than a
+/// working limit.
+const DEFAULT_SEQUENCE_MAX_TRACKED_NAMES: usize = 200_000;
+
 /// Keeps the bridge next to the other Genix services on the same hosts (14008 ScyllaDB,
 /// 14010 backend, 14013 this process's rate limiter, 14446 GenixSearch).
 const DEFAULT_BRIDGE_PORT: u16 = 14012;
@@ -91,6 +102,9 @@ pub struct AppConfig {
     /// Process-wide ceilings for the lock service. Per-action policy is deliberately absent:
     /// that belongs to the Go call sites, which is what keeps this service generic.
     pub locks: LockLimits,
+    /// Block sizing for the autoincrement reservation service. Nothing here says which counters
+    /// exist: the daemon learns a name when a client first asks for it.
+    pub sequences: SequenceLimits,
     pub bridge: BridgeConfig,
     pub request_log: RequestLogConfig,
     pub server_metrics: ServerMetricsConfig,
@@ -255,6 +269,24 @@ impl AppConfig {
             max_lease: Duration::from_millis(lock_max_lease_ms),
         };
 
+        let sequence_block_size =
+            optional_u64(&config, "SEQUENCE_BLOCK_SIZE", "sequence.block_size")?
+                .unwrap_or(u64::from(DEFAULT_SEQUENCE_BLOCK_SIZE));
+        let sequence_max_tracked_names = optional_usize(
+            &config,
+            "SEQUENCE_MAX_TRACKED_NAMES",
+            "sequence.max_tracked_names",
+        )?
+        .unwrap_or(DEFAULT_SEQUENCE_MAX_TRACKED_NAMES);
+        if sequence_block_size == 0 || sequence_max_tracked_names == 0 {
+            bail!("sequence.block_size and sequence.max_tracked_names must be positive");
+        }
+        let sequences = SequenceLimits {
+            block_size: u32::try_from(sequence_block_size)
+                .context("sequence.block_size must fit in uint32")?,
+            max_tracked_names: sequence_max_tracked_names,
+        };
+
         // Every value here has a default, unlike the eight credit ceilings: a guessed quota is
         // worse than none, but a guessed flush interval for a log table is simply a flush interval.
         // An absent [request_log] section therefore means "on, with these", not a refusal to start.
@@ -345,6 +377,7 @@ impl AppConfig {
             },
             policy,
             locks,
+            sequences,
             request_log,
             server_metrics,
         })

@@ -34,10 +34,15 @@ const (
 	// that follows is `extra_len` bytes and is empty for every opcode but a charge that asked for
 	// authorization, which answers with the sub-accesses of the required slots the user holds.
 	farewardReplyHeadSize = 6
-	// The widest tail: MAX_REQUIRED_ACCESS slots of at most two sub bytes each. A reply claiming
-	// more is a desynchronized stream, not a long answer, so it kills the connection rather than
-	// being read as payload.
-	farewardReplyMaxExtraSize = 2 * MaxRequiredAccess
+	// Width of the length header a length-prefixed opcode carries between the opcode and its
+	// payload. Mirrors LENGTH_PREFIX_SIZE in fareward/src/service/protocol.rs.
+	farewardLengthPrefixSize = 2
+	// The widest tail over every opcode that has one: MAX_REQUIRED_ACCESS slots of at most two sub
+	// bytes each for a charge, and one int64 for a sequence reservation. A reply claiming more is a
+	// desynchronized stream, not a long answer, so it kills the connection rather than being read
+	// as payload. Mirrors REPLY_MAX_EXTRA_SIZE in fareward/src/service/protocol.rs, which is a max
+	// over the same two for the same reason.
+	farewardReplyMaxExtraSize = max(2*MaxRequiredAccess, sequenceReplyExtraSize)
 	// Names the framing of the whole port, request and reply, and is bumped on every wire change
 	// so a mismatched peer fails at the first frame instead of misreading bytes.
 	// `:v7` renamed the string itself from `genix-server-utils` to `fareward` and `:v8` replaced
@@ -53,14 +58,19 @@ const (
 	opcodeChargeCredits = byte(0x01)
 	opcodeLockAcquire   = byte(0x02)
 	opcodeLockRelease   = byte(0x03)
-	// opcodeLogRequest is the only length-prefixed opcode and the only one the daemon does not
-	// answer. Both are consequences of what it carries: a variable-length log record that must
-	// never make a response wait.
+	// opcodeLogRequest is the only opcode the daemon does not answer, and one of the two that are
+	// length-prefixed. Both are consequences of what it carries: a variable-length log record that
+	// must never make a response wait.
 	opcodeLogRequest          = byte(0x04)
 	opcodeMutateCompanyBudget = byte(0x05)
 	// opcodeInvalidateUserAccess is the second unanswered opcode: the TTL on the daemon's grant
 	// cache is the backstop if it is lost, so a user save does not wait for an acknowledgement.
 	opcodeInvalidateUserAccess = byte(0x06)
+	// opcodeReserveSequence and opcodeSetSequence are the other length-prefixed opcodes, because
+	// they carry a counter name, and unlike the request log both are answered — the value is the
+	// whole point of the call.
+	opcodeReserveSequence = byte(0x07)
+	opcodeSetSequence     = byte(0x08)
 
 	// Frames are tiny and the daemon is on loopback or a private network, so a write that cannot
 	// complete in this long means the connection is gone.
@@ -350,7 +360,7 @@ func (connection *muxConnection) exchange(
 	connection.pendingMu.Unlock()
 	connection.sequence++
 
-	frame := buildFarewardFrame(secret, &connection.nonce, sequence, opcode, payload)
+	frame := buildFrameForOpcode(secret, &connection.nonce, sequence, opcode, payload)
 	writeErr := connection.conn.SetWriteDeadline(time.Now().Add(farewardWriteTimeout))
 	if writeErr == nil {
 		writeErr = writeCompleteFrame(connection.conn, frame)
@@ -481,6 +491,25 @@ func (connection *muxConnection) isClosed() bool {
 	}
 }
 
+// opcodeIsLengthPrefixed reports whether an opcode states its own payload length. Only the two
+// that carry a string do: every other operation describes a fixed record whose width the opcode
+// already implies. Mirrors Opcode::payload_width in fareward/src/service/protocol.rs — a
+// disagreement here would make the daemon read the length header as the payload's first bytes.
+func opcodeIsLengthPrefixed(opcode byte) bool {
+	return opcode == opcodeLogRequest ||
+		opcode == opcodeReserveSequence ||
+		opcode == opcodeSetSequence
+}
+
+func buildFrameForOpcode(
+	secret []byte, nonce *[farewardNonceSize]byte, sequence uint64, opcode byte, payload []byte,
+) []byte {
+	if opcodeIsLengthPrefixed(opcode) {
+		return buildFarewardLengthPrefixedFrame(secret, nonce, sequence, opcode, payload)
+	}
+	return buildFarewardFrame(secret, nonce, sequence, opcode, payload)
+}
+
 func buildFarewardFrame(
 	secret []byte, nonce *[farewardNonceSize]byte, sequence uint64, opcode byte, payload []byte,
 ) []byte {
@@ -496,7 +525,7 @@ func buildFarewardFrame(
 func buildFarewardLengthPrefixedFrame(
 	secret []byte, nonce *[farewardNonceSize]byte, sequence uint64, opcode byte, payload []byte,
 ) []byte {
-	frame := make([]byte, 0, 1+2+len(payload)+farewardAuthTagSize)
+	frame := make([]byte, 0, 1+farewardLengthPrefixSize+len(payload)+farewardAuthTagSize)
 	frame = append(frame, opcode)
 	frame = binary.BigEndian.AppendUint16(frame, uint16(len(payload)))
 	frame = append(frame, payload...)

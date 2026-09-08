@@ -34,6 +34,10 @@ use crate::{
         registry::{LockGuard, LockOutcome, LockRegistry},
     },
     reqlog::{protocol::parse_request_log, writer::RequestLogSink},
+    sequence::{
+        allocator::SequenceAllocator,
+        protocol::{SequenceReply, encode_sequence_value, parse_reserve, parse_set},
+    },
     service::{
         auth,
         protocol::{
@@ -69,6 +73,7 @@ pub async fn run(
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
     request_logs: RequestLogSink,
+    sequences: Arc<SequenceAllocator>,
     secret: Arc<Vec<u8>>,
     frame_timeout: Duration,
     max_connections: usize,
@@ -107,6 +112,7 @@ pub async fn run(
                 let limiter = limiter.clone();
                 let locks = locks.clone();
                 let request_logs = request_logs.clone();
+                let sequences = sequences.clone();
                 let secret = secret.clone();
                 let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
@@ -117,6 +123,7 @@ pub async fn run(
                         limiter,
                         locks,
                         request_logs,
+                        sequences,
                         &secret,
                         frame_timeout,
                         max_inflight,
@@ -149,6 +156,7 @@ async fn handle_connection(
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
     request_logs: RequestLogSink,
+    sequences: Arc<SequenceAllocator>,
     secret: &[u8],
     frame_timeout: Duration,
     max_inflight: usize,
@@ -497,6 +505,107 @@ async fn handle_connection(
                         user_id = invalidation.user_id,
                         "dropped cached user access grants"
                     );
+                });
+            }
+            Opcode::ReserveSequence => {
+                let request = match parse_reserve(&frame[payload_offset..tag_offset]) {
+                    Ok(request) => request,
+                    // Unlike the request log, a malformed reservation is answered rather than
+                    // discarded: a caller is parked waiting for a value, and no reply at all would
+                    // hang it until its own timeout.
+                    Err(parse_error) => {
+                        warn!(%peer, sequence = frame_sequence, error = %parse_error,
+                              "refusing a malformed sequence reservation");
+                        send_reply(
+                            &reply_sender,
+                            frame_sequence,
+                            SequenceReply::Invalid as u8,
+                            0,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                // Spawned for the same reason as a charge: a request that exhausts its block goes
+                // to ScyllaDB, and inlining that would stall every other frame on this connection
+                // behind it.
+                let Some(permit) = permit else {
+                    warn!(%peer, "in-flight ceiling reached, refusing a sequence reservation");
+                    send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                    continue;
+                };
+                let sequences = sequences.clone();
+                let reply_sender = reply_sender.clone();
+                handlers.spawn(async move {
+                    let _permit = permit;
+                    match sequences.reserve(&request.name, request.increment).await {
+                        Ok(start) => {
+                            send_reply_with_extra(
+                                &reply_sender,
+                                frame_sequence,
+                                SequenceReply::Ok as u8,
+                                0,
+                                &encode_sequence_value(start),
+                            )
+                            .await;
+                        }
+                        // Fails closed: the client turns any non-zero status into an error and
+                        // refuses the write, because the alternative — falling back to its own
+                        // allocator — is what would mint a duplicate id.
+                        Err(reserve_error) => {
+                            warn!(counter = %request.name, error = %reserve_error,
+                                  "sequence reservation failed");
+                            send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                        }
+                    }
+                });
+            }
+            Opcode::SetSequence => {
+                let request = match parse_set(&frame[payload_offset..tag_offset]) {
+                    Ok(request) => request,
+                    Err(parse_error) => {
+                        warn!(%peer, sequence = frame_sequence, error = %parse_error,
+                              "refusing a malformed sequence assignment");
+                        send_reply(
+                            &reply_sender,
+                            frame_sequence,
+                            SequenceReply::Invalid as u8,
+                            0,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let Some(permit) = permit else {
+                    warn!(%peer, "in-flight ceiling reached, refusing a sequence assignment");
+                    send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                    continue;
+                };
+                let sequences = sequences.clone();
+                let reply_sender = reply_sender.clone();
+                handlers.spawn(async move {
+                    let _permit = permit;
+                    match sequences.set(&request.name, request.value).await {
+                        Ok(previous) => {
+                            // Logged unconditionally: this is a destructive administrative write,
+                            // and the value it replaced exists nowhere else afterwards.
+                            info!(counter = %request.name, previous, assigned = request.value,
+                                  "sequence counter reassigned");
+                            send_reply_with_extra(
+                                &reply_sender,
+                                frame_sequence,
+                                SequenceReply::Ok as u8,
+                                0,
+                                &encode_sequence_value(previous),
+                            )
+                            .await;
+                        }
+                        Err(set_error) => {
+                            warn!(counter = %request.name, error = %set_error,
+                                  "sequence assignment failed");
+                            send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                        }
+                    }
                 });
             }
         }
