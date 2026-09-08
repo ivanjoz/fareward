@@ -1,3 +1,27 @@
+## The counter bind is pinned by a serialization test, and only the sequence log prints its chain
+
+**Context** — `ScyllaSequenceStore::bump` bound the delta as a bare `i64` against a `counter`
+column. The driver type-checks binds before a statement leaves the process and accepts `i64` for
+`bigint` only, so every reservation failed at serialization — the sequence service had never
+allocated an id against a real table. Two things hid it. The adapter has no test: every test here
+substitutes an in-memory `SequenceStore`, exactly as the trait's own comment says it is for. And
+the failure was unreadable — `warn!(error = %reserve_error)` prints an `anyhow::Error` with
+`Display`, which is the outermost `.context()` and nothing below it, so the log said "counter
+update failed" and dropped the driver's explanation.
+
+**Decision** — Two narrow ones beyond the fix itself. The bind is pinned by a unit test that
+type-checks `Counter` and a bare `i64` against `ColumnType::Native(NativeType::Counter)` directly,
+with no cluster. And `{:#}` replaces `%` at the two sequence log sites only, not at the ~20 others
+that log an `anyhow::Error` the same way.
+
+**Rationale** — A cluster-backed integration test would catch more, but it would be the first test
+here to need a live ScyllaDB, and that is a decision about how this repo is tested rather than a
+fix for this bug; the serialization test catches this whole class — every bind-type mismatch — for
+the cost of no I/O at all. The logging was left alone elsewhere for the same reason: the request-log
+and server-metrics writers swallow their causes identically, and converting them is a sweep through
+the daemon's logging, not part of repairing the allocator. The cost of both choices is that the
+next such bug in another store is still invisible until someone widens the pattern.
+
 ## Moving a counter is an opcode, because a block outlives the value it came from
 
 **Context** — `ResetCounter` in genix-orm realigns a counter with the rows a partition actually

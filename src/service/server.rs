@@ -553,7 +553,12 @@ async fn handle_connection(
                         // refuses the write, because the alternative — falling back to its own
                         // allocator — is what would mint a duplicate id.
                         Err(reserve_error) => {
-                            warn!(counter = %request.name, error = %reserve_error,
+                            // `{:#}` and not `%`: every failure on this path arrives wrapped in
+                            // `.context()`, and Display prints only the outermost layer — which
+                            // reports "counter update failed" and hides the ScyllaDB error that
+                            // says why. A reservation failure blocks every insert on the counter,
+                            // so it is the last place to be economical about a log line.
+                            warn!(counter = %request.name, error = %format_args!("{reserve_error:#}"),
                                   "sequence reservation failed");
                             send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
                         }
@@ -601,7 +606,7 @@ async fn handle_connection(
                             .await;
                         }
                         Err(set_error) => {
-                            warn!(counter = %request.name, error = %set_error,
+                            warn!(counter = %request.name, error = %format_args!("{set_error:#}"),
                                   "sequence assignment failed");
                             send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
                         }
