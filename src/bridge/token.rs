@@ -9,10 +9,8 @@
 //! Both are mirrors of Go code in another repository, so every rule here is pinned by
 //! vectors generated from that Go code — see `fareward/vectors`, which prints them.
 
-use std::sync::OnceLock;
-
 use base64::{Engine, engine::general_purpose};
-use colbin::{Kind, Schema};
+use colbin::Colbin;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -37,8 +35,12 @@ pub enum TokenError {
     ChannelNotCanonical,
 }
 
-/// Session identity proven by the token. Mirrors `core.UsuarioToken`; the transient `Error`
-/// field carries `cb:"-"` in Go and is never on the wire.
+/// Session identity proven by the token. Mirrors `core.UsuarioToken`; the `Error` and
+/// `SubAccesos` fields carry `cb:"-"` in Go and are never on the wire.
+///
+/// `hash` is a fixed sixteen bytes here where Go has a `[]byte`, because this is the
+/// credential the bridge compares and a width is the one thing the comparison cannot
+/// check for itself. `SessionMessage` is what the wire actually carries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UserToken {
     pub company_id: i32,
@@ -48,63 +50,46 @@ pub struct UserToken {
     pub user: String,
 }
 
-/// The token's fields, in Go declaration order and with the Go widths.
+/// The token exactly as colbin carries it.
 ///
-/// Both matter. colbin derives each wire id by hashing the field name and linear-probing
-/// past the ids already taken, so the order decides which field wins a collision; and the
-/// width is what says where a value ends, since it never reaches the wire.
-const SESSION_FIELDS: [(&str, Kind); 5] = [
-    ("CompanyID", Kind::Int32),
-    ("ID", Kind::Int32),
-    ("Created", Kind::Int32),
-    ("Hash", Kind::Bytes),
-    ("User", Kind::String),
-];
-
-/// The schema and the ids it produced, resolved once. The ids are what the message names
-/// its fields by, so they are read out of the schema rather than restated here.
-struct SessionSchema {
-    schema: Schema,
-    ids: [u8; SESSION_FIELDS.len()],
-}
-
-fn session_schema() -> &'static SessionSchema {
-    static SCHEMA: OnceLock<SessionSchema> = OnceLock::new();
-    SCHEMA.get_or_init(|| {
-        let schema =
-            Schema::from_go(&SESSION_FIELDS).expect("the session layout is a valid schema");
-        let ids = schema
-            .ids()
-            .try_into()
-            .expect("the schema has one id per declared field");
-        SessionSchema { schema, ids }
-    })
+/// The ids are the backend's own `cb` tags (`core.UsuarioToken`), copied rather than
+/// derived. colbin can hash a field name into an id, but that would make this decoder agree
+/// with the encoder only as long as two hash implementations in two languages agree, and
+/// nothing would report a disagreement — every token would simply decode to zeros. A
+/// declared id is a number, and `fareward/vectors` prints the backend's so the two can be
+/// compared by eye. Ids under sixteen also put the message on four-bit keys, which is what
+/// makes the token four bytes shorter than a derived-id one.
+#[derive(Colbin, Debug, Default)]
+struct SessionMessage {
+    #[cb(1)]
+    company_id: i32,
+    #[cb(2)]
+    id: i32,
+    #[cb(3)]
+    created: i32,
+    #[cb(4)]
+    hash: Vec<u8>,
+    #[cb(5)]
+    user: String,
 }
 
 /// Decodes the colbin payload of a session token.
 ///
-/// A single struct is one record, which colbin routes through compact mode: the fields
-/// arrive as a run of `[key][value]` pairs, and a field holding its zero value is not
-/// there at all. That is why every field is read through an accessor that answers with the
-/// zero value rather than an option — it is the same answer the Go decoder writes into the
-/// destination struct.
+/// A field holding its zero value is not written at all, so an absent key is not an error —
+/// the generated decoder leaves the field at its default, which is the same answer the Go
+/// decoder writes into the destination struct.
 pub fn decode_session_token(payload: &[u8]) -> Result<UserToken, TokenError> {
-    let session = session_schema();
-    let [company_id, id, created, hash, user] = session.ids;
-    let record = colbin::decode_one(payload, &session.schema)?;
+    let message = SessionMessage::decode(payload)?;
     Ok(UserToken {
-        company_id: record.i64(company_id) as i32,
-        id: record.i64(id) as i32,
-        created: record.i64(created) as i32,
+        company_id: message.company_id,
+        id: message.id,
+        created: message.created,
         // A wrong-width hash is refused here rather than compared: colbin omits a zero-valued
-        // field entirely, so a token with no hash at all would otherwise arrive as sixteen zeros
-        // and reach the tag comparison as if it had claimed something.
-        hash: record
-            .get(hash)
-            .and_then(colbin::Value::as_bytes)
-            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-            .ok_or(TokenError::SessionHashWidth)?,
-        user: record.str(user).to_owned(),
+        // field entirely, so a token with no hash at all would otherwise arrive as an empty
+        // slice and reach the tag comparison as if it had claimed something.
+        hash: <[u8; 16]>::try_from(message.hash.as_slice())
+            .map_err(|_| TokenError::SessionHashWidth)?,
+        user: message.user,
     })
 }
 
@@ -213,36 +198,61 @@ fn append_uvarint(output: &mut Vec<u8>, mut value: u64) {
 mod tests {
     use super::*;
 
-    /// Field ids assigned by the Go colbin builder for this struct's field names. A change
-    /// here means every session token silently decodes to zero values, since a message
-    /// names its fields by id and an unknown one is the only thing that would be reported.
+    /// The ids are the whole of what this decoder and the backend's encoder agree on, and a
+    /// disagreement is silent — a message names its fields by id, so a token whose ids moved
+    /// decodes to zero values with nothing reported.
+    ///
+    /// Asserting the attributes would only restate them. Encoding a record and demanding the
+    /// bytes Go wrote for the same one checks the ids, the key width and the field widths at
+    /// once, in the only terms that matter.
     #[test]
-    fn field_ids_match_the_go_colbin_layout() {
-        assert_eq!(session_schema().ids, [202, 53, 159, 26, 106]);
+    fn encodes_the_bytes_the_go_encoder_writes() {
+        let (encoded, token) = &plain_vector();
+        let message = SessionMessage {
+            company_id: token.company_id,
+            id: token.id,
+            created: token.created,
+            hash: token.hash.to_vec(),
+            user: token.user.clone(),
+        };
+        assert_eq!(
+            message.encode(),
+            decode_session_base64(encoded).unwrap(),
+            "the Rust encoder and the Go encoder disagree about this struct"
+        );
+        // Four-bit keys, which is what the ids under sixteen buy and what a derived id
+        // would silently give up.
+        assert_eq!(message.encode()[0], colbin::ROOT_STRUCT_NARROW);
+    }
+
+    /// The first vector, kept apart because two tests need it: this one to decode and
+    /// `encodes_the_bytes_the_go_encoder_writes` to re-encode.
+    fn plain_vector() -> (&'static str, UserToken) {
+        (
+            "0AkHGSoq0gQwEKPF9f1VhoUc4pBU9cq/paxABnRlc3Rlcg==",
+            UserToken {
+                company_id: 7,
+                id: 42,
+                created: 1234,
+                hash: [
+                    0xa3, 0xc5, 0xf5, 0xfd, 0x55, 0x86, 0x85, 0x1c, 0xe2, 0x90, 0x54, 0xf5, 0xca, 0xbf, 0xa5, 0xac,
+                ],
+                user: "tester".to_owned(),
+            },
+        )
     }
 
     /// Tokens produced by `colbin.Marshal` on the real Go struct, printed by
     /// `go run ./fareward/vectors`. Each covers a different shape: the plain case, an
     /// omitted field (`Created` is zero) with an empty string, the i32 maximum, multi-byte
-    /// UTF-8, a long user name, and a negative value, which is what clears the message's
-    /// ALL_POSITIVE flag and puts the integers on the zigzag path.
+    /// UTF-8, a long user name, and a negative value, which is what puts an integer on the
+    /// zigzag path rather than the plain one.
     #[test]
     fn decodes_the_go_colbin_vectors() {
         let vectors: [(&str, UserToken); 6] = [
+            plain_vector(),
             (
-                "Q5mjBvVTyUQDaLS4vr/KsJBDHJKqXvm3lFUt5ZPISSLgHw==",
-                UserToken {
-                    company_id: 7,
-                    id: 42,
-                    created: 1234,
-                    hash: [
-                        0xa3, 0xc5, 0xf5, 0xfd, 0x55, 0x86, 0x85, 0x1c, 0xe2, 0x90, 0x54, 0xf5, 0xca, 0xbf, 0xa5, 0xac,
-                    ],
-                    user: "tester".to_owned(),
-                },
-            ),
-            (
-                "Q5mghkADCNPRCYmQk5b5xyv4qUIfbe8f",
+                "0AkBGQEwEJiOTkiEnLTMP17BTxX6aHs=",
                 UserToken {
                     company_id: 1,
                     id: 1,
@@ -254,7 +264,7 @@ mod tests {
                 },
             ),
             (
-                "Q/n////9a/7//9//8/////01gKbDJxSYVBmVZ0PdhsmDf4DVEPD+AQ==",
+                "0Az///9/HP///38s////fzAQ0+ETCkyqjMqzoW7D5ME/wEABeA==",
                 UserToken {
                     company_id: 2_147_483_647,
                     id: 2_147_483_647,
@@ -266,7 +276,7 @@ mod tests {
                 },
             ),
             (
-                "Q9k/gr7mHDA+Byh/SlkD6A2P5Fz4vod2iKIuSuLE/kQtrh2DNnrvkFzA3iJehWPgHw==",
+                "0As/Qg8aOTAsAPFTZTAQb3gk58L3PbRDFHVREif2J0ATw7FhbmTDukBleGFtcGxlLmNvbQ==",
                 UserToken {
                     company_id: 999_999,
                     id: 12_345,
@@ -278,7 +288,7 @@ mod tests {
                 },
             ),
             (
-                "QzlAavrjcwAANYCcfIfRFk+e5SeFiPDUXJkf1ZIFfiUR/+Wa+VSS+Btg5BcXv0Vjnj+JnKgZ/gE=",
+                "0AmAGX8rAAABMBBOvsNoiyfP8pNCRHhqrsyPQCdhLXZlcnktbG9uZy11c2VyLW5hbWUtZm9yLXdpZHRoLXRlc3Rpbmc=",
                 UserToken {
                     company_id: 128,
                     id: 127,
@@ -290,7 +300,7 @@ mod tests {
                 },
             ),
             (
-                "QRmjBuSTRAMI5E0wEZIo+JdL4aTJg9YmTg3DrezsHw==",
+                "0AkDGQQhBTAQIG+CiZBEwb9cCidNHrQ2cUADbmVn",
                 UserToken {
                     company_id: 3,
                     id: 4,
@@ -331,21 +341,31 @@ mod tests {
 
     #[test]
     fn rejects_a_truncated_or_mistyped_session_token() {
+        // No root byte at all, which is a message that ended before it began.
         assert_eq!(
             decode_session_token(&[]),
             Err(TokenError::Session(colbin::Error::Truncated))
         );
-        // An even first byte is a standard-mode version byte; 0x0a is not one colbin writes.
+        // Outside colbin's reserved 0xD0..0xDF range, so not a colbin message at all.
         assert_eq!(
             decode_session_token(&[0x0a, 0x01, 0x00]),
-            Err(TokenError::Session(colbin::Error::BadVersion(0x0a)))
+            Err(TokenError::Session(colbin::Error::BadRoot(0x0a)))
         );
-        // A compact message whose first key names no field of this struct. It cannot be
-        // stepped over: the wire carries no type tag, so there is no way to know how far.
+        // A four-bit key run holding a key this struct does not declare. It cannot be
+        // stepped over: four descriptor bits have no room for a class, so nothing can size
+        // a field it cannot classify.
         assert!(matches!(
-            decode_session_token(&[0x43, 0x00, 0x00]),
-            Err(TokenError::Session(colbin::Error::UnknownField(_)))
+            decode_session_token(&[colbin::ROOT_STRUCT_NARROW, 0x59, 0x00]),
+            Err(TokenError::Session(colbin::Error::UnknownKey(5)))
         ));
+        // A token carrying a hash of the wrong width is refused before the comparison, not
+        // padded into one that could be compared.
+        let mut short_hash = SessionMessage::default();
+        short_hash.hash = vec![1, 2, 3];
+        assert_eq!(
+            decode_session_token(&short_hash.encode()),
+            Err(TokenError::SessionHashWidth)
+        );
         assert_eq!(
             decode_session_base64("not base64!!"),
             Err(TokenError::SessionBase64)

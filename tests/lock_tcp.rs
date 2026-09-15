@@ -10,12 +10,14 @@ use std::{
 };
 
 use anyhow::Result;
+use colbin::Colbin;
 use async_trait::async_trait;
 use fareward::{
     limiter::{
         aggregation::UsageKey,
         credits_blob::Credits,
-        protocol::CHARGE_PAYLOAD_SIZE,
+        budget::BudgetMutationFrame,
+        protocol::ChargeFrame,
         quota::{CreditLimits, LimitPolicy, RateLimiter, ScopeLimits},
         storage::{
             LimiterStore, StoredBudget, StoredBudgetRow, StoredBudgetUsage, StoredUsage,
@@ -23,13 +25,16 @@ use fareward::{
         },
         time_frame,
     },
-    lock::registry::{LockLimits, LockRegistry},
+    lock::{
+        protocol::{AcquireRequest, ReleaseRequest},
+        registry::{LockLimits, LockRegistry},
+    },
     reqlog::writer::RequestLogSink,
     sequence::{
         allocator::{SequenceAllocator, SequenceLimits},
         store::SequenceStore,
     },
-    service::server,
+    service::{auth::DOMAIN, protocol::ReplyShape, server},
     siphash::{SipHasher24, derive_key},
 };
 use tokio::{
@@ -187,11 +192,16 @@ impl Client {
     }
 
     /// Writes a frame without waiting for its reply, and returns the correlation to expect.
+    ///
+    /// Every opcode states its own payload length — there is no second, fixed-width framing any
+    /// more — and the tag covers the length header, so a peer cannot make the daemon buffer a
+    /// different amount than the one it signed.
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> u16 {
         let mut frame = vec![opcode];
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         frame.extend_from_slice(payload);
         let mut hasher = SipHasher24::new(&derive_key(SECRET));
-        hasher.write(b"fareward:v9");
+        hasher.write(DOMAIN);
         hasher.write(&self.nonce);
         hasher.write(&self.sequence.to_be_bytes());
         hasher.write(&frame);
@@ -202,74 +212,117 @@ impl Client {
         correlation
     }
 
-    /// Returns `(correlation, status, detail)` of whichever reply arrives next.
+    /// Returns `(correlation, shape, body)` of the next reply, skipping any push that arrives in
+    /// between.
     ///
-    /// The tail is consumed even though no lock test has one: leaving it in the socket would
-    /// desynchronize every reply after it, which is exactly the failure the length prefix exists
-    /// to make impossible.
-    async fn read_reply(&mut self) -> (u16, u8, u16) {
-        let mut reply = [0_u8; 6];
-        self.socket.read_exact(&mut reply).await.unwrap();
-        let extra_len = usize::from(reply[5]);
-        if extra_len > 0 {
-            let mut extra = vec![0_u8; extra_len];
-            self.socket.read_exact(&mut extra).await.unwrap();
+    /// A push has no correlation and can land at any moment — a lease this suite deliberately lets
+    /// expire sends one — so a reader that did not step over it would hand the next test its
+    /// neighbour's frame. `read_push` is what asserts they arrive; this is what keeps the
+    /// request/reply tests from tripping over them.
+    ///
+    /// The body is always consumed. Leaving one in the socket would desynchronize every reply
+    /// after it, which is exactly the failure the per-shape width exists to make impossible.
+    async fn read_reply(&mut self) -> (u16, ReplyShape, Vec<u8>) {
+        loop {
+            let (correlation, shape, body) = self.read_frame().await;
+            if !shape.is_push() {
+                return (correlation, shape, body);
+            }
         }
-        (
-            u16::from_be_bytes([reply[0], reply[1]]),
-            reply[2],
-            u16::from_be_bytes([reply[3], reply[4]]),
-        )
+    }
+
+    /// Reads exactly one frame, push or not.
+    async fn read_frame(&mut self) -> (u16, ReplyShape, Vec<u8>) {
+        let mut head = [0_u8; 3];
+        self.socket.read_exact(&mut head).await.unwrap();
+        let shape = ReplyShape::from_byte(head[0]).expect("a shape this daemon writes");
+        let correlation = u16::from_be_bytes([head[1], head[2]]);
+        // A push says how long it is, so an unknown one could be stepped over. A reply's width
+        // comes from its shape, except for the one that counts its own sub bytes.
+        let mut body = if shape.is_push() {
+            let mut length = [0_u8; 1];
+            self.socket.read_exact(&mut length).await.unwrap();
+            vec![0_u8; usize::from(length[0])]
+        } else {
+            match shape.body_size() {
+                Some(width) => vec![0_u8; width],
+                None => vec![0_u8; 3],
+            }
+        };
+        self.socket.read_exact(&mut body).await.unwrap();
+        if !shape.is_push() && shape.body_size().is_none() {
+            let mut sub_bytes = vec![0_u8; usize::from(body[2])];
+            self.socket.read_exact(&mut sub_bytes).await.unwrap();
+            body.extend_from_slice(&sub_bytes);
+        }
+        (correlation, shape, body)
+    }
+
+    /// Reads the next frame and requires it to be a push.
+    async fn read_push(&mut self) -> (ReplyShape, Vec<u8>) {
+        let (correlation, shape, body) = self.read_frame().await;
+        assert!(
+            shape.is_push(),
+            "expected a push, got {shape:?} correlated to {correlation}"
+        );
+        (shape, body)
     }
 
     async fn send(&mut self, opcode: u8, payload: &[u8]) -> u8 {
         let expected = self.write_frame(opcode, payload).await;
-        let (correlation, status, _) = self.read_reply().await;
+        let (correlation, shape, body) = self.read_reply().await;
         assert_eq!(
             correlation, expected,
             "reply correlated to the wrong request"
         );
-        status
+        outcome_code(shape, &body)
     }
 
-    /// A minimal, always-admissible charge: opcode 0x01 for company 1 / user 1 on route 1, with the
-    /// four authorization slots left empty so nothing is asked of the (empty) access store.
+    /// A minimal, always-admissible charge: company 1 / user 1 on route 1, with the four
+    /// authorization slots left empty so nothing is asked of the (empty) access store.
+    ///
+    /// Built through the same struct the daemon decodes rather than by hand. A payload assembled
+    /// here would only prove this file and the parser agree, and the Go client — the one peer that
+    /// matters — is pinned separately by the vectors in service/auth.rs.
     fn charge_payload() -> Vec<u8> {
-        let mut payload = Vec::with_capacity(CHARGE_PAYLOAD_SIZE);
-        payload.extend_from_slice(&[0, 0, 1]);
-        payload.extend_from_slice(&[0, 0, 1]);
-        payload.extend_from_slice(&1_u16.to_be_bytes());
-        payload.extend_from_slice(&1_u16.to_be_bytes());
-        payload.extend_from_slice(&0_u16.to_be_bytes());
-        payload.resize(CHARGE_PAYLOAD_SIZE, 0);
-        payload
+        ChargeFrame {
+            company_id: 1,
+            user_id: 1,
+            route_id: 1,
+            cpu: 1,
+            ..Default::default()
+        }
+        .encode()
     }
 
     fn budget_payload(operation: u8, cpu: u64, inference: u64) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(20);
-        payload.extend_from_slice(&[0, 0, 1]);
-        payload.push(operation);
-        payload.extend_from_slice(&cpu.to_be_bytes());
-        payload.extend_from_slice(&inference.to_be_bytes());
-        payload
+        BudgetMutationFrame {
+            company_id: 1,
+            operation,
+            cpu,
+            inference,
+        }
+        .encode()
     }
 
-    fn acquire_payload(identifier: i64, max_waiters: u8, wait_ms: u16, lease_ms: u16) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(15);
-        payload.extend_from_slice(&ACTION.to_be_bytes());
-        payload.extend_from_slice(&identifier.to_be_bytes());
-        payload.push(max_waiters);
-        payload.extend_from_slice(&wait_ms.to_be_bytes());
-        payload.extend_from_slice(&lease_ms.to_be_bytes());
-        payload
+    fn acquire_payload(identifier: i64, max_waiters: u8, wait_ms: u32, lease_ms: u32) -> Vec<u8> {
+        AcquireRequest {
+            action: ACTION,
+            identifier,
+            max_waiters,
+            wait_ms,
+            lease_ms,
+        }
+        .encode()
     }
 
     fn release_payload(identifier: i64, generation: u16) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(12);
-        payload.extend_from_slice(&ACTION.to_be_bytes());
-        payload.extend_from_slice(&identifier.to_be_bytes());
-        payload.extend_from_slice(&generation.to_be_bytes());
-        payload
+        ReleaseRequest {
+            action: ACTION,
+            identifier,
+            generation,
+        }
+        .encode()
     }
 
     /// Returns the status only; use `acquire_granting` when the generation is needed.
@@ -277,35 +330,65 @@ impl Client {
         &mut self,
         identifier: i64,
         max_waiters: u8,
-        wait_ms: u16,
-        lease_ms: u16,
+        wait_ms: u32,
+        lease_ms: u32,
     ) -> u8 {
         self.acquire_granting(identifier, max_waiters, wait_ms, lease_ms)
             .await
             .0
     }
 
-    /// Returns `(status, generation)`. The generation is what a later release must present.
+    /// Returns `(outcome, generation)`. The generation is what a later release must present, and
+    /// it now rides in the `LockGranted` body rather than in a field a refusal also uses.
     async fn acquire_granting(
         &mut self,
         identifier: i64,
         max_waiters: u8,
-        wait_ms: u16,
-        lease_ms: u16,
+        wait_ms: u32,
+        lease_ms: u32,
     ) -> (u8, u16) {
         let payload = Self::acquire_payload(identifier, max_waiters, wait_ms, lease_ms);
         let expected = self.write_frame(0x02, &payload).await;
-        let (correlation, status, generation) = self.read_reply().await;
+        let (correlation, shape, body) = self.read_reply().await;
         assert_eq!(
             correlation, expected,
             "reply correlated to the wrong request"
         );
-        (status, generation)
+        let generation = match shape {
+            ReplyShape::LockGranted => u16::from_be_bytes([body[0], body[1]]),
+            _ => 0,
+        };
+        (outcome_code(shape, &body), generation)
     }
 
     async fn release(&mut self, identifier: i64, generation: u16) -> u8 {
         let payload = Self::release_payload(identifier, generation);
         self.send(0x03, &payload).await
+    }
+}
+
+/// The outcome code this suite asserts on, derived from the reply's shape.
+///
+/// Every assertion here is about lock *behaviour* — busy, misuse, hand-over — rather than about
+/// byte layout, and the codes are the same ones the daemon still sends inside a `LockRefused`. So
+/// the shape byte is resolved in exactly one place instead of restated fifty times, and the framing
+/// itself is pinned by `every_reply_names_its_own_shape` and `an_expired_lease_pushes_lock_lost`
+/// below, which assert on shapes directly.
+fn outcome_code(shape: ReplyShape, body: &[u8]) -> u8 {
+    match shape {
+        // Success, whatever the operation was.
+        ReplyShape::Ack | ReplyShape::ChargeAllowed | ReplyShape::ChargeGranted => 0,
+        ReplyShape::LockGranted => 0,
+        ReplyShape::SequenceValue => 0,
+        // A refusal carries its reason as its whole body.
+        ReplyShape::LockRefused
+        | ReplyShape::BudgetRefused
+        | ReplyShape::ChargeCreditViolation
+        | ReplyShape::ChargeAccessDenied => body[0],
+        ReplyShape::SequenceInvalid => 1,
+        // What 0xFF used to mean when it was a status rather than a shape.
+        ReplyShape::Unavailable => 0xFF,
+        ReplyShape::LockLost => panic!("a push is not an outcome"),
     }
 }
 
@@ -327,6 +410,102 @@ async fn budget_mutations_and_charges_share_the_authenticated_connection() {
         0
     );
     assert_eq!(client.send(0x01, &Client::charge_payload()).await, 0);
+}
+
+/// Phase 4: the holder is *told* its lease elapsed, rather than inferring it from a timer it
+/// started a round trip after the daemon did.
+///
+/// Before the push existed there was nothing on this socket at all — the daemon dropped the hold,
+/// logged it, and the client went on believing it owned the key until its own timer fired.
+#[tokio::test]
+async fn an_expired_lease_pushes_lock_lost() {
+    let server = start_server(Duration::from_secs(30)).await;
+    let mut holder = Client::connect(&server).await;
+    let (outcome, _) = holder.acquire_granting(300, 0, 0, 150).await;
+    assert_eq!(outcome, 0);
+
+    // Nothing is sent and nothing is asked for: the next frame on this socket is the daemon's own.
+    let (shape, body) = timeout(Duration::from_secs(2), holder.read_push())
+        .await
+        .expect("an elapsed lease must announce itself");
+    assert_eq!(shape, ReplyShape::LockLost);
+    assert_eq!(u16::from_be_bytes([body[0], body[1]]), ACTION, "action");
+    assert_eq!(
+        i64::from_be_bytes([
+            body[2], body[3], body[4], body[5], body[6], body[7], body[8], body[9]
+        ]),
+        300,
+        "identifier"
+    );
+}
+
+/// Every outcome this port can produce, named by its shape rather than decoded out of a status
+/// byte whose meaning depended on the request it answered.
+#[tokio::test]
+async fn every_reply_names_its_own_shape() {
+    let server = start_server(Duration::from_secs(30)).await;
+    let mut client = Client::connect(&server).await;
+
+    // A charge that asks for no authorization.
+    let expected = client.write_frame(0x01, &Client::charge_payload()).await;
+    let (correlation, shape, body) = client.read_reply().await;
+    assert_eq!(correlation, expected);
+    assert_eq!(shape, ReplyShape::ChargeAllowed);
+    assert!(body.is_empty(), "an allowed charge says nothing more");
+
+    // A budget mutation that lands.
+    client
+        .write_frame(0x05, &Client::budget_payload(1, 100, 100))
+        .await;
+    let (_, shape, body) = client.read_reply().await;
+    assert_eq!(shape, ReplyShape::Ack);
+    assert!(body.is_empty());
+
+    // A granted lock, and the generation in its own body.
+    let payload = Client::acquire_payload(400, 0, 0, 15000);
+    client.write_frame(0x02, &payload).await;
+    let (_, shape, body) = client.read_reply().await;
+    assert_eq!(shape, ReplyShape::LockGranted);
+    assert_eq!(body.len(), 2);
+    let generation = u16::from_be_bytes([body[0], body[1]]);
+
+    // A refusal, from a second connection that cannot have the same key.
+    let mut rival = Client::connect(&server).await;
+    rival.write_frame(0x02, &Client::acquire_payload(400, 0, 0, 15000)).await;
+    let (_, shape, body) = rival.read_reply().await;
+    assert_eq!(shape, ReplyShape::LockRefused);
+    assert_eq!(body, vec![1], "busy");
+
+    // A release, acknowledged.
+    client
+        .write_frame(0x03, &Client::release_payload(400, generation))
+        .await;
+    let (_, shape, _) = client.read_reply().await;
+    assert_eq!(shape, ReplyShape::Ack);
+
+    // A release of something this connection does not hold: refused, not acknowledged.
+    client
+        .write_frame(0x03, &Client::release_payload(999, generation))
+        .await;
+    let (_, shape, body) = client.read_reply().await;
+    assert_eq!(shape, ReplyShape::LockRefused);
+    assert_eq!(body, vec![4], "misuse");
+
+    // A reserved counter value, in a body of its own rather than a tail.
+    let mut reserve = 7_u32.to_be_bytes().to_vec();
+    reserve.extend_from_slice(b"x1_tests_0");
+    client.write_frame(0x07, &reserve).await;
+    let (_, shape, body) = client.read_reply().await;
+    assert_eq!(shape, ReplyShape::SequenceValue);
+    assert_eq!(body.len(), 8);
+
+    // And a malformed one, which no retry fixes.
+    client
+        .write_frame(0x07, &0_u32.to_be_bytes())
+        .await;
+    let (_, shape, body) = client.read_reply().await;
+    assert_eq!(shape, ReplyShape::SequenceInvalid);
+    assert!(body.is_empty());
 }
 
 #[tokio::test]
@@ -545,22 +724,26 @@ async fn a_queued_acquire_does_not_delay_a_later_charge() {
     let charge_id = client.write_frame(0x01, &Client::charge_payload()).await;
 
     // The charge must come back first, while the acquire is still waiting.
-    let (first, status, _) = timeout(Duration::from_millis(500), client.read_reply())
+    let (first, shape, _) = timeout(Duration::from_millis(500), client.read_reply())
         .await
         .expect("the charge must be answered without waiting for the queued acquire");
     assert_eq!(
         first, charge_id,
         "replies did not overtake the parked acquire"
     );
-    assert_eq!(status, 0, "the charge should have been admitted");
+    assert_eq!(
+        shape,
+        ReplyShape::ChargeAllowed,
+        "the charge should have been admitted"
+    );
 
     // And the acquire still gets its own answer once the holder releases.
     assert_eq!(holder.release(50, generation).await, 0);
-    let (second, status, _) = timeout(Duration::from_secs(2), client.read_reply())
+    let (second, shape, _) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the queued acquire must still be answered");
     assert_eq!(second, acquire_id);
-    assert_eq!(status, 0);
+    assert_eq!(shape, ReplyShape::LockGranted);
 }
 
 #[tokio::test]

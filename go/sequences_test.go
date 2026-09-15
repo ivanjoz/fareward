@@ -11,11 +11,15 @@ import (
 // The frame the daemon reads: opcode, a two-byte length covering only the payload, the increment,
 // the counter name, then the tag. Pinned here because the daemon parses these exact offsets in
 // fareward/src/sequence/protocol.rs.
+// sequenceValueBody is the eight-byte body a SequenceValue carries.
+func sequenceValueBody(value int64) []byte {
+	return binary.BigEndian.AppendUint64(nil, uint64(value))
+}
+
 func TestReserveSequenceFrameLayout(t *testing.T) {
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return sequenceReplyOK, 0, true }
-	stub.answerExtra = func(uint64, byte, []byte) []byte {
-		return binary.BigEndian.AppendUint64(nil, 1)
+	stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+		return replySequenceValue, sequenceValueBody(1), true
 	}
 
 	if _, err := stub.client().ReserveSequence(
@@ -41,12 +45,11 @@ func TestReserveSequenceFrameLayout(t *testing.T) {
 
 // The reserved value is the point of the call, so it has to survive the round trip exactly — a
 // truncated or sign-flipped id is a valid-looking id for a different record.
-func TestReserveSequenceReadsTheValueFromTheReplyTail(t *testing.T) {
+func TestReserveSequenceReadsTheValueFromTheReplyBody(t *testing.T) {
 	const reserved = int64(9_876_543_210)
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return sequenceReplyOK, 0, true }
-	stub.answerExtra = func(uint64, byte, []byte) []byte {
-		return binary.BigEndian.AppendUint64(nil, uint64(reserved))
+	stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+		return replySequenceValue, sequenceValueBody(reserved), true
 	}
 
 	start, err := stub.client().ReserveSequence(context.Background(), "counter", 1)
@@ -62,9 +65,9 @@ func TestReserveSequenceReadsTheValueFromTheReplyTail(t *testing.T) {
 // the fallback it would otherwise take — the ORM's own allocator — is what mints duplicates.
 func TestReserveSequenceFailsClosedOnARefusal(t *testing.T) {
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) {
-		// 0xFF is the daemon saying it could not answer.
-		return 0xFF, 0, true
+	stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+		// Its own shape now, rather than a 0xFF status inside a field that also carries verdicts.
+		return replyUnavailable, nil, true
 	}
 
 	start, err := stub.client().ReserveSequence(context.Background(), "counter", 1)
@@ -79,24 +82,26 @@ func TestReserveSequenceFailsClosedOnARefusal(t *testing.T) {
 	}
 }
 
-// A success status with no tail, or with a non-positive value, is a daemon that disagrees with this
-// client about the wire. Trusting either would write a record under an id nothing reserved.
-func TestReserveSequenceRejectsAnUnusableReply(t *testing.T) {
+// A SequenceValue with a body the wrong width, or a non-positive value in it, is a daemon that
+// disagrees with this client about the wire. Trusting either would write a record under an id
+// nothing reserved.
+//
+// The body width cases arrive through the reader rather than the decoder: the shape fixes the
+// width, so a short body now desynchronizes the stream and kills the connection instead of
+// reaching this call. What is left to reject here is the values.
+func TestReserveSequenceRejectsAnUnusableValue(t *testing.T) {
 	for _, testCase := range []struct {
 		name  string
-		extra []byte
+		value int64
 	}{
-		{"no tail at all", nil},
-		{"a truncated tail", []byte{0, 0, 0, 1}},
-		{"a zero value", binary.BigEndian.AppendUint64(nil, 0)},
-		{"a negative value", binary.BigEndian.AppendUint64(nil, uint64(^uint64(0)))},
+		{"a zero value", 0},
+		{"a negative value", -1},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			stub := startMuxDaemonStub(t)
-			stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) {
-				return sequenceReplyOK, 0, true
+			stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+				return replySequenceValue, sequenceValueBody(testCase.value), true
 			}
-			stub.answerExtra = func(uint64, byte, []byte) []byte { return testCase.extra }
 
 			if _, err := stub.client().ReserveSequence(
 				context.Background(), "counter", 1); err == nil {
@@ -110,9 +115,8 @@ func TestReserveSequenceRejectsAnUnusableReply(t *testing.T) {
 // it replaced — the caller's only record of what the counter held before a destructive repair.
 func TestSetSequenceFrameLayoutAndPreviousValue(t *testing.T) {
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return sequenceReplyOK, 0, true }
-	stub.answerExtra = func(uint64, byte, []byte) []byte {
-		return binary.BigEndian.AppendUint64(nil, 512)
+	stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+		return replySequenceValue, sequenceValueBody(512), true
 	}
 
 	previous, err := stub.client().SetSequence(context.Background(), "x7_ventas_0", 4)
@@ -143,9 +147,8 @@ func TestSetSequenceFrameLayoutAndPreviousValue(t *testing.T) {
 // hand out non-positive primary keys and is refused here.
 func TestSetSequenceAcceptsZeroAndRejectsNegative(t *testing.T) {
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return sequenceReplyOK, 0, true }
-	stub.answerExtra = func(uint64, byte, []byte) []byte {
-		return binary.BigEndian.AppendUint64(nil, 9)
+	stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+		return replySequenceValue, sequenceValueBody(9), true
 	}
 
 	if _, err := stub.client().SetSequence(context.Background(), "counter", 0); err != nil {

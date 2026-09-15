@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/ivanjoz/colbin"
 )
 
 // Opcode 0x06: drop a user's cached authorization grants.
 //
-//	[opcode:1][company:u24][user:u24][tag:8]
+//	[opcode:1][length:u16][payload][tag:8]
 //
 // The daemon caches `users.accesos_computed` for ten minutes so it can answer the route gate without
 // reading ScyllaDB. This is what keeps that TTL a backstop rather than the mechanism: the backend
@@ -19,10 +21,18 @@ import (
 // damage if the frame is lost, so a user save must not wait on the daemon to acknowledge it. The
 // payload layout is mirrored in fareward/src/limiter/access.rs.
 
-const invalidateAccessPayloadSize = 6
+// accessInvalidationFrame is the payload. Mirrored by `AccessInvalidation` in
+// fareward/src/limiter/access.rs.
+type accessInvalidationFrame struct {
+	CompanyID int32 `cb:"1"`
+	UserID    int32 `cb:"2"`
+}
+
+var accessInvalidationCodec = colbin.MustCodec[accessInvalidationFrame]()
 
 // InvalidateAllCompanyUsers is the wildcard for the userID argument. User IDs start at 1, so zero is
-// free to mean "every cached user of this company".
+// free to mean "every cached user of this company" — and colbin does not write a zero field, so the
+// wildcard is literally the frame with no user in it.
 const InvalidateAllCompanyUsers int32 = 0
 
 var ErrAccessInvalidationNotConfigured = errors.New("fareward is not configured")
@@ -52,8 +62,8 @@ func encodeAccessInvalidation(companyID, userID int32) ([]byte, error) {
 	if userID < 0 || userID > 0xFF_FFFF {
 		return nil, fmt.Errorf("user ID %d must fit uint24", userID)
 	}
-	payload := make([]byte, invalidateAccessPayloadSize)
-	writeUint24(payload[0:3], uint32(companyID))
-	writeUint24(payload[3:6], uint32(userID))
-	return payload, nil
+	return accessInvalidationCodec.Append(nil, &accessInvalidationFrame{
+		CompanyID: companyID,
+		UserID:    userID,
+	}), nil
 }

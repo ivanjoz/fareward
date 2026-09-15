@@ -3,35 +3,54 @@ package fareward
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
 )
 
-// These twenty bytes are the contract with the Rust decoder, which reads them by offset. The
-// vectors here and the ones in parses_the_exact_wire_offsets and
-// required_access_slots_are_read_by_offset (limiter/protocol.rs) are the same charge written from
-// both ends. This test and its Rust twin are the only thing holding the layout.
-func TestChargePayloadMatchesTheWireOffsets(t *testing.T) {
+// The payload is a colbin message, so the contract with the Rust decoder is the field ids, not
+// byte offsets. Decoding it back is what asserts them: a field encoded under the wrong id decodes
+// as absent on the far side, which reaches the daemon as a zero and charges the wrong route.
+func TestChargeRoundTripsEveryField(t *testing.T) {
 	payload, err := encodeCharge(0x123456, 42, 103, 300, 25, []uint16{0x0139, 0x008B}, false)
 	if err != nil {
 		t.Fatalf("encodeCharge refused a valid charge: %v", err)
 	}
 
-	want := []byte{
-		0x12, 0x34, 0x56, // company
-		0x00, 0x00, 0x2A, // user
-		0x00, 0x67, // route 103
-		0x01, 0x2C, // cpu 300
-		0x00, 0x19, // inference 25
-		0x01, 0x39, // required access slot 0
-		0x00, 0x8B, // required access slot 1
-		0x00, 0x00, // slot 2 unused
-		0x00, 0x00, // slot 3 unused
+	var decoded chargeFrame
+	if err := chargeCodec.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Equal(payload, want) {
-		t.Fatalf("charge payload = % X; want % X", payload, want)
+	want := chargeFrame{
+		CompanyID: 0x123456,
+		UserID:    42,
+		RouteID:   103,
+		CPU:       300,
+		Inference: 25,
+		Access1:   0x0139,
+		Access2:   0x008B,
+	}
+	if decoded != want {
+		t.Fatalf("charge payload decoded as %+v; want %+v", decoded, want)
+	}
+}
+
+// The common case the codec was adopted for: an ungated request carries no access field at all,
+// where the fixed layout always spent eight bytes on four empty slots.
+func TestAnUngatedChargeCarriesNoAccessSlots(t *testing.T) {
+	ungated, err := encodeCharge(7, 1, 103, 300, 0, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gated, err := encodeCharge(7, 1, 103, 300, 0, []uint16{0x0139}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ungated) >= len(gated) {
+		t.Fatalf("an ungated charge is %d bytes against %d for a gated one", len(ungated), len(gated))
+	}
+	if len(ungated) > 12 {
+		t.Fatalf("an ungated charge is %d bytes", len(ungated))
 	}
 }
 
@@ -69,52 +88,46 @@ func TestAFrameNeedsCreditsOrARequiredAccess(t *testing.T) {
 	}
 }
 
-// The reply's detail field. Zero when a check was requested means the daemon never answered it,
-// which must fail closed: failing open would silently unauthorize every gated route the moment the
-// two binaries drifted apart.
-func TestAccessVerdictDecoding(t *testing.T) {
-	if _, err := decodeAccessResponse(0, nil, false); err != nil {
-		t.Fatalf("an unrequested check reported %v", err)
-	}
-	// Granted, slot 0, no sub-accesses.
-	grant, err := decodeAccessResponse(1|(0b1<<3), nil, true)
-	if err != nil || grant == nil || grant.GrantedSlots != 0b1 {
-		t.Fatalf("a granted check decoded to %+v, %v", grant, err)
-	}
-
+// A denial's body is the reason and nothing else, now that "not requested" and "granted" are shapes
+// of their own rather than codes sharing a field with it.
+func TestAccessDenialDecoding(t *testing.T) {
 	for _, check := range []struct {
-		detail         uint16
+		reason         byte
 		identityFailed bool
 	}{{2, false}, {3, true}, {4, true}} {
-		_, err := decodeAccessResponse(check.detail, nil, true)
+		err := decodeAccessDenied([]byte{check.reason})
 		denied, ok := err.(*AccessDenied)
 		if !ok {
-			t.Fatalf("detail %d decoded as %T: %v", check.detail, err, err)
+			t.Fatalf("reason %d decoded as %T: %v", check.reason, err, err)
 		}
 		if denied.IdentityFailed() != check.identityFailed {
-			t.Fatalf("detail %d: IdentityFailed() = %v; want %v",
-				check.detail, denied.IdentityFailed(), check.identityFailed)
+			t.Fatalf("reason %d: IdentityFailed() = %v; want %v",
+				check.reason, denied.IdentityFailed(), check.identityFailed)
 		}
 		if !IsAccessDeniedError(err) {
-			t.Fatalf("detail %d was not recognised as an access denial", check.detail)
+			t.Fatalf("reason %d was not recognised as an access denial", check.reason)
 		}
 	}
 
-	// A daemon that ignored the slots, and one that answered something invented.
-	for _, detail := range []uint16{0, 5, 7} {
-		if _, err := decodeAccessResponse(detail, nil, true); !errors.Is(err, ErrFarewardUnavailable) {
-			t.Fatalf("detail %d decoded as %v; want unavailability", detail, err)
+	// A reason this client does not know, and a denial carrying nothing at all: both are a layout
+	// disagreement rather than a verdict, so neither may read as a permission.
+	for name, body := range map[string][]byte{"invented reason": {7}, "empty body": {}} {
+		err := decodeAccessDenied(body)
+		if !errors.Is(err, ErrFarewardUnavailable) {
+			t.Fatalf("%s decoded as %v; want unavailability", name, err)
+		}
+		if IsAccessDeniedError(err) {
+			t.Fatalf("%s read as a real denial", name)
 		}
 	}
 }
 
-// The masks and the tail describe each other, so every way they can disagree is a desynchronized
-// pair of binaries — refused, because half-reading the tail attributes one access's sub-accesses to
-// another.
-func TestAccessGrantSplitsTheReplyTailPerSlot(t *testing.T) {
+// The masks and the sub bytes describe each other, so every way they can disagree is a
+// desynchronized pair of binaries — refused, because half-reading them attributes one access's
+// sub-accesses to another.
+func TestAccessGrantSplitsTheBodyPerSlot(t *testing.T) {
 	// Slots 0 and 2 granted; only slot 2 carries sub bytes, and its run is two bytes long.
-	detail := uint16(1) | (0b101 << 3) | (0b100 << 7)
-	grant, err := decodeAccessResponse(detail, []byte{0x81, 0x20}, true)
+	grant, err := decodeAccessGrant([]byte{0b101, 0b100, 2, 0x81, 0x20})
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -126,9 +139,14 @@ func TestAccessGrantSplitsTheReplyTailPerSlot(t *testing.T) {
 		t.Fatalf("SubAccesoBytes = %v", grant.SubAccesoBytes)
 	}
 
+	// A grant with no sub-accesses at all is the common case and carries only its masks.
+	grant, err = decodeAccessGrant([]byte{0b1, 0, 0})
+	if err != nil || grant.GrantedSlots != 0b1 || len(grant.SubAccesoBytes) != 0 {
+		t.Fatalf("a bare grant decoded to %+v, %v", grant, err)
+	}
+
 	// Two slots, two runs, split at the MORE bit rather than in the middle.
-	detail = uint16(1) | (0b11 << 3) | (0b11 << 7)
-	grant, err = decodeAccessResponse(detail, []byte{0x06, 0x81, 0x20}, true)
+	grant, err = decodeAccessGrant([]byte{0b11, 0b11, 3, 0x06, 0x81, 0x20})
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -137,16 +155,17 @@ func TestAccessGrantSplitsTheReplyTailPerSlot(t *testing.T) {
 		t.Fatalf("runs split wrongly: %v", grant.SubAccesoBytes)
 	}
 
-	for name, check := range map[string]struct {
-		detail uint16
-		extra  []byte
-	}{
-		"sub-accesses on an ungranted slot": {uint16(1) | (0b1 << 3) | (0b10 << 7), []byte{0x01}},
-		"tail ends mid run":                 {uint16(1) | (0b1 << 3) | (0b1 << 7), []byte{0x81}},
-		"tail longer than the mask claims":  {uint16(1) | (0b1 << 3) | (0b1 << 7), []byte{0x01, 0x02}},
-		"tail present with no marked slot":  {uint16(1) | (0b1 << 3), []byte{0x01}},
+	for name, body := range map[string][]byte{
+		"sub-accesses on an ungranted slot":      {0b1, 0b10, 1, 0x01},
+		"body ends mid run":                      {0b1, 0b1, 1, 0x81},
+		"more sub bytes than the mask claims":    {0b1, 0b1, 2, 0x01, 0x02},
+		"sub bytes with no marked slot":          {0b1, 0, 1, 0x01},
+		"declared count disagrees with the body": {0b1, 0b1, 5, 0x01},
+		// A daemon that ignored the slots would grant nothing and still call it a grant.
+		"granted nothing": {0, 0, 0},
+		"truncated":       {0b1, 0b1},
 	} {
-		if _, err := decodeAccessResponse(check.detail, check.extra, true); err == nil {
+		if _, err := decodeAccessGrant(body); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
 	}
@@ -192,10 +211,11 @@ func TestChargeAcceptsUnknownRoutesAndRefusesUnencodableOnes(t *testing.T) {
 	}
 }
 
-// The extra-credit mark rides in the high bit of the route field, which maxChargeRouteID leaves
-// free. Two things must hold and neither is visible from the Rust side alone: the bit lands on
-// byte 6 and nowhere else, and a route number can never set it by itself.
-func TestTheExtraCreditFlagRidesInTheRouteField(t *testing.T) {
+// The extra-credit mark used to ride in the high bit of the route field, which made "is this route
+// number clean" a real question on both sides. It is a field of its own now, so the two cannot
+// interfere — and a false one is not written at all, which is what makes it free on every frame
+// that is not a read.
+func TestTheExtraCreditFlagIsAFieldOfItsOwn(t *testing.T) {
 	unmarked, err := encodeCharge(1, 1, 103, 2, 0, nil, false)
 	if err != nil {
 		t.Fatalf("encodeCharge refused a valid charge: %v", err)
@@ -204,24 +224,38 @@ func TestTheExtraCreditFlagRidesInTheRouteField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeCharge refused a marked charge: %v", err)
 	}
-	if marked[6] != unmarked[6]|0x80 {
-		t.Fatalf("the mark did not set the high bit of byte 6: % X vs % X", marked, unmarked)
-	}
-	// Byte 6 is the only difference: a mark must not move a single credit or access slot.
-	marked[6] = unmarked[6]
-	if !bytes.Equal(marked, unmarked) {
-		t.Fatalf("marking a charge changed more than the route field: % X vs % X", marked, unmarked)
+	if len(marked) != len(unmarked)+1 {
+		t.Fatalf("the mark cost %d bytes, want one", len(marked)-len(unmarked))
 	}
 
-	// The highest encodable route still leaves the bit free, which is what makes the field safe to
-	// share: fourteen bits of route against a bit-15 marker.
+	// Marking must not move a single credit or access slot.
+	var markedFrame, unmarkedFrame chargeFrame
+	if err := chargeCodec.Unmarshal(marked, &markedFrame); err != nil {
+		t.Fatal(err)
+	}
+	if err := chargeCodec.Unmarshal(unmarked, &unmarkedFrame); err != nil {
+		t.Fatal(err)
+	}
+	if !markedFrame.ExtraAllowed {
+		t.Fatal("a marked charge decoded without its flag")
+	}
+	markedFrame.ExtraAllowed = false
+	if markedFrame != unmarkedFrame {
+		t.Fatalf("marking changed more than the flag: %+v vs %+v", markedFrame, unmarkedFrame)
+	}
+
+	// And no route number sets it by itself, at any width.
 	for _, routeID := range []int16{0, 1, 103, maxChargeRouteID} {
 		payload, err := encodeCharge(1, 1, routeID, 2, 0, nil, false)
 		if err != nil {
 			t.Fatalf("route %d was refused: %v", routeID, err)
 		}
-		if payload[6]&0x80 != 0 {
-			t.Fatalf("route %d set the extra-credit flag by itself", routeID)
+		var frame chargeFrame
+		if err := chargeCodec.Unmarshal(payload, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.ExtraAllowed || frame.RouteID != uint16(routeID) {
+			t.Fatalf("route %d decoded as %+v", routeID, frame)
 		}
 	}
 }
@@ -285,16 +319,17 @@ func TestChargeFrameMatchesTheRustAuthVector(t *testing.T) {
 
 	frame := buildFarewardFrame(secret, &nonce, 0, opcodeChargeCredits, payload)
 	want := []byte{
-		0x01, 0x12, 0x34, 0x56, 0x00, 0x00, 0x2A, 0x00, 0x67, 0x01, 0x2C, 0x00, 0x19, 0x01,
-		0x39, 0x00, 0x8B, 0x00, 0x00, 0x00, 0x00,
-		0xD2, 0xA6, 0x9B, 0x95, 0xEC, 0x5E, 0x0C, 0x94,
+		0x01, 0x00, 0x13,
+		0xD0, 0x0B, 0x56, 0x34, 0x12, 0x19, 0x2A, 0x28, 0x67, 0x39, 0x2C, 0x01, 0x48, 0x19,
+		0x69, 0x39, 0x01, 0x78, 0x8B,
+		0x4F, 0xC0, 0xB8, 0xD1, 0xBA, 0xE0, 0x72, 0x76,
 	}
 	if !bytes.Equal(frame, want) {
 		t.Fatalf("charge frame = % X; want % X", frame, want)
 	}
 	// The tag is bound to the sequence, so frame two of a connection differs in its last eight bytes.
 	next := buildFarewardFrame(secret, &nonce, 1, opcodeChargeCredits, payload)
-	wantTag := []byte{0xF1, 0x7B, 0x93, 0xF3, 0xA4, 0x9D, 0x7D, 0x3E}
+	wantTag := []byte{0xD3, 0x87, 0x19, 0xB6, 0xF0, 0x84, 0x90, 0x66}
 	if !bytes.Equal(next[len(next)-farewardAuthTagSize:], wantTag) {
 		t.Fatalf("sequence 1 tag = % X; want % X", next[len(next)-farewardAuthTagSize:], wantTag)
 	}
@@ -309,8 +344,9 @@ func TestAccessInvalidationFrameMatchesTheRustAuthVector(t *testing.T) {
 	nonce := [farewardNonceSize]byte{1, 2, 3, 4, 5, 6, 7, 8}
 	frame := buildFarewardFrame([]byte("test-secret"), &nonce, 0, opcodeInvalidateUserAccess, payload)
 	want := []byte{
-		0x06, 0x00, 0x00, 0x07, 0x00, 0x01, 0x2C,
-		0xB7, 0x90, 0xDA, 0x17, 0xF1, 0x4C, 0xCD, 0x92,
+		0x06, 0x00, 0x06,
+		0xD0, 0x09, 0x07, 0x1A, 0x2C, 0x01,
+		0x02, 0xA6, 0x4D, 0x42, 0xA1, 0x56, 0xA8, 0x01,
 	}
 	if !bytes.Equal(frame, want) {
 		t.Fatalf("invalidation frame = % X; want % X", frame, want)
@@ -331,7 +367,7 @@ func TestAccessInvalidationFrameMatchesTheRustAuthVector(t *testing.T) {
 // amounts — what the operator is spared is the refusal, and that lives in the router.
 func TestTheOperatorCompanyIsChargedLikeAnyTenant(t *testing.T) {
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return 0, 0, true }
+	stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) { return replyChargeAllowed, nil, true }
 	installStubAsConfiguredFareward(t, stub)
 
 	if _, err := chargeConfiguredCredits(
@@ -349,12 +385,15 @@ func TestTheOperatorCompanyIsChargedLikeAnyTenant(t *testing.T) {
 		t.Fatal("no charge frame reached the daemon for the operator company")
 	}
 
-	// frame[0] is the opcode, so the payload offsets shift by one.
-	if cpuCredits := binary.BigEndian.Uint16(frame[9:11]); cpuCredits != 300 {
-		t.Fatalf("cpu credits on the wire = %d; want the 300 that were asked for", cpuCredits)
+	var charge chargeFrame
+	if err := chargeCodec.Unmarshal(framePayload(t, frame), &charge); err != nil {
+		t.Fatal(err)
 	}
-	if inferenceCredits := binary.BigEndian.Uint16(frame[11:13]); inferenceCredits != 25 {
-		t.Fatalf("inference credits on the wire = %d; want the 25 that were asked for", inferenceCredits)
+	if charge.CPU != 300 {
+		t.Fatalf("cpu credits on the wire = %d; want the 300 that were asked for", charge.CPU)
+	}
+	if charge.Inference != 25 {
+		t.Fatalf("inference credits on the wire = %d; want the 25 that were asked for", charge.Inference)
 	}
 }
 

@@ -12,6 +12,8 @@
 //! every policy rule around that — an unmapped GET being free, `POST.user-self` needing no access,
 //! user 1 bypassing the check entirely — stays in Go, where the catalogue is embedded.
 
+use colbin::Colbin;
+
 use crate::limiter::storage::StoredUserAccess;
 
 /// How many required grants one frame can carry. `access_list.yml` maps at most two accesses to any
@@ -20,35 +22,30 @@ use crate::limiter::storage::StoredUserAccess;
 /// the daemon being down and would surface as a 503 instead of as the bug it is.
 pub const MAX_REQUIRED_ACCESS: usize = 4;
 
-/// Payload of opcode `0x06`: `[company:u24][user:u24]`.
-pub const INVALIDATE_ACCESS_PAYLOAD_SIZE: usize = 6;
+/// Ceiling on one invalidation payload: two `i32` at their widest, plus the root byte.
+pub const INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE: usize = 16;
 
-/// Which cached grants to drop. `user_id == 0` is the wildcard, since user ids start at 1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which cached grants to drop. `user_id == 0` is the wildcard, since user ids start at 1 — and the
+/// wildcard is therefore the frame that carries no user field at all, colbin omitting the zero.
+///
+/// Mirrors `accessInvalidationFrame` in fareward/go/access_invalidation.go.
+#[derive(Colbin, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccessInvalidation {
+    #[cb(1)]
     pub company_id: i32,
     /// Zero means every cached user of the company.
+    #[cb(2)]
     pub user_id: i32,
 }
 
 /// Decodes one invalidation. Only the company is required to be real: a wildcard is the point of
 /// user zero, and a stale entry for a user the backend has since deleted is still worth dropping.
-pub fn parse_access_invalidation(
-    payload: &[u8; INVALIDATE_ACCESS_PAYLOAD_SIZE],
-) -> anyhow::Result<AccessInvalidation> {
-    let company_id = read_u24(&payload[0..3]) as i32;
-    let user_id = read_u24(&payload[3..6]) as i32;
-    if company_id <= 0 {
+pub fn parse_access_invalidation(payload: &[u8]) -> anyhow::Result<AccessInvalidation> {
+    let invalidation = AccessInvalidation::decode(payload)?;
+    if invalidation.company_id <= 0 {
         anyhow::bail!("company_id must be positive");
     }
-    Ok(AccessInvalidation {
-        company_id,
-        user_id,
-    })
-}
-
-fn read_u24(bytes: &[u8]) -> u32 {
-    (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2])
+    Ok(invalidation)
 }
 
 /// `users.status` value that means the user exists and may act. Anything else — 0 from a soft
@@ -588,18 +585,32 @@ mod tests {
 
     #[test]
     fn an_invalidation_decodes_its_two_ids_and_its_wildcard() {
-        let invalidation =
-            parse_access_invalidation(&[0x00, 0x00, 0x07, 0x00, 0x01, 0x2C]).unwrap();
+        let invalidation = parse_access_invalidation(
+            &AccessInvalidation {
+                company_id: 7,
+                user_id: 300,
+            }
+            .encode(),
+        )
+        .unwrap();
         assert_eq!(invalidation.company_id, 7);
         assert_eq!(invalidation.user_id, 300);
-        // User zero is the wildcard, not an error: user ids start at 1.
-        assert_eq!(
-            parse_access_invalidation(&[0x00, 0x00, 0x07, 0x00, 0x00, 0x00])
-                .unwrap()
-                .user_id,
-            0
-        );
-        assert!(parse_access_invalidation(&[0; INVALIDATE_ACCESS_PAYLOAD_SIZE]).is_err());
+
+        // User zero is the wildcard, not an error: user ids start at 1. It is also the frame that
+        // carries no user field at all, since colbin does not write a zero — so the wildcard is
+        // the cheapest invalidation as well as the broadest.
+        let wildcard = AccessInvalidation {
+            company_id: 7,
+            user_id: 0,
+        }
+        .encode();
+        assert_eq!(parse_access_invalidation(&wildcard).unwrap().user_id, 0);
+        assert!(wildcard.len() < invalidation.encode().len());
+
+        // A frame naming no company at all is refused: there is nothing it could invalidate.
+        assert!(parse_access_invalidation(&AccessInvalidation::default().encode()).is_err());
+        // And bytes that are not a colbin message are refused rather than read as offsets.
+        assert!(parse_access_invalidation(&[0; 6]).is_err());
     }
 
     #[test]

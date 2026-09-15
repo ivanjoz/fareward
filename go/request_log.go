@@ -2,54 +2,56 @@ package fareward
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
+
+	"github.com/ivanjoz/colbin"
 )
 
 // Opcode 0x04: the end-of-request record.
 //
-// The only variable-length frame on this port, and the only one the daemon never answers. Both
-// follow from what it is for: a log row carries strings, and making a response wait for an
-// acknowledgement that a log was stored would put the daemon's latency on the critical path of
-// every request in the system. The client writes the frame and returns.
+// The one frame the daemon never answers: making a response wait for an acknowledgement that a log
+// was stored would put the daemon's latency on the critical path of every request in the system.
+// The client writes the frame and returns.
 //
 //	[opcode:1][length:u16][payload:length][tag:8]
 //
-// The payload layout is mirrored in fareward/src/reqlog/protocol.rs. Every field is
-// big-endian, like the rest of this port.
+// The record is a colbin message, mirrored by `RequestLogRecord` in fareward/src/reqlog/protocol.rs.
+// It is the shape that gained most from the codec: an error-free row — the overwhelming majority —
+// writes only the fields it actually set, and the daemon's side lost a hand-written parser with
+// three length idioms and seven ways to be lied to about a length.
 
 const (
-	// date i16, request id i64, route i16, frame u8, company u24, user i32, elapsed u16, errors u8.
-	requestLogHeaderSize = 2 + 8 + 2 + 1 + 3 + 4 + 2 + 1
-
-	// The daemon enforces the same three ceilings and refuses anything past them, so these are a
-	// contract and not a local preference.
+	// The daemon enforces the same two ceilings and refuses anything past them, so these are a
+	// contract and not a local preference. The error cap is enforced on both sides too.
 	requestLogMaxErrors    = 4
 	requestLogMaxLineBytes = 64
 	requestLogMaxTextBytes = 200
 
-	requestLogMaxErrorBlockSize = 4 + 1 + requestLogMaxLineBytes + 2 + requestLogMaxTextBytes
-	requestLogMaxPayloadSize    = requestLogHeaderSize + requestLogMaxErrors*requestLogMaxErrorBlockSize
+	// Matches REQUEST_LOG_MAX_PAYLOAD_SIZE in fareward/src/reqlog/protocol.rs, which is what the
+	// daemon will buffer before checking a tag.
+	requestLogMaxPayloadSize = 64 + requestLogMaxErrors*300
 )
 
 // RequestLogError is one failing code line, already hashed by the caller.
 type RequestLogError struct {
-	ID   int32
-	Line string
-	Text string
+	ID   int32  `cb:"1"`
+	Line string `cb:"2"`
+	Text string `cb:"3"`
 }
 
 // RequestLogRecord is everything one finished request contributes to user_logs.
 type RequestLogRecord struct {
-	Date      int16
-	RequestID int64
-	RouteID   int16
-	Frame     uint8
-	CompanyID int32
-	UserID    int32
-	ElapsedMs int16
-	Errors    []RequestLogError
+	Date      int16             `cb:"1"`
+	RequestID int64             `cb:"2"`
+	RouteID   int16             `cb:"3"`
+	Frame     uint8             `cb:"4"`
+	CompanyID int32             `cb:"5"`
+	UserID    int32             `cb:"6"`
+	ElapsedMs int16             `cb:"7"`
+	Errors    []RequestLogError `cb:"8"`
 }
+
+var requestLogCodec = colbin.MustCodec[RequestLogRecord]()
 
 var (
 	ErrRequestLogTooLarge = errors.New("request log payload exceeds the protocol ceiling")
@@ -81,33 +83,22 @@ func SendRequestLog(ctx context.Context, record RequestLogRecord) error {
 // over-long preview truncated to 200 bytes still says what happened, and a fifth error dropped
 // still leaves four. Refusing outright would throw away the row over its least important field.
 func encodeRequestLog(record RequestLogRecord) ([]byte, error) {
-	errorsToSend := record.Errors
-	if len(errorsToSend) > requestLogMaxErrors {
-		errorsToSend = errorsToSend[:requestLogMaxErrors]
+	// Clamped into a copy rather than in place: the caller's record is its own, and a log write
+	// must not quietly shorten the strings a caller may still be using.
+	if len(record.Errors) > requestLogMaxErrors {
+		record.Errors = record.Errors[:requestLogMaxErrors]
 	}
-
-	payload := make([]byte, 0, requestLogHeaderSize+len(errorsToSend)*64)
-	payload = binary.BigEndian.AppendUint16(payload, uint16(record.Date))
-	payload = binary.BigEndian.AppendUint64(payload, uint64(record.RequestID))
-	payload = binary.BigEndian.AppendUint16(payload, uint16(record.RouteID))
-	payload = append(payload, record.Frame)
-	// Three bytes, same width the charge opcode uses for a company.
-	payload = append(payload,
-		byte(record.CompanyID>>16), byte(record.CompanyID>>8), byte(record.CompanyID))
-	payload = binary.BigEndian.AppendUint32(payload, uint32(record.UserID))
-	payload = binary.BigEndian.AppendUint16(payload, uint16(record.ElapsedMs))
-	payload = append(payload, byte(len(errorsToSend)))
-
-	for _, requestError := range errorsToSend {
-		payload = binary.BigEndian.AppendUint32(payload, uint32(requestError.ID))
-		line := truncateUTF8(requestError.Line, requestLogMaxLineBytes)
-		payload = append(payload, byte(len(line)))
-		payload = append(payload, line...)
-		text := truncateUTF8(requestError.Text, requestLogMaxTextBytes)
-		payload = binary.BigEndian.AppendUint16(payload, uint16(len(text)))
-		payload = append(payload, text...)
+	clamped := make([]RequestLogError, len(record.Errors))
+	for index, requestError := range record.Errors {
+		clamped[index] = RequestLogError{
+			ID:   requestError.ID,
+			Line: truncateUTF8(requestError.Line, requestLogMaxLineBytes),
+			Text: truncateUTF8(requestError.Text, requestLogMaxTextBytes),
+		}
 	}
+	record.Errors = clamped
 
+	payload := requestLogCodec.Append(nil, &record)
 	// Unreachable given the clamping above; kept because the daemon closes the connection on an
 	// oversized declared length, and a silent framing bug here would take the charges and locks
 	// on that connection down with it.

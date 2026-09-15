@@ -23,15 +23,18 @@ import (
 	"golang.org/x/crypto/blake2s"
 )
 
-// UsuarioToken mirrors backend/core.UsuarioToken minus its json tags, which
-// rename fields in colbin's schema section without touching the binary payload,
-// and minus its Error field, which carries cb:"-" and is never encoded.
+// UsuarioToken mirrors backend/core.UsuarioToken minus its json tags, which name
+// fields for a schema reader without touching the binary payload, and minus the
+// two fields that carry cb:"-" and are never encoded.
+//
+// The cb ids are copied from the backend struct and are the whole of what the
+// wire says: get one wrong here and the vectors below pin the wrong bytes.
 type UsuarioToken struct {
-	CompanyID int32
-	ID        int32
-	Created   int32
-	Hash      []byte
-	User      string
+	CompanyID int32  `cb:"1"`
+	ID        int32  `cb:"2"`
+	Created   int32  `cb:"3"`
+	Hash      []byte `cb:"4"`
+	User      string `cb:"5"`
 }
 
 // testSecret is the secret the Rust tests declare. It is a test fixture, not a
@@ -88,7 +91,18 @@ func main() {
 		{"negative-created", UsuarioToken{CompanyID: 3, ID: 4, Created: -5, User: "neg"}},
 	}
 
-	fmt.Printf("colbin %s, secret %q\n\n", colbinVersion(), testSecret)
+	fmt.Printf("colbin %s, secret %q\n", colbinVersion(), testSecret)
+	// Printed rather than assumed: these are the bytes the Rust side must agree with,
+	// and reading them out of the encoder is the only spelling that cannot drift.
+	//
+	// FieldIDs reports the wire *key*, which is the `cb` id minus one — source counts
+	// from one, bytes count from zero. So `cb:"1"` prints as 0, and the Rust struct
+	// that reads this token declares #[cb(1)] for it.
+	fieldKeys, err := colbin.FieldIDs(UsuarioToken{})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("field keys (cb id - 1): %v\n\n", fieldKeys)
 	for _, c := range cases {
 		c.token.Hash = computeHash(c.token)
 		data, err := colbin.Marshal(c.token)
@@ -115,9 +129,14 @@ func main() {
 
 // colbinVersion is a label for the printout, so a regenerated vector says which
 // format wrote it.
+//
+// Omit-zero is no longer a setting — the byte-aligned format never writes a
+// zero-valued field — so the only process-wide switch left that changes these
+// bytes is the packed5 string encoding, and a vector regenerated with it on
+// would not match one generated with it off.
 func colbinVersion() string {
-	if colbin.OmitEmpty() {
-		return "omit-empty on"
+	if colbin.Packed5() {
+		return "byte-aligned, packed5 on"
 	}
-	return "omit-empty off (the backend's setting for this type)"
+	return "byte-aligned, packed5 off"
 }

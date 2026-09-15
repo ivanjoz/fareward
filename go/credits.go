@@ -2,18 +2,40 @@ package fareward
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/ivanjoz/colbin"
 )
 
-const (
-	// Opcode 0x01: [opcode][company:u24][user:u24][route:u16][cpu:u16][inference:u16]
-	// [requiredAccess:4xu16][tag:8].
-	creditChargePayloadSize = 12 + 2*MaxRequiredAccess
+// chargeFrame is opcode 0x01 on the wire, mirrored by `Request` in fareward/src/limiter/protocol.rs.
+//
+// The four access slots are four scalar fields rather than one `[]uint16`. That is measured, not
+// stylistic: an array field in a one-record message costs more than four scalars and is larger on
+// the wire, and — the part that matters here — four fields omit individually, so the common case of
+// an ungated route carries no access field at all.
+//
+// ExtraAllowed is a field of its own now. It used to ride in bit 15 of the route number, which was
+// free space the route encoding could never reach; a codec makes that unnecessary, so the route is
+// a plain route number again and the flag costs one byte when true and nothing when false.
+type chargeFrame struct {
+	CompanyID    int32  `cb:"1"`
+	UserID       int32  `cb:"2"`
+	RouteID      uint16 `cb:"3"`
+	CPU          uint16 `cb:"4"`
+	Inference    uint16 `cb:"5"`
+	ExtraAllowed bool   `cb:"6"`
+	Access1      uint16 `cb:"7"`
+	Access2      uint16 `cb:"8"`
+	Access3      uint16 `cb:"9"`
+	Access4      uint16 `cb:"10"`
+}
 
+var chargeCodec = colbin.MustCodec[chargeFrame]()
+
+const (
 	// MaxRequiredAccess is how many packed grants one frame can carry. access_list.yml maps at most
 	// two accesses to any one backend route, so this is 2x headroom for eight bytes of frame. A
 	// route needing a fifth is refused here rather than by the daemon, for the same reason
@@ -33,43 +55,19 @@ const (
 	// subAccesoMoreBit terminates a sub-access run: set means another byte follows. The runs
 	// themselves are opaque here — see AccessGrant.
 	subAccesoMoreBit = 0x80
-
-	// extraCreditFlag rides in the high bit of the route field, which maxChargeRouteID leaves free.
-	// Set, it tells the daemon this charge is a read and may therefore fall back to the company's
-	// extra daily pool once normal quota refuses. Mirrored from EXTRA_CREDIT_FLAG in
-	// fareward/src/limiter/protocol.rs.
-	//
-	// It is a permission and not an instruction: an eligible frame that fits in normal quota is
-	// charged normally. Only reads carry it, because the pool exists to keep a tenant out of credit
-	// able to look at its data, not to keep writing.
-	extraCreditFlag = uint16(0x8000)
 )
 
 var ErrCreditLimiterMissing = errors.New("credit rate limiter is not configured")
 
-// accessDeniedReason is the low three bits of the reply frame's detail field. Zero means no
-// authorization was requested and one means granted, which is why the refusals start at two —
-// mirrored from fareward/src/limiter/access.rs.
-type accessDeniedReason uint16
+// accessDeniedReason is the whole body of a ChargeAccessDenied reply. The values start at two
+// because they used to share a field with "not requested" and "granted", which are now shapes of
+// their own — mirrored from fareward/src/limiter/access.rs.
+type accessDeniedReason uint8
 
 const (
-	accessGranted      accessDeniedReason = 1
 	accessReasonNone   accessDeniedReason = 2
 	accessReasonNoUser accessDeniedReason = 3
 	accessReasonStatus accessDeniedReason = 4
-)
-
-// How the daemon packs a granted verdict into the reply's sixteen-bit detail field. The code keeps
-// the low bits it always had; the two masks occupy space that used to be permanently zero.
-//
-//	bits  0..2  the code above
-//	bits  3..6  granted mask   — bit N = requiredAccess[N] is held
-//	bits  7..10 has-subs mask  — bit N = slot N contributed bytes to the reply tail
-const (
-	accessCodeMask     = 0b111
-	accessGrantedShift = 3
-	accessHasSubsShift = 7
-	accessSlotMask     = 0b1111
 )
 
 // AccessGrant is what one authorized route learned about the caller: which of the accesses it
@@ -349,10 +347,12 @@ func chargeConfiguredCredits(
 	return accessGrant, err
 }
 
-// encodeCharge validates one charge and lays it out for the wire. Separate from Charge so the
-// layout can be asserted without a daemon: these twenty bytes are read by offset on the Rust side
-// (fareward/src/limiter/protocol.rs), and a field that shifts here charges the wrong number to
-// the wrong route with nothing in either process to say so.
+// encodeCharge validates one charge and encodes it. Separate from Charge so the frame can be
+// asserted without a daemon.
+//
+// The validation stays here and does not move into the codec: "a company id must be positive", the
+// route ceiling and the no-gaps rule are protocol rules that both sides depend on, not encoding
+// rules. The codec's job is bytes.
 //
 // Route zero is accepted, and means the request matched no generated route. Those credits are as
 // real as any other and belong in the total; refusing them would make an unnumbered handler free.
@@ -386,23 +386,23 @@ func encodeCharge(
 		return nil, errors.New("a frame must carry credits, a required access, or both")
 	}
 
-	payload := make([]byte, creditChargePayloadSize)
-	writeUint24(payload[0:3], uint32(companyID))
-	writeUint24(payload[3:6], uint32(userID))
-	// The flag is applied after the conversion to uint16, so the int16 parameter never has to hold
-	// it: routeID stays a plain route number, validated above against maxChargeRouteID.
-	encodedRoute := uint16(routeID)
-	if extraCreditsAllowed {
-		encodedRoute |= extraCreditFlag
+	frame := chargeFrame{
+		CompanyID:    companyID,
+		UserID:       userID,
+		RouteID:      uint16(routeID),
+		CPU:          cpuCredits,
+		Inference:    inferenceCredits,
+		ExtraAllowed: extraCreditsAllowed,
 	}
-	binary.BigEndian.PutUint16(payload[6:8], encodedRoute)
-	binary.BigEndian.PutUint16(payload[8:10], cpuCredits)
-	binary.BigEndian.PutUint16(payload[10:12], inferenceCredits)
+	// Filled from slot 0 with no gaps, which is what lets the daemon read up to the first zero and
+	// have that mean "the end of the list".
+	slots := [MaxRequiredAccess]*uint16{
+		&frame.Access1, &frame.Access2, &frame.Access3, &frame.Access4,
+	}
 	for slot, packedAccess := range requiredAccess {
-		offset := 12 + 2*slot
-		binary.BigEndian.PutUint16(payload[offset:offset+2], packedAccess)
+		*slots[slot] = packedAccess
 	}
-	return payload, nil
+	return chargeCodec.Append(nil, &frame), nil
 }
 
 // Charge sends one authenticated frame and returns nil only when both verdicts allow the request.
@@ -431,50 +431,70 @@ func (client *FarewardClient) Charge(
 		return nil, err
 	}
 
-	if reply.status != 0 {
-		return nil, decodeCreditLimitResponse(reply.status)
-	}
-	return decodeAccessResponse(reply.detail, reply.extra, len(requiredAccess) > 0)
-}
-
-// decodeAccessResponse reads the authorization verdict out of the reply's detail field and tail.
-//
-// A daemon that ignored the slots would answer zero. That is treated as unavailability rather than
-// as a grant: failing open here would silently unauthorize every gated route the moment the two
-// binaries drifted apart.
-func decodeAccessResponse(detail uint16, extra []byte, wasRequested bool) (*AccessGrant, error) {
-	if !wasRequested {
-		return nil, nil
-	}
-	switch reason := accessDeniedReason(detail & accessCodeMask); reason {
-	case accessGranted:
-		grant, err := decodeAccessGrant(detail, extra)
-		if err != nil {
-			return nil, err
+	switch reply.shape {
+	case replyChargeAllowed:
+		// Allowed, and nothing was asked about access. A frame that did ask must not land here:
+		// a daemon that ignored the slots would otherwise read as a silent authorization.
+		if len(requiredAccess) > 0 {
+			return nil, fmt.Errorf(
+				"%w: the daemon allowed a charge without answering its access check",
+				ErrFarewardUnavailable)
 		}
-		return grant, nil
-	case accessReasonNone, accessReasonNoUser, accessReasonStatus:
-		return nil, &AccessDenied{reason: reason}
+		return nil, nil
+	case replyChargeGranted:
+		return decodeAccessGrant(reply.body)
+	case replyChargeAccessDenied:
+		return nil, decodeAccessDenied(reply.body)
+	case replyChargeCreditViolation:
+		return nil, decodeCreditLimitResponse(reply.body[0])
 	default:
-		return nil, fmt.Errorf(
-			"%w: credit limiter did not answer the access check (detail %d)",
-			ErrFarewardUnavailable, detail)
+		return nil, fmt.Errorf("%w: charge answered with shape 0x%02X",
+			ErrFarewardUnavailable, reply.shape)
 	}
 }
 
-// decodeAccessGrant splits the reply tail back out per slot.
+// decodeAccessDenied turns the one-byte refusal into the error its call sites branch on.
+func decodeAccessDenied(body []byte) error {
+	if len(body) == 0 {
+		return fmt.Errorf("%w: an access denial carried no reason", ErrFarewardUnavailable)
+	}
+	switch reason := accessDeniedReason(body[0]); reason {
+	case accessReasonNone, accessReasonNoUser, accessReasonStatus:
+		return &AccessDenied{reason: reason}
+	default:
+		return fmt.Errorf("%w: access denied for an unknown reason %d",
+			ErrFarewardUnavailable, body[0])
+	}
+}
+
+// decodeAccessGrant splits a ChargeGranted body back out per slot.
 //
-// The two masks and the tail have to agree exactly: each slot in the has-subs mask consumes one
-// MORE-terminated run, in ascending slot order, and the tail must end precisely when the last one
-// does. A disagreement means the two binaries no longer share a layout, which is refused rather
+//	[granted_mask:u8][has_subs_mask:u8][sub_len:u8][sub bytes…]
+//
+// The two masks and the sub bytes have to agree exactly: each slot in the has-subs mask consumes
+// one MORE-terminated run, in ascending slot order, and the bytes must end precisely when the last
+// one does. A disagreement means the two binaries no longer share a layout, which is refused rather
 // than half-read — the alternative is attributing one access's sub-accesses to another.
-func decodeAccessGrant(detail uint16, extra []byte) (*AccessGrant, error) {
-	grantedSlots := uint8(detail>>accessGrantedShift) & accessSlotMask
-	hasSubsSlots := uint8(detail>>accessHasSubsShift) & accessSlotMask
+func decodeAccessGrant(body []byte) (*AccessGrant, error) {
+	if len(body) < 3 {
+		return nil, fmt.Errorf("%w: a granted charge carried %d bytes, needs at least 3",
+			ErrFarewardUnavailable, len(body))
+	}
+	grantedSlots, hasSubsSlots, subBytes := body[0], body[1], body[3:]
+	if int(body[2]) != len(subBytes) {
+		return nil, fmt.Errorf("%w: a granted charge declared %d sub bytes and carried %d",
+			ErrFarewardUnavailable, body[2], len(subBytes))
+	}
+	if grantedSlots == 0 {
+		// A daemon that ignored the slots would answer this. Refused rather than believed: failing
+		// open here would silently unauthorize every gated route the moment the two binaries
+		// drifted apart.
+		return nil, fmt.Errorf("%w: a granted charge granted no slot", ErrFarewardUnavailable)
+	}
 	if hasSubsSlots&^grantedSlots != 0 {
 		return nil, fmt.Errorf(
-			"%w: reply marks sub-accesses on a slot it did not grant (detail %d)",
-			ErrFarewardUnavailable, detail)
+			"%w: reply marks sub-accesses on a slot it did not grant (granted %b, subs %b)",
+			ErrFarewardUnavailable, grantedSlots, hasSubsSlots)
 	}
 
 	grant := &AccessGrant{GrantedSlots: grantedSlots}
@@ -485,12 +505,12 @@ func decodeAccessGrant(detail uint16, extra []byte) (*AccessGrant, error) {
 		}
 		runStart := offset
 		for {
-			if offset >= len(extra) {
+			if offset >= len(subBytes) {
 				return nil, fmt.Errorf(
-					"%w: reply tail ends mid sub-access run for slot %d",
+					"%w: reply ends mid sub-access run for slot %d",
 					ErrFarewardUnavailable, slotIndex)
 			}
-			subByte := extra[offset]
+			subByte := subBytes[offset]
 			offset++
 			if subByte&subAccesoMoreBit == 0 {
 				break
@@ -499,12 +519,12 @@ func decodeAccessGrant(detail uint16, extra []byte) (*AccessGrant, error) {
 		if grant.SubAccesoBytes == nil {
 			grant.SubAccesoBytes = make(map[int][]byte, 1)
 		}
-		grant.SubAccesoBytes[slotIndex] = extra[runStart:offset]
+		grant.SubAccesoBytes[slotIndex] = subBytes[runStart:offset]
 	}
-	if offset != len(extra) {
+	if offset != len(subBytes) {
 		return nil, fmt.Errorf(
-			"%w: reply tail has %d bytes left over after every marked slot",
-			ErrFarewardUnavailable, len(extra)-offset)
+			"%w: reply has %d sub bytes left over after every marked slot",
+			ErrFarewardUnavailable, len(subBytes)-offset)
 	}
 	return grant, nil
 }
@@ -522,10 +542,10 @@ func chargeWait(ctx context.Context) time.Duration {
 
 func decodeCreditLimitResponse(code uint8) error {
 	windowCode := (code >> 1) & 0b11
-	// 0xFF is the daemon saying it could not answer; anything else malformed is treated the same
-	// way, as unavailability rather than as a verdict.
+	// "I could not answer" is a shape of its own now, so anything malformed here is a layout
+	// disagreement: treated as unavailability rather than as a verdict.
 	if code&0b1110_0000 != 0 || code&0b0001_1000 == 0 {
-		return fmt.Errorf("%w: credit limiter returned status %d", ErrFarewardUnavailable, code)
+		return fmt.Errorf("%w: credit limiter sent violation bits %08b", ErrFarewardUnavailable, code)
 	}
 	windows := [...]string{"10 seconds", "1 hour", "24 hours", "month"}
 	return &CreditLimitExceeded{

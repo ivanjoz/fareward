@@ -208,8 +208,21 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "colbin"
-version = "0.1.0"
-source = "git+https://github.com/ivanjoz/colbin?rev=9643bc87e9ca14fdc8eb5b87af123b8c6fa1b362#9643bc87e9ca14fdc8eb5b87af123b8c6fa1b362"
+version = "0.3.0"
+source = "git+https://github.com/ivanjoz/colbin?tag=v0.3.0#8b6d1ec7450cf59821281df60a648a3f18f26182"
+dependencies = [
+ "colbin-derive",
+]
+
+[[package]]
+name = "colbin-derive"
+version = "0.3.0"
+source = "git+https://github.com/ivanjoz/colbin?tag=v0.3.0#8b6d1ec7450cf59821281df60a648a3f18f26182"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "core-foundation-sys"

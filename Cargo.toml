@@ -10,11 +10,18 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 blake2 = "0.11.0"
-# The colbin wire format, decoded by the repository that defines it rather than
-# transcribed here. Pinned by rev: that repository's tags are its Go module's
-# version ladder, so a tag requirement would either entangle the two release
-# cadences or resolve to a tag that predates the crate.
-colbin = { git = "https://github.com/ivanjoz/colbin", rev = "9643bc87e9ca14fdc8eb5b87af123b8c6fa1b362" }
+# The colbin wire format, encoded and decoded by the repository that defines it rather
+# than transcribed here. Six of the eight request frames are colbin messages and the
+# session token is one, so both halves of this daemon depend on it.
+#
+# Pinned by tag, which used to be impossible: colbin's tags were its Go module's version
+# ladder and the crate did not exist yet. `v0.2.0` is the first tag that carries both, so
+# the Go client and this daemon can name the same version of the format.
+#
+# `derive` brings in the proc-macro crate. Without it the trait is still here and an impl
+# can be hand-written; with it, `#[derive(Colbin)]` emits the straight-line encode and
+# decode, which is what every frame struct in src/ uses.
+colbin = { git = "https://github.com/ivanjoz/colbin", tag = "v0.3.0", features = ["derive"] }
 getrandom = "0.4"
 # Only for statvfs, which is how the disk column is read: nothing under /proc reports free space.
 libc = "0.2"

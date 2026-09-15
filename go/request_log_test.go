@@ -21,60 +21,52 @@ func sampleRecord() RequestLogRecord {
 	}
 }
 
-// These offsets are the wire contract with fareward/src/reqlog/protocol.rs. Nothing at runtime
-// notices when they drift — the daemon would simply parse different values out of the same bytes
-// and write rows that look plausible and are wrong.
-func TestEncodeRequestLogWireOffsets(t *testing.T) {
-	payload, err := encodeRequestLog(sampleRecord())
+// The record is a colbin message, so what the daemon and this encoder agree on is the field ids,
+// not byte offsets. Decoding it back is what asserts that agreement: a field that moved to a
+// different id decodes as absent, and the round trip is what notices.
+//
+// Nothing at runtime would: the daemon would parse a plausible record out of the same bytes and
+// write rows that look right and are wrong.
+func TestEncodeRequestLogRoundTripsEveryField(t *testing.T) {
+	record := sampleRecord()
+	payload, err := encodeRequestLog(record)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got := int16(binary.BigEndian.Uint16(payload[0:2])); got != 20_500 {
-		t.Errorf("date = %d at offset 0", got)
+	var decoded RequestLogRecord
+	if err := requestLogCodec.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	if got := int64(binary.BigEndian.Uint64(payload[2:10])); got != 1_767_225_600_123 {
-		t.Errorf("request id = %d at offset 2", got)
+	if decoded.Date != 20_500 || decoded.RequestID != 1_767_225_600_123 || decoded.RouteID != 102 {
+		t.Errorf("header fields decoded as %+v", decoded)
 	}
-	if got := int16(binary.BigEndian.Uint16(payload[10:12])); got != 102 {
-		t.Errorf("route id = %d at offset 10", got)
+	if decoded.Frame != 41 || decoded.CompanyID != 7 || decoded.UserID != 42 {
+		t.Errorf("identity fields decoded as %+v", decoded)
 	}
-	if payload[12] != 41 {
-		t.Errorf("frame = %d at offset 12", payload[12])
+	if decoded.ElapsedMs != 318 {
+		t.Errorf("elapsed = %d", decoded.ElapsedMs)
 	}
-	if got := int32(payload[13])<<16 | int32(payload[14])<<8 | int32(payload[15]); got != 7 {
-		t.Errorf("company = %d at offset 13", got)
+	if len(decoded.Errors) != 1 {
+		t.Fatalf("errors decoded as %+v", decoded.Errors)
 	}
-	if got := int32(binary.BigEndian.Uint32(payload[16:20])); got != 42 {
-		t.Errorf("user = %d at offset 16", got)
-	}
-	if got := int16(binary.BigEndian.Uint16(payload[20:22])); got != 318 {
-		t.Errorf("elapsed = %d at offset 20", got)
-	}
-	if payload[22] != 1 {
-		t.Errorf("error count = %d at offset 22", payload[22])
-	}
-
-	// The error block: id, one-byte line length, line, two-byte text length, text.
-	block := payload[requestLogHeaderSize:]
-	if got := int32(binary.BigEndian.Uint32(block[0:4])); got != 1_234_567 {
-		t.Errorf("error id = %d", got)
-	}
-	lineLength := int(block[4])
-	if line := string(block[5 : 5+lineLength]); line != "responses.go:539" {
-		t.Errorf("code line = %q", line)
-	}
-	textStart := 5 + lineLength
-	textLength := int(binary.BigEndian.Uint16(block[textStart : textStart+2]))
-	if text := string(block[textStart+2 : textStart+2+textLength]); text != "no se pudo obtener el registro" {
-		t.Errorf("text = %q", text)
-	}
-	// The daemon refuses a payload with bytes left over, so the encoder must produce none.
-	if consumed := requestLogHeaderSize + textStart + 2 + textLength; consumed != len(payload) {
-		t.Errorf("payload is %d bytes but describes %d", len(payload), consumed)
+	if decoded.Errors[0] != record.Errors[0] {
+		t.Errorf("error block decoded as %+v, want %+v", decoded.Errors[0], record.Errors[0])
 	}
 }
 
+// The bytes the Rust test `parses_bytes_produced_by_the_go_encoder` is pinned against. Printed
+// here rather than asserted so regenerating them is a copy, not a hand-assembly.
+func TestEncodeRequestLogWireBytes(t *testing.T) {
+	payload, err := encodeRequestLog(sampleRecord())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("sampleRecord() encodes to %d bytes: %x", len(payload), payload)
+}
+
+// The overwhelmingly common case: a request that failed at nothing. Every zero-valued field is
+// absent, and so is the error list, which is most of what the codec bought on this shape.
 func TestEncodeRequestLogWithNoErrors(t *testing.T) {
 	record := sampleRecord()
 	record.Errors = nil
@@ -82,12 +74,16 @@ func TestEncodeRequestLogWithNoErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(payload) != requestLogHeaderSize {
-		t.Fatalf("an error-free record encoded to %d bytes, expected the %d-byte header",
-			len(payload), requestLogHeaderSize)
+
+	var decoded RequestLogRecord
+	if err := requestLogCodec.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	if payload[22] != 0 {
-		t.Fatalf("error count = %d, expected 0", payload[22])
+	if len(decoded.Errors) != 0 {
+		t.Fatalf("errors decoded as %+v, want none", decoded.Errors)
+	}
+	if len(payload) >= 40 {
+		t.Fatalf("an error-free record encoded to %d bytes", len(payload))
 	}
 }
 
@@ -102,26 +98,35 @@ func TestEncodeRequestLogClampsInsteadOfFailing(t *testing.T) {
 			Text: strings.Repeat("y", requestLogMaxTextBytes*3),
 		})
 	}
+	original := record.Errors[0].Line
 
 	payload, err := encodeRequestLog(record)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if payload[22] != requestLogMaxErrors {
-		t.Fatalf("error count = %d, expected the cap of %d", payload[22], requestLogMaxErrors)
 	}
 	if len(payload) > requestLogMaxPayloadSize {
 		t.Fatalf("payload is %d bytes, over the %d ceiling the daemon enforces",
 			len(payload), requestLogMaxPayloadSize)
 	}
 
-	block := payload[requestLogHeaderSize:]
-	if lineLength := int(block[4]); lineLength != requestLogMaxLineBytes {
-		t.Fatalf("code line was not clamped: %d bytes", lineLength)
+	var decoded RequestLogRecord
+	if err := requestLogCodec.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	textLength := int(binary.BigEndian.Uint16(block[5+requestLogMaxLineBytes : 7+requestLogMaxLineBytes]))
-	if textLength != requestLogMaxTextBytes {
-		t.Fatalf("text was not clamped: %d bytes", textLength)
+	if len(decoded.Errors) != requestLogMaxErrors {
+		t.Fatalf("error count = %d, expected the cap of %d",
+			len(decoded.Errors), requestLogMaxErrors)
+	}
+	if len(decoded.Errors[0].Line) != requestLogMaxLineBytes {
+		t.Fatalf("code line was not clamped: %d bytes", len(decoded.Errors[0].Line))
+	}
+	if len(decoded.Errors[0].Text) != requestLogMaxTextBytes {
+		t.Fatalf("text was not clamped: %d bytes", len(decoded.Errors[0].Text))
+	}
+	// The caller keeps its own record intact: a log write must not shorten strings it may still
+	// be using.
+	if record.Errors[0].Line != original {
+		t.Fatal("encoding mutated the caller's record")
 	}
 }
 
@@ -139,13 +144,14 @@ func TestEncodeRequestLogKeepsRunesWhole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	block := payload[requestLogHeaderSize:]
-	textStart := 5 + int(block[4])
-	textLength := int(binary.BigEndian.Uint16(block[textStart : textStart+2]))
-	text := string(block[textStart+2 : textStart+2+textLength])
+	var decoded RequestLogRecord
+	if err := requestLogCodec.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	text := decoded.Errors[0].Text
 
-	if textLength > requestLogMaxTextBytes {
-		t.Fatalf("text is %d bytes, over the ceiling", textLength)
+	if len(text) > requestLogMaxTextBytes {
+		t.Fatalf("text is %d bytes, over the ceiling", len(text))
 	}
 	if !strings.HasPrefix(record.Errors[0].Text, text) {
 		t.Fatal("truncation produced something that is not a prefix of the original")
@@ -165,7 +171,7 @@ func TestLengthPrefixedFrameLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	frame := buildFarewardLengthPrefixedFrame([]byte("test-secret"), &nonce, 0, opcodeLogRequest, payload)
+	frame := buildFarewardFrame([]byte("test-secret"), &nonce, 0, opcodeLogRequest, payload)
 
 	if frame[0] != opcodeLogRequest {
 		t.Fatalf("opcode = %#x, expected %#x", frame[0], opcodeLogRequest)

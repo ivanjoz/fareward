@@ -161,7 +161,7 @@ mod tests {
     /// Hash field was computed by Go's `core.ComputeUsuarioTokenHash` with TEST_SECRET. If
     /// this passes, the Rust and Go session-token hashes agree byte for byte. Printed by
     /// `go run ./fareward/vectors`, which is also where token.rs's vectors come from.
-    const GO_SESSION_TOKEN: &str = "Q5mjBvVTyUQDaLS4vr/KsJBDHJKqXvm3lFUt5ZPISSLgHw==";
+    const GO_SESSION_TOKEN: &str = "0AkHGSoq0gQwEKPF9f1VhoUc4pBU9cq/paxABnRlc3Rlcg==";
 
     /// The official keyed BLAKE2s-128 vectors, taken from `golang.org/x/crypto/blake2s`'s own
     /// `hashes128` test table: key `00 01 … 1f`, message `00 01 … n-1`.
@@ -221,7 +221,7 @@ mod tests {
     /// Printed by `go run ./fareward/vectors`.
     #[test]
     fn rejects_a_token_that_carries_no_hash() {
-        const HASHLESS_TOKEN: &str = "Q5mjBvVTyUQt5ZPISSLgHw~~";
+        const HASHLESS_TOKEN: &str = "0AkHGSoq0gRABnRlc3Rlcg~~";
         assert_eq!(
             authenticate_user(Some(&format!("Bearer {HASHLESS_TOKEN}")), TEST_SECRET),
             Err(BridgeAuthError::MalformedSessionToken(

@@ -12,12 +12,13 @@ use std::{
 };
 
 use anyhow::Result;
+use colbin::Colbin;
 use async_trait::async_trait;
 use fareward::{
     limiter::{
         aggregation::UsageKey,
         credits_blob::Credits,
-        protocol::CHARGE_PAYLOAD_SIZE,
+        protocol::ChargeFrame,
         quota::{CreditLimits, LimitPolicy, RateLimiter, ScopeLimits},
         storage::{
             LimiterStore, StoredBudget, StoredBudgetRow, StoredBudgetUsage, StoredUsage,
@@ -26,13 +27,20 @@ use fareward::{
         time_frame,
     },
     lock::registry::{LockLimits, LockRegistry},
-    reqlog::{protocol::REQUEST_LOG_MAX_PAYLOAD_SIZE, writer::RequestLogSink},
+    reqlog::{
+        protocol::{ErrorEntry, REQUEST_LOG_MAX_PAYLOAD_SIZE, RequestLogRecord},
+        writer::RequestLogSink,
+    },
     sequence::{
         allocator::{SequenceAllocator, SequenceLimits},
         protocol::SEQUENCE_NAME_MAX,
         store::SequenceStore,
     },
-    service::server,
+    service::{
+        auth::DOMAIN,
+        protocol::ReplyShape,
+        server,
+    },
     siphash::{SipHasher24, derive_key},
 };
 use tokio::{
@@ -195,12 +203,14 @@ impl Client {
         }
     }
 
-    /// Writes any frame whose body (everything between the opcode and the tag) is already built.
+    /// Writes any frame whose body (the length header and everything after it, up to the tag) is
+    /// already built. Tests that need a well-formed length call `write_length_prefixed`; this one
+    /// stays raw so a frame can declare a length it does not carry.
     async fn write_frame(&mut self, opcode: u8, body: &[u8]) {
         let mut frame = vec![opcode];
         frame.extend_from_slice(body);
         let mut hasher = SipHasher24::new(&derive_key(SECRET));
-        hasher.write(b"fareward:v9");
+        hasher.write(DOMAIN);
         hasher.write(&self.nonce);
         hasher.write(&self.sequence.to_be_bytes());
         hasher.write(&frame);
@@ -211,9 +221,7 @@ impl Client {
 
     /// A request log frame: the two-byte length header followed by the payload.
     async fn write_request_log(&mut self, payload: &[u8]) {
-        let mut body = (payload.len() as u16).to_be_bytes().to_vec();
-        body.extend_from_slice(payload);
-        self.write_frame(OPCODE_LOG_REQUEST, &body).await;
+        self.write_length_prefixed(OPCODE_LOG_REQUEST, payload).await;
     }
 
     /// A frame whose declared length disagrees with what follows it.
@@ -245,57 +253,52 @@ impl Client {
         self.write_frame(opcode, &body).await;
     }
 
-    /// The head is six bytes, the sixth being the tail's length. Reading five and leaving that byte
-    /// in the stream would desynchronize every reply after it.
-    async fn read_reply(&mut self) -> (u16, u8, u16, Vec<u8>) {
-        let mut reply = [0_u8; 6];
-        self.socket.read_exact(&mut reply).await.unwrap();
-        let mut extra = vec![0_u8; usize::from(reply[5])];
-        if !extra.is_empty() {
-            self.socket.read_exact(&mut extra).await.unwrap();
+    /// The head is `[shape:1][correlation:u16]`, and the shape says how much body follows.
+    /// Leaving any of it in the stream would desynchronize every reply after it.
+    async fn read_reply(&mut self) -> (u16, ReplyShape, Vec<u8>) {
+        let mut head = [0_u8; 3];
+        self.socket.read_exact(&mut head).await.unwrap();
+        let shape = ReplyShape::from_byte(head[0]).expect("a shape this daemon writes");
+        let correlation = u16::from_be_bytes([head[1], head[2]]);
+        let mut body = vec![0_u8; shape.body_size().expect("no test here grants a charge")];
+        if !body.is_empty() {
+            self.socket.read_exact(&mut body).await.unwrap();
         }
-        (
-            u16::from_be_bytes([reply[0], reply[1]]),
-            reply[2],
-            u16::from_be_bytes([reply[3], reply[4]]),
-            extra,
-        )
+        (correlation, shape, body)
     }
 
     /// Authorization slots left empty: this test is about frame sequencing, not about grants.
     fn charge_payload() -> Vec<u8> {
-        let mut payload = Vec::with_capacity(CHARGE_PAYLOAD_SIZE);
-        payload.extend_from_slice(&[0, 0, 1]);
-        payload.extend_from_slice(&[0, 0, 1]);
-        payload.extend_from_slice(&1_u16.to_be_bytes());
-        payload.extend_from_slice(&1_u16.to_be_bytes());
-        payload.extend_from_slice(&0_u16.to_be_bytes());
-        payload.resize(CHARGE_PAYLOAD_SIZE, 0);
-        payload
+        ChargeFrame {
+            company_id: 1,
+            user_id: 1,
+            route_id: 1,
+            cpu: 1,
+            ..Default::default()
+        }
+        .encode()
     }
 }
 
-/// A well-formed record with one error, matching what the Go client writes.
+/// A well-formed record, matching what the Go client writes.
 fn request_log_payload(error_count: u8) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&20_500_i16.to_be_bytes());
-    payload.extend_from_slice(&1_767_225_600_123_i64.to_be_bytes());
-    payload.extend_from_slice(&102_i16.to_be_bytes());
-    payload.push(41);
-    payload.extend_from_slice(&[0, 0, 7]);
-    payload.extend_from_slice(&42_i32.to_be_bytes());
-    payload.extend_from_slice(&318_i16.to_be_bytes());
-    payload.push(error_count);
-    for index in 0..error_count {
-        payload.extend_from_slice(&(1_000 + index as i32).to_be_bytes());
-        let code_line = format!("responses.go:{}", 500 + index as u32);
-        payload.push(code_line.len() as u8);
-        payload.extend_from_slice(code_line.as_bytes());
-        let text = "no se pudo obtener el registro";
-        payload.extend_from_slice(&(text.len() as u16).to_be_bytes());
-        payload.extend_from_slice(text.as_bytes());
+    RequestLogRecord {
+        date: 20_500,
+        request_id: 1_767_225_600_123,
+        route_id: 102,
+        frame: 41,
+        company_id: 7,
+        user_id: 42,
+        elapsed_ms: 318,
+        errors: (0..error_count)
+            .map(|index| ErrorEntry {
+                id: 1_000 + i32::from(index),
+                code_line: format!("responses.go:{}", 500 + u32::from(index)),
+                text: "no se pudo obtener el registro".to_string(),
+            })
+            .collect(),
     }
-    payload
+    .encode()
 }
 
 /// The core claim of the fire-and-forget design: nothing comes back, so a caller that writes a
@@ -309,15 +312,15 @@ async fn a_request_log_is_not_answered_and_does_not_desynchronize_the_stream() {
 
     client.write_request_log(&request_log_payload(2)).await;
     client
-        .write_frame(OPCODE_CHARGE, &Client::charge_payload())
+        .write_length_prefixed(OPCODE_CHARGE, &Client::charge_payload())
         .await;
 
-    let (correlation, status, _, _) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, _) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the charge behind a request log was never answered");
     // Sequence 0 was the log frame, so the charge is sequence 1 — and the only reply.
     assert_eq!(correlation, 1);
-    assert_eq!(status, 0);
+    assert_eq!(shape, ReplyShape::ChargeAllowed);
 }
 
 #[tokio::test]
@@ -327,13 +330,14 @@ async fn a_request_log_with_no_errors_is_accepted() {
 
     client.write_request_log(&request_log_payload(0)).await;
     client
-        .write_frame(OPCODE_CHARGE, &Client::charge_payload())
+        .write_length_prefixed(OPCODE_CHARGE, &Client::charge_payload())
         .await;
 
-    let (correlation, status, _, _) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, _) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the connection stalled after an error-free request log");
-    assert_eq!((correlation, status), (1, 0));
+    assert_eq!(correlation, 1);
+    assert_eq!(shape, ReplyShape::ChargeAllowed);
 }
 
 /// A log row is not worth a connection. A malformed payload is discarded and the connection keeps
@@ -347,13 +351,14 @@ async fn a_malformed_request_log_does_not_close_the_connection() {
     // Declares its true length, but the payload is far shorter than the header requires.
     client.write_request_log(&[0_u8; 4]).await;
     client
-        .write_frame(OPCODE_CHARGE, &Client::charge_payload())
+        .write_length_prefixed(OPCODE_CHARGE, &Client::charge_payload())
         .await;
 
-    let (correlation, status, _, _) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, _) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the connection died on a malformed request log");
-    assert_eq!((correlation, status), (1, 0));
+    assert_eq!(correlation, 1);
+    assert_eq!(shape, ReplyShape::ChargeAllowed);
 }
 
 /// The ceiling is what stops a peer from making the daemon buffer without limit before its tag has
@@ -388,13 +393,14 @@ async fn consecutive_request_logs_stay_in_frame() {
         client.write_request_log(&request_log_payload(errors)).await;
     }
     client
-        .write_frame(OPCODE_CHARGE, &Client::charge_payload())
+        .write_length_prefixed(OPCODE_CHARGE, &Client::charge_payload())
         .await;
 
-    let (correlation, status, _, _) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, _) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the stream desynchronized across consecutive request logs");
-    assert_eq!((correlation, status), (4, 0));
+    assert_eq!(correlation, 4);
+    assert_eq!(shape, ReplyShape::ChargeAllowed);
 }
 
 /// The reservation opcode is the first that is both length-prefixed and answered, so it is the only
@@ -405,19 +411,20 @@ async fn a_reservation_answers_with_the_first_value_in_the_tail() {
     let mut client = Client::connect(&server).await;
 
     client.write_reserve_sequence("x1_ventas_0", 3).await;
-    let (correlation, status, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the daemon did not answer a reservation");
-    assert_eq!((correlation, status), (0, 0));
-    assert_eq!(extra.len(), 8, "the reserved value must fill the tail");
-    assert_eq!(i64::from_be_bytes(extra.try_into().unwrap()), 1);
+    assert_eq!(correlation, 0);
+    assert_eq!(shape, ReplyShape::SequenceValue);
+    assert_eq!(body.len(), 8, "the reserved value is the whole body");
+    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 1);
 
     // The three values just reserved are gone, so the next caller starts past them.
     client.write_reserve_sequence("x1_ventas_0", 1).await;
-    let (_, _, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (_, _, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
-        .expect("the stream desynchronized after a reply with a tail");
-    assert_eq!(i64::from_be_bytes(extra.try_into().unwrap()), 4);
+        .expect("the stream desynchronized after a reply with a body");
+    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 4);
 }
 
 /// A reservation that cannot be parsed is answered rather than discarded: unlike a request log,
@@ -429,20 +436,25 @@ async fn a_malformed_reservation_is_refused_without_closing_the_connection() {
 
     // A zero increment reserves nothing and still would have to answer with some value.
     client.write_reserve_sequence("x1_ventas_0", 0).await;
-    let (correlation, status, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the daemon did not answer a malformed reservation");
     assert_eq!(correlation, 0);
-    assert_ne!(status, 0, "a malformed reservation must not report success");
-    assert!(extra.is_empty());
+    assert_eq!(
+        shape,
+        ReplyShape::SequenceInvalid,
+        "a malformed reservation must not report a value"
+    );
+    assert!(body.is_empty());
 
     // The connection is still usable, so a bad frame costs one request and not the socket.
     client.write_reserve_sequence("x1_ventas_0", 1).await;
-    let (correlation, status, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("a refused reservation took the connection with it");
-    assert_eq!((correlation, status), (1, 0));
-    assert_eq!(i64::from_be_bytes(extra.try_into().unwrap()), 1);
+    assert_eq!(correlation, 1);
+    assert_eq!(shape, ReplyShape::SequenceValue);
+    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 1);
 }
 
 /// The reason `0x08` exists rather than the caller writing the row itself: over a live connection
@@ -455,43 +467,44 @@ async fn a_set_moves_the_counter_and_abandons_the_live_block() {
 
     // block_size is 8 in this harness, so one reservation leaves a live block with room to spare.
     client.write_reserve_sequence("x1_ventas_0", 2).await;
-    let (_, status, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (_, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the daemon did not answer a reservation");
-    assert_eq!(status, 0);
-    assert_eq!(i64::from_be_bytes(extra.try_into().unwrap()), 1);
+    assert_eq!(shape, ReplyShape::SequenceValue);
+    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 1);
 
     // A restore finds the partition really only holds rows up to id 4.
     client.write_set_sequence("x1_ventas_0", 4).await;
-    let (correlation, status, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the daemon did not answer a set");
-    assert_eq!((correlation, status), (1, 0));
+    assert_eq!(correlation, 1);
+    assert_eq!(shape, ReplyShape::SequenceValue);
     // The reply reports what was replaced — the whole block, not the two values handed out.
-    assert_eq!(i64::from_be_bytes(extra.try_into().unwrap()), 8);
+    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 8);
 
     // Re-derived from 4 instead of continuing the abandoned block at 3.
     client.write_reserve_sequence("x1_ventas_0", 1).await;
-    let (_, _, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (_, _, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the daemon did not answer the reservation after a set");
-    assert_eq!(i64::from_be_bytes(extra.try_into().unwrap()), 5);
+    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 5);
 }
 
 /// A negative counter would hand out non-positive primary keys, so it is refused like any other
-/// malformed payload — with a status, not by dropping the connection.
+/// malformed payload — with a shape of its own, not by dropping the connection.
 #[tokio::test]
 async fn a_set_to_a_negative_value_is_refused() {
     let server = start_server().await;
     let mut client = Client::connect(&server).await;
 
     client.write_set_sequence("x1_ventas_0", -5).await;
-    let (correlation, status, _, extra) = timeout(Duration::from_secs(2), client.read_reply())
+    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
         .await
         .expect("the daemon did not answer a negative set");
     assert_eq!(correlation, 0);
-    assert_ne!(status, 0);
-    assert!(extra.is_empty());
+    assert_eq!(shape, ReplyShape::SequenceInvalid);
+    assert!(body.is_empty());
 }
 
 /// The name ceiling bounds what an unauthenticated peer can make the daemon buffer, exactly as the

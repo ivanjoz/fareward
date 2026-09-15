@@ -129,7 +129,7 @@ impl LockRegistry {
             return outcome;
         }
 
-        let waited = timeout(request.wait, entry.semaphore.clone().acquire_owned()).await;
+        let waited = timeout(request.wait(), entry.semaphore.clone().acquire_owned()).await;
         self.leave_queue(&entry);
         match waited {
             Ok(Ok(permit)) => LockOutcome::Acquired(self.make_guard(key, entry, permit)),
@@ -250,13 +250,13 @@ mod tests {
         ))
     }
 
-    fn request(max_waiters: u8, wait_ms: u64) -> AcquireRequest {
+    fn request(max_waiters: u8, wait_ms: u32) -> AcquireRequest {
         AcquireRequest {
             action: 1,
             identifier: 99,
             max_waiters,
-            wait: Duration::from_millis(wait_ms),
-            lease: Duration::from_secs(15),
+            wait_ms,
+            lease_ms: 15_000,
         }
     }
 

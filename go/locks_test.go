@@ -18,12 +18,9 @@ type muxDaemonStub struct {
 	frames   chan []byte
 
 	mu sync.Mutex
-	// answer decides the reply for one request. Returning ok=false withholds the reply entirely,
-	// which is how a queued acquire is simulated.
-	answer func(sequence uint64, opcode byte, payload []byte) (status byte, detail uint16, ok bool)
-	// answerExtra supplies the reply's tail. Nil means no tail, which is every opcode but a charge
-	// that asked for authorization and a sequence reservation.
-	answerExtra func(sequence uint64, opcode byte, payload []byte) []byte
+	// answer decides the reply for one request: which shape, and the body that shape carries.
+	// Returning ok=false withholds the reply entirely, which is how a queued acquire is simulated.
+	answer func(sequence uint64, opcode byte, payload []byte) (shape byte, body []byte, ok bool)
 	// deferred holds replies the stub chose to withhold, so a test can release them later.
 	deferred []deferredReply
 	conns    []net.Conn
@@ -32,19 +29,8 @@ type muxDaemonStub struct {
 type deferredReply struct {
 	connection net.Conn
 	sequence   uint64
-	status     byte
-	detail     uint16
-}
-
-func frameSizeFor(opcode byte) int {
-	switch opcode {
-	case opcodeChargeCredits:
-		return 1 + creditChargePayloadSize + farewardAuthTagSize
-	case opcodeLockAcquire:
-		return 1 + lockAcquirePayloadSize + farewardAuthTagSize
-	default:
-		return 1 + lockReleasePayloadSize + farewardAuthTagSize
-	}
+	shape      byte
+	body       []byte
 }
 
 func startMuxDaemonStub(t *testing.T) *muxDaemonStub {
@@ -54,7 +40,9 @@ func startMuxDaemonStub(t *testing.T) *muxDaemonStub {
 		t.Fatal(err)
 	}
 	stub := &muxDaemonStub{listener: listener, frames: make(chan []byte, 32)}
-	stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return lockReplyOK, 7, true }
+	stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+		return replyLockGranted, lockGenerationBody(7), true
+	}
 	go stub.serve()
 	t.Cleanup(func() { listener.Close() })
 	return stub
@@ -83,48 +71,32 @@ func (stub *muxDaemonStub) handle(connection net.Conn) {
 		if _, err := io.ReadFull(connection, opcode); err != nil {
 			return
 		}
-		// A length-prefixed opcode states its own width; every other one has it fixed by the
-		// opcode alone.
-		var body, payload []byte
-		if opcodeIsLengthPrefixed(opcode[0]) {
-			header := make([]byte, farewardLengthPrefixSize)
-			if _, err := io.ReadFull(connection, header); err != nil {
-				return
-			}
-			declared := int(binary.BigEndian.Uint16(header))
-			rest := make([]byte, declared+farewardAuthTagSize)
-			if _, err := io.ReadFull(connection, rest); err != nil {
-				return
-			}
-			body = append(header, rest...)
-			payload = rest[:declared]
-		} else {
-			body = make([]byte, frameSizeFor(opcode[0])-1)
-			if _, err := io.ReadFull(connection, body); err != nil {
-				return
-			}
-			payload = body[:len(body)-farewardAuthTagSize]
+		// Every opcode states its own payload width, so the stub needs no table of them.
+		header := make([]byte, farewardLengthPrefixSize)
+		if _, err := io.ReadFull(connection, header); err != nil {
+			return
 		}
+		declared := int(binary.BigEndian.Uint16(header))
+		rest := make([]byte, declared+farewardAuthTagSize)
+		if _, err := io.ReadFull(connection, rest); err != nil {
+			return
+		}
+		body := append(header, rest...)
+		payload := rest[:declared]
 		stub.frames <- append(opcode, body...)
 
 		stub.mu.Lock()
 		answer := stub.answer
-		answerExtra := stub.answerExtra
 		stub.mu.Unlock()
-		status, detail, ok := answer(sequence, opcode[0], payload)
+		shape, body, ok := answer(sequence, opcode[0], payload)
 		if !ok {
 			stub.mu.Lock()
 			stub.deferred = append(stub.deferred,
-				deferredReply{connection, sequence, lockReplyOK, detail})
+				deferredReply{connection, sequence, replyLockGranted, body})
 			stub.mu.Unlock()
 			continue
 		}
-		var extra []byte
-		if answerExtra != nil {
-			extra = answerExtra(sequence, opcode[0], payload)
-		}
-		if _, err := connection.Write(
-			makeStubReplyWithExtra(sequence, status, detail, extra)); err != nil {
+		if _, err := connection.Write(makeStubReply(sequence, shape, body)); err != nil {
 			return
 		}
 	}
@@ -137,7 +109,7 @@ func (stub *muxDaemonStub) flushDeferred() {
 	stub.deferred = nil
 	stub.mu.Unlock()
 	for _, reply := range pending {
-		reply.connection.Write(makeStubReply(reply.sequence, reply.status, reply.detail))
+		reply.connection.Write(makeStubReply(reply.sequence, reply.shape, reply.body))
 	}
 }
 
@@ -151,21 +123,64 @@ func (stub *muxDaemonStub) dropConnections() {
 	}
 }
 
-func makeStubReply(sequence uint64, status byte, detail uint16) []byte {
-	return makeStubReplyWithExtra(sequence, status, detail, nil)
+// makeStubReply builds `[shape:1][correlation:u16][body…]`, the frame the daemon writes.
+func makeStubReply(sequence uint64, shape byte, body []byte) []byte {
+	reply := make([]byte, farewardReplyHeadSize, farewardReplyHeadSize+len(body))
+	reply[0] = shape
+	binary.BigEndian.PutUint16(reply[1:3], uint16(sequence))
+	return append(reply, body...)
 }
 
-func makeStubReplyWithExtra(sequence uint64, status byte, detail uint16, extra []byte) []byte {
-	reply := make([]byte, farewardReplyHeadSize, farewardReplyHeadSize+len(extra))
-	binary.BigEndian.PutUint16(reply[0:2], uint16(sequence))
-	reply[2] = status
-	binary.BigEndian.PutUint16(reply[3:5], detail)
-	reply[5] = byte(len(extra))
-	return append(reply, extra...)
+// lockGenerationBody is the body of a LockGranted: the generation a later release must present.
+func lockGenerationBody(generation uint16) []byte {
+	body := make([]byte, 2)
+	binary.BigEndian.PutUint16(body, generation)
+	return body
+}
+
+// makeStubPush builds a frame the daemon sends without being asked: no correlation, and the body
+// behind the length every push carries so an unknown one can be skipped.
+func makeStubPush(shape byte, body []byte) []byte {
+	frame := makeStubReply(0, shape, []byte{byte(len(body))})
+	return append(frame, body...)
+}
+
+// push writes a frame to every connection the stub has accepted.
+func (stub *muxDaemonStub) push(frame []byte) {
+	stub.mu.Lock()
+	connections := append([]net.Conn(nil), stub.conns...)
+	stub.mu.Unlock()
+	for _, connection := range connections {
+		connection.Write(frame)
+	}
+}
+
+// lockLostBody names the hold a LockLost push reports.
+func lockLostBody(action uint16, identifier int64) []byte {
+	body := make([]byte, lockLostBodyLen)
+	binary.BigEndian.PutUint16(body[0:2], action)
+	binary.BigEndian.PutUint64(body[2:10], uint64(identifier))
+	return body
 }
 
 func (stub *muxDaemonStub) client() *FarewardClient {
 	return &FarewardClient{address: stub.listener.Addr().String(), secret: []byte("test-secret")}
+}
+
+// framePayload strips the framing a test captured off the stub — opcode, declared length, tag —
+// and checks that the length header describes what actually arrived, which is the one thing a
+// payload assertion cannot check for itself.
+func framePayload(t *testing.T, frame []byte) []byte {
+	t.Helper()
+	if len(frame) < 1+farewardLengthPrefixSize+farewardAuthTagSize {
+		t.Fatalf("frame % X is too short to hold its own framing", frame)
+	}
+	declared := int(binary.BigEndian.Uint16(frame[1 : 1+farewardLengthPrefixSize]))
+	payload := frame[1+farewardLengthPrefixSize : len(frame)-farewardAuthTagSize]
+	if declared != len(payload) {
+		t.Fatalf("frame declares %d payload bytes and carries %d", declared, len(payload))
+	}
+	return payload
 }
 
 func TestAcquireAndReleaseFramesMatchTheRustVectors(t *testing.T) {
@@ -181,29 +196,34 @@ func TestAcquireAndReleaseFramesMatchTheRustVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pinned byte for byte against service/auth.rs.
+	// Pinned byte for byte against service/auth.rs, which asserts the daemon accepts exactly this
+	// frame. It covers the payload, the length header and the tag together, so it is the one place
+	// a change to any of the three has to be acknowledged on purpose.
 	expected := []byte{
-		0x02, 0x00, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xD6, 0x03, 0x13, 0x88,
-		0x3A, 0x98, 0x4B, 0xC6, 0x3A, 0x2A, 0xB5, 0x50, 0x44, 0x63,
+		0x02, 0x00, 0x0B,
+		0xD0, 0x07, 0x11, 0x2A, 0x23, 0x39, 0x88, 0x13, 0x49, 0x98, 0x3A,
+		0xCD, 0xE6, 0xD2, 0x58, 0xF9, 0xB7, 0x7A, 0x2C,
 	}
 	if frame := <-stub.frames; string(frame) != string(expected) {
 		t.Fatalf("acquire frame = % X; want % X", frame, expected)
 	}
 
-	// The release must carry the key and the generation the daemon handed back (7 here).
+	// The release must carry the key and the generation the daemon handed back (7 here). Read
+	// back through the codec rather than by offset: the payload is a colbin message now, so an
+	// offset here would be asserting against this test's idea of the layout instead of the
+	// encoder's.
 	lock.Release()
 	release := <-stub.frames
-	if release[0] != opcodeLockRelease || len(release) != frameSizeFor(opcodeLockRelease) {
-		t.Fatalf("release frame = % X; want a %d-byte 0x03 frame", release, frameSizeFor(opcodeLockRelease))
+	if release[0] != opcodeLockRelease {
+		t.Fatalf("release frame = % X; want a 0x03 frame", release)
 	}
-	if action := binary.BigEndian.Uint16(release[1:3]); action != 7 {
-		t.Fatalf("release action = %d; want 7", action)
+	var releaseFrame lockReleaseFrame
+	if err := lockReleaseCodec.Unmarshal(framePayload(t, release), &releaseFrame); err != nil {
+		t.Fatalf("release payload did not decode: %v", err)
 	}
-	if identifier := int64(binary.BigEndian.Uint64(release[3:11])); identifier != -42 {
-		t.Fatalf("release identifier = %d; want -42", identifier)
-	}
-	if generation := binary.BigEndian.Uint16(release[11:13]); generation != 7 {
-		t.Fatalf("release generation = %d; want the granted 7", generation)
+	if releaseFrame != (lockReleaseFrame{Action: 7, Identifier: -42, Generation: 7}) {
+		t.Fatalf("release carried %+v; want action 7, identifier -42, the granted generation 7",
+			releaseFrame)
 	}
 
 	// Release is idempotent: deferring it next to an early return is the normal usage.
@@ -219,11 +239,14 @@ func TestRepliesCorrelateToTheRightCallerOutOfOrder(t *testing.T) {
 	// The property multiplexing rests on: a request parked in a lock queue must not stop later
 	// requests from being answered, and each caller must get its own answer.
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(sequence uint64, opcode byte, _ []byte) (byte, uint16, bool) {
+	stub.answer = func(sequence uint64, opcode byte, _ []byte) (byte, []byte, bool) {
 		if opcode == opcodeLockAcquire {
-			return 0, 11, false // withheld, like an acquire sitting in the queue
+			// Withheld, like an acquire sitting in the queue. The body is the generation it will
+			// be granted with once the test releases it.
+			return replyLockGranted, lockGenerationBody(11), false
 		}
-		return 0, 0, true
+		// The frame that must overtake it is a charge, which has a shape of its own.
+		return replyChargeAllowed, nil, true
 	}
 	client := stub.client()
 
@@ -312,11 +335,12 @@ func TestAnAbandonedAcquireGrantedLateIsReleasedAutomatically(t *testing.T) {
 	// A caller whose context is cancelled after its frame went out must not leave the key held by
 	// nobody until the lease runs out.
 	stub := startMuxDaemonStub(t)
-	stub.answer = func(_ uint64, opcode byte, _ []byte) (byte, uint16, bool) {
+	stub.answer = func(_ uint64, opcode byte, _ []byte) (byte, []byte, bool) {
 		if opcode == opcodeLockAcquire {
-			return 0, 33, false // granted, but only after the caller has given up
+			// Granted, but only after the caller has given up.
+			return replyLockGranted, lockGenerationBody(33), false
 		}
-		return 0, 0, true
+		return replyAck, nil, true
 	}
 	client := stub.client()
 
@@ -341,8 +365,12 @@ func TestAnAbandonedAcquireGrantedLateIsReleasedAutomatically(t *testing.T) {
 		if frame[0] != opcodeLockRelease {
 			t.Fatalf("expected an automatic release, got opcode %d", frame[0])
 		}
-		if generation := binary.BigEndian.Uint16(frame[11:13]); generation != 33 {
-			t.Fatalf("release generation = %d; want the granted 33", generation)
+		var releaseFrame lockReleaseFrame
+		if err := lockReleaseCodec.Unmarshal(framePayload(t, frame), &releaseFrame); err != nil {
+			t.Fatal(err)
+		}
+		if releaseFrame.Generation != 33 {
+			t.Fatalf("release generation = %d; want the granted 33", releaseFrame.Generation)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a lock granted after its caller gave up must be released automatically")
@@ -393,15 +421,17 @@ func TestAnUnreachableDaemonIsDistinguishableFromBusy(t *testing.T) {
 }
 
 func TestBusyAndTimeoutRepliesBothReportBusy(t *testing.T) {
-	for _, status := range []byte{lockReplyBusy, lockReplyWaitTimeout} {
+	for _, reason := range []byte{lockRefusedBusy, lockRefusedWaitTimeout} {
 		stub := startMuxDaemonStub(t)
-		stub.answer = func(uint64, byte, []byte) (byte, uint16, bool) { return status, 0, true }
+		stub.answer = func(uint64, byte, []byte) (byte, []byte, bool) {
+			return replyLockRefused, []byte{reason}, true
+		}
 		client := stub.client()
 		lock, err := client.Acquire(context.Background(), 1, 5, LockOptions{
 			MaxWaiters: 1, Wait: 100 * time.Millisecond, Lease: time.Second,
 		})
 		if !errors.Is(err, ErrLockBusy) {
-			t.Fatalf("status %d gave err = %v; want ErrLockBusy", status, err)
+			t.Fatalf("reason %d gave err = %v; want ErrLockBusy", reason, err)
 		}
 		if lock != nil {
 			t.Fatal("a refused acquire must not return a lock")
@@ -409,13 +439,88 @@ func TestBusyAndTimeoutRepliesBothReportBusy(t *testing.T) {
 	}
 }
 
-func TestLeaseAndWaitMustFitTheWireWidth(t *testing.T) {
+// A zero lease is still refused before dialing — it would expire the hold the instant it was
+// granted. What is no longer refused is a long one: the wire carried uint16 milliseconds while the
+// payload was a fixed fifteen bytes, which capped a lease at 65.5 s for no reason but the layout.
+// A ninety-second critical section now has an honest frame.
+func TestTheLeaseCeilingIsGoneButAZeroLeaseIsStillRefused(t *testing.T) {
 	client := &FarewardClient{address: "127.0.0.1:1", secret: []byte("s")}
 	if _, err := client.Acquire(context.Background(), 1, 5, LockOptions{Lease: 0}); err == nil {
 		t.Fatal("a zero lease must be rejected before dialing")
 	}
+	// It never connects, so the only thing this can prove is that it got past validation and as far
+	// as the dial — which is the whole claim.
 	_, err := client.Acquire(context.Background(), 1, 5, LockOptions{Lease: 90 * time.Second})
+	if !errors.Is(err, ErrLockUnavailable) {
+		t.Fatalf("err = %v; want a 90 s lease to reach the dial rather than be refused", err)
+	}
+
+	// The ceiling that is left is what a uint32 of milliseconds can spell, which no caller reaches
+	// by accident.
+	_, err = client.Acquire(context.Background(), 1, 5, LockOptions{Lease: 60 * 24 * time.Hour})
 	if err == nil || errors.Is(err, ErrLockUnavailable) {
-		t.Fatalf("err = %v; want a validation error about the 65535 ms ceiling", err)
+		t.Fatalf("err = %v; want a validation error about the millisecond ceiling", err)
+	}
+}
+
+// Phase 4: the daemon says a lease expired, rather than the client inferring it from a timer it
+// started a round trip later.
+func TestALockLostPushClosesTheLostChannel(t *testing.T) {
+	stub := startMuxDaemonStub(t)
+	client := stub.client()
+
+	lock, err := client.Acquire(context.Background(), 7, -42, LockOptions{
+		MaxWaiters: 3,
+		Wait:       5000 * time.Millisecond,
+		// Long enough that the local timer cannot be what closes the channel within this test —
+		// only the push can. 65 535 ms is the ceiling the wire carries, which §2.7 of
+		// PROTOCOL_SHAPES.md counts as a wart the colbin phase would remove.
+		Lease: 60 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lock.Lost():
+		t.Fatal("the lock was lost before the daemon said anything")
+	default:
+	}
+
+	stub.push(makeStubPush(replyLockLost, lockLostBody(7, -42)))
+
+	select {
+	case <-lock.Lost():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a LockLost push did not close the Lost channel")
+	}
+}
+
+// A push names one hold, so it must not end a different one — and an unknown push must cost nothing
+// at all, because it states its own length and can be stepped over.
+func TestAPushOnlyEndsTheLockItNames(t *testing.T) {
+	stub := startMuxDaemonStub(t)
+	client := stub.client()
+
+	lock, err := client.Acquire(context.Background(), 7, 1, LockOptions{
+		MaxWaiters: 3, Wait: time.Second, Lease: 60 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stub.push(makeStubPush(replyLockLost, lockLostBody(7, 2)))
+	stub.push(makeStubPush(0x9F, []byte{1, 2, 3}))
+
+	// Round-trip something afterwards to prove the stream is still aligned.
+	if _, err := client.Acquire(context.Background(), 7, 99, LockOptions{
+		MaxWaiters: 3, Wait: time.Second, Lease: time.Minute,
+	}); err != nil {
+		t.Fatalf("the connection did not survive the pushes: %v", err)
+	}
+
+	select {
+	case <-lock.Lost():
+		t.Fatal("a push for another key ended this lock")
+	default:
 	}
 }

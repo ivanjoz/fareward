@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/ivanjoz/colbin"
 )
 
 // Ephemeral distributed locks against the Rust daemon, over the connection shared with the
@@ -21,9 +23,30 @@ import (
 // backstop for a process that freezes without closing its socket. Both are why a lock cannot be
 // released from a different connection than the one that took it.
 
-const (
-	lockAcquirePayloadSize = 15
-	lockReleasePayloadSize = 12
+// lockAcquireFrame and lockReleaseFrame are opcodes 0x02 and 0x03 on the wire, mirrored by
+// `AcquireRequest` and `ReleaseRequest` in fareward/src/lock/protocol.rs.
+//
+// WaitMs and LeaseMs are uint32. They were uint16 while the payload was a fixed fifteen bytes,
+// which capped a lease at 65535 ms — a ceiling nothing about locking wanted, only the layout. A
+// colbin integer costs the bytes its value needs, so widening them costs nothing for the 5 s and
+// 15 s the callers actually use.
+type lockAcquireFrame struct {
+	Action     uint16 `cb:"1"`
+	Identifier int64  `cb:"2"`
+	MaxWaiters uint8  `cb:"3"`
+	WaitMs     uint32 `cb:"4"`
+	LeaseMs    uint32 `cb:"5"`
+}
+
+type lockReleaseFrame struct {
+	Action     uint16 `cb:"1"`
+	Identifier int64  `cb:"2"`
+	Generation uint16 `cb:"3"`
+}
+
+var (
+	lockAcquireCodec = colbin.MustCodec[lockAcquireFrame]()
+	lockReleaseCodec = colbin.MustCodec[lockReleaseFrame]()
 )
 
 // The action namespace itself lives in core (enums.go), not here: which features need
@@ -40,14 +63,32 @@ var (
 	ErrLockUnavailable = ErrFarewardUnavailable
 )
 
-// Daemon reply statuses. Zero is success for every opcode on this port.
+// Why the daemon refused, carried as the whole body of a LockRefused reply. A grant is not in this
+// list: it is a shape of its own, so success and refusal no longer share a field.
 const (
-	lockReplyOK          = 0
-	lockReplyBusy        = 1
-	lockReplyWaitTimeout = 2
-	lockReplyCapacity    = 3
-	lockReplyMisuse      = 4
+	lockRefusedBusy        = 1
+	lockRefusedWaitTimeout = 2
+	lockRefusedCapacity    = 3
+	lockRefusedMisuse      = 4
 )
+
+// decodeLockGeneration reads the generation out of a LockGranted body. It is what a later release
+// must present, and it is what pins that release to this grant rather than to whichever hold
+// replaced it on the same key.
+func decodeLockGeneration(reply muxReply) uint16 {
+	if len(reply.body) < 2 {
+		return 0
+	}
+	return binary.BigEndian.Uint16(reply.body[0:2])
+}
+
+// refusalReason reads the one byte a LockRefused carries.
+func refusalReason(reply muxReply) byte {
+	if len(reply.body) == 0 {
+		return 0
+	}
+	return reply.body[0]
+}
 
 // LockOptions is the full acquire surface, reached through client.Acquire. Handlers do not build
 // one: they call AcquireLock, which fills Wait and Lease with the values below.
@@ -78,15 +119,24 @@ type Lock struct {
 	done        chan struct{}
 }
 
-// Lost closes when this lock is no longer ours: the connection died, so the daemon dropped every
-// lock on it, or the lease elapsed and the daemon expired the hold on its own clock.
+// Lost closes when this lock is no longer ours: the daemon said so, the connection died, or the
+// local lease timer ran out.
 //
-// It is advisory, not authoritative. The lease timer here starts when the grant arrives, a round
-// trip after the daemon started counting, and under a partition a holder may already be past its
-// check by the time this fires. Work inside a lock has to stay safe to run twice regardless;
-// this only narrows the window and makes the failure visible instead of silent.
+// The daemon says so first. When a lease elapses it drops the hold and pushes a LockLost frame, so
+// this closes at the daemon's own deadline rather than at the local timer's — which starts a round
+// trip later and is therefore always the more optimistic of the two. The timer stays as the
+// backstop for the case the push cannot arrive, which is the same case the connection dying covers.
+//
+// It is still advisory under a partition: work inside a lock has to stay safe to run twice. What
+// the push buys is that the common case — a slow critical section against a live daemon — is now
+// reported rather than inferred.
 func (lock *Lock) Lost() <-chan struct{} {
 	return lock.lost
+}
+
+// markLost is how the connection reader reports a LockLost push.
+func (lock *Lock) markLost() {
+	lock.lostOnce.Do(func() { close(lock.lost) })
 }
 
 // Release hands the lock back. It must travel on the connection that took it, because that is
@@ -94,6 +144,7 @@ func (lock *Lock) Lost() <-chan struct{} {
 func (lock *Lock) Release() {
 	lock.releaseOnce.Do(func() {
 		close(lock.done)
+		lock.connection.forgetHeld(lock)
 		if lock.connection.isClosed() {
 			return
 		}
@@ -105,9 +156,9 @@ func (lock *Lock) Release() {
 			logLine("lock release failed::", err)
 			return
 		}
-		if reply.status != lockReplyOK {
-			// Misuse here means the daemon no longer had this hold — the lease beat us to it.
-			logLine("lock release refused, status::", reply.status)
+		if reply.shape != replyAck {
+			// A refusal here means the daemon no longer had this hold — the lease beat us to it.
+			logLine("lock release refused, shape::", reply.shape, " reason::", refusalReason(reply))
 		}
 	})
 }
@@ -162,12 +213,13 @@ func (client *FarewardClient) Acquire(
 		return nil, errors.New("LockOptions.Lease must be positive")
 	}
 
-	payload := make([]byte, lockAcquirePayloadSize)
-	binary.BigEndian.PutUint16(payload[0:2], action)
-	binary.BigEndian.PutUint64(payload[2:10], uint64(identifier))
-	payload[10] = options.MaxWaiters
-	binary.BigEndian.PutUint16(payload[11:13], waitMillis)
-	binary.BigEndian.PutUint16(payload[13:15], leaseMillis)
+	payload := lockAcquireCodec.Append(nil, &lockAcquireFrame{
+		Action:     action,
+		Identifier: identifier,
+		MaxWaiters: options.MaxWaiters,
+		WaitMs:     waitMillis,
+		LeaseMs:    leaseMillis,
+	})
 
 	// The daemon holds the frame for up to Wait before answering, so our patience has to outlast
 	// the queue, not the round trip.
@@ -177,15 +229,21 @@ func (client *FarewardClient) Acquire(
 		return nil, err
 	}
 
-	switch reply.status {
-	case lockReplyOK:
-		return newLock(client, connection, action, identifier, reply.detail, options.Lease), nil
-	case lockReplyBusy, lockReplyWaitTimeout:
-		return nil, ErrLockBusy
-	case lockReplyCapacity:
-		return nil, fmt.Errorf("%w: daemon at capacity", ErrLockUnavailable)
+	switch reply.shape {
+	case replyLockGranted:
+		return newLock(
+			client, connection, action, identifier, decodeLockGeneration(reply), options.Lease), nil
+	case replyLockRefused:
+		switch refusalReason(reply) {
+		case lockRefusedBusy, lockRefusedWaitTimeout:
+			return nil, ErrLockBusy
+		case lockRefusedCapacity:
+			return nil, fmt.Errorf("%w: daemon at capacity", ErrLockUnavailable)
+		}
+		return nil, fmt.Errorf("%w: refused with reason %d", ErrLockUnavailable, refusalReason(reply))
 	default:
-		return nil, fmt.Errorf("%w: unexpected reply status %d", ErrLockUnavailable, reply.status)
+		return nil, fmt.Errorf("%w: acquire answered with shape 0x%02X",
+			ErrLockUnavailable, reply.shape)
 	}
 }
 
@@ -202,7 +260,11 @@ func newLock(
 		lost:       make(chan struct{}),
 		done:       make(chan struct{}),
 	}
-	// Watches for the two ways this hold can end without us releasing it. Exits as soon as the
+	// Filed before the watcher starts: a lease this short could elapse on the daemon before this
+	// function returns, and a push that arrived first would otherwise find nothing to mark.
+	connection.registerHeld(lock)
+
+	// Watches for the two ways this hold can end that no push will report. Exits as soon as the
 	// lock is released normally, so it costs nothing in the common case.
 	go func() {
 		timer := time.NewTimer(lease)
@@ -213,27 +275,30 @@ func newLock(
 		case <-connection.closed:
 		case <-timer.C:
 		}
-		lock.lostOnce.Do(func() { close(lock.lost) })
+		lock.markLost()
 	}()
 	return lock
 }
 
 func makeLockReleasePayload(action uint16, identifier int64, generation uint16) []byte {
-	payload := make([]byte, lockReleasePayloadSize)
-	binary.BigEndian.PutUint16(payload[0:2], action)
-	binary.BigEndian.PutUint64(payload[2:10], uint64(identifier))
-	binary.BigEndian.PutUint16(payload[10:12], generation)
-	return payload
+	return lockReleaseCodec.Append(nil, &lockReleaseFrame{
+		Action:     action,
+		Identifier: identifier,
+		Generation: generation,
+	})
 }
 
-// lockDurationToMillis enforces the uint16 milliseconds the wire carries.
-func lockDurationToMillis(value time.Duration, name string) (uint16, error) {
+// lockDurationToMillis enforces the uint32 milliseconds the wire carries — 49 days, which is a
+// ceiling no caller can reach by accident. The daemon clamps a lease to its own configured maximum
+// anyway, so this only has to refuse what cannot be spelled.
+func lockDurationToMillis(value time.Duration, name string) (uint32, error) {
 	if value < 0 {
 		return 0, fmt.Errorf("LockOptions.%s cannot be negative", name)
 	}
 	millis := value.Milliseconds()
-	if millis > int64(^uint16(0)) {
-		return 0, fmt.Errorf("LockOptions.%s exceeds the 65535 ms the protocol carries", name)
+	if millis > int64(^uint32(0)) {
+		return 0, fmt.Errorf("LockOptions.%s exceeds the %d ms the protocol carries",
+			name, ^uint32(0))
 	}
-	return uint16(millis), nil
+	return uint32(millis), nil
 }

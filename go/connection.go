@@ -30,45 +30,41 @@ import (
 const (
 	farewardNonceSize   = 8
 	farewardAuthTagSize = 8
-	// Every reply starts with [correlation:u16][status:u8][detail:u16][extra_len:u8]. The tail
-	// that follows is `extra_len` bytes and is empty for every opcode but a charge that asked for
-	// authorization, which answers with the sub-accesses of the required slots the user holds.
-	farewardReplyHeadSize = 6
-	// Width of the length header a length-prefixed opcode carries between the opcode and its
-	// payload. Mirrors LENGTH_PREFIX_SIZE in fareward/src/service/protocol.rs.
+	// Every reply starts with [shape:1][correlation:u16]. What follows is the body the shape names,
+	// which is nothing at all for four of the eleven shapes.
+	farewardReplyHeadSize = 3
+	// Width of the length header every opcode carries between the opcode and its payload.
+	// Mirrors LENGTH_PREFIX_SIZE in fareward/src/service/protocol.rs.
 	farewardLengthPrefixSize = 2
-	// The widest tail over every opcode that has one: MAX_REQUIRED_ACCESS slots of at most two sub
-	// bytes each for a charge, and one int64 for a sequence reservation. A reply claiming more is a
-	// desynchronized stream, not a long answer, so it kills the connection rather than being read
-	// as payload. Mirrors REPLY_MAX_EXTRA_SIZE in fareward/src/service/protocol.rs, which is a max
-	// over the same two for the same reason.
-	farewardReplyMaxExtraSize = max(2*MaxRequiredAccess, sequenceReplyExtraSize)
 	// Names the framing of the whole port, request and reply, and is bumped on every wire change
 	// so a mismatched peer fails at the first frame instead of misreading bytes.
 	// `:v7` renamed the string itself from `genix-server-utils` to `fareward` and `:v8` replaced
 	// truncated HMAC-SHA256 with SipHash-2-4. Neither changed a frame's layout, but each
 	// invalidates every tag a peer on the old string produces, so both spend a bump rather than
-	// leaving two incompatible protocols under one name. `:v9` did change the layout: the reply
-	// grew a length-prefixed tail, so a mixed pair cannot read each other at all and must fail at
-	// the first frame instead of misparsing one.
+	// leaving two incompatible protocols under one name. `:v9` grew a length-prefixed reply tail.
+	// `:v10` gave every reply a shape in byte 0 and retired the status/detail pair, whose meaning
+	// depended on which request the correlation belonged to — a peer on `:v9` would read the shape
+	// as half a correlation and be wrong about every frame after it.
+	// `:v11` moved six of the eight request payloads onto colbin and length-prefixed all of them,
+	// so a peer on `:v10` would read a length header as a payload's first two bytes.
 	// Mirrored byte for byte by DOMAIN in fareward/src/service/auth.rs; backend and daemon must
 	// cross this boundary in a single deploy.
-	farewardAuthDomain = "fareward:v9"
+	farewardAuthDomain = "fareward:v11"
 
 	opcodeChargeCredits = byte(0x01)
 	opcodeLockAcquire   = byte(0x02)
 	opcodeLockRelease   = byte(0x03)
-	// opcodeLogRequest is the only opcode the daemon does not answer, and one of the two that are
-	// length-prefixed. Both are consequences of what it carries: a variable-length log record that
-	// must never make a response wait.
+	// opcodeLogRequest is one of the two opcodes the daemon does not answer: it carries a log
+	// record, and making a response wait for an acknowledgement that a log was stored would put the
+	// daemon's latency on the critical path of every request in the system.
 	opcodeLogRequest          = byte(0x04)
 	opcodeMutateCompanyBudget = byte(0x05)
 	// opcodeInvalidateUserAccess is the second unanswered opcode: the TTL on the daemon's grant
 	// cache is the backstop if it is lost, so a user save does not wait for an acknowledgement.
 	opcodeInvalidateUserAccess = byte(0x06)
-	// opcodeReserveSequence and opcodeSetSequence are the other length-prefixed opcodes, because
-	// they carry a counter name, and unlike the request log both are answered — the value is the
-	// whole point of the call.
+	// The two sequence opcodes are the only request payloads that are not colbin messages. They are
+	// a scalar and a counter name, and PROTOCOL_SHAPES.md §4.3 is why they stay hand-rolled: the
+	// reserve path is the ORM's insert path, and the shape has no room to grow.
 	opcodeReserveSequence = byte(0x07)
 	opcodeSetSequence     = byte(0x08)
 
@@ -94,13 +90,57 @@ func SetLogger(logger func(args ...any)) {
 // a charge treats it as permission to proceed, sign-up treats it as a reason to refuse.
 var ErrFarewardUnavailable = errors.New("fareward service is unavailable")
 
+// Reply shapes. Byte 0 of every reply names the outcome, which is what lets the reader parse a
+// frame without first remembering what was asked. Mirrors ReplyShape in
+// fareward/src/service/protocol.rs.
+const (
+	replyChargeAllowed         = byte(0x01)
+	replyChargeGranted         = byte(0x02)
+	replyChargeCreditViolation = byte(0x03)
+	replyChargeAccessDenied    = byte(0x04)
+	replyLockGranted           = byte(0x05)
+	replyLockRefused           = byte(0x06)
+	replyAck                   = byte(0x07)
+	replyBudgetRefused         = byte(0x08)
+	replySequenceValue         = byte(0x09)
+	replySequenceInvalid       = byte(0x0A)
+	// replyUnavailable is "I could not answer". Every operation applies its own policy to it:
+	// credits fail closed, a sequence fails the write, lock call sites decide individually.
+	replyUnavailable = byte(0x7F)
+	// replyLockLost and anything above it is a push: a frame the daemon sends without being asked,
+	// which carries no correlation and is routed on its shape alone. Every push is [len:u8][body],
+	// so a push this client predates can be stepped over instead of killing the connection.
+	replyLockLost   = byte(0x80)
+	replyPushFloor  = byte(0x80)
+	lockLostBodyLen = 10
+)
+
+// replyBodySize is how many bytes follow the head, or -1 when the shape states its own length.
+// Mirrors ReplyShape::body_size; a disagreement here desynchronizes every reply after the first.
+func replyBodySize(shape byte) (int, bool) {
+	switch shape {
+	case replyChargeAllowed, replyAck, replySequenceInvalid, replyUnavailable:
+		return 0, true
+	case replyChargeCreditViolation, replyChargeAccessDenied, replyLockRefused, replyBudgetRefused:
+		return 1, true
+	case replyLockGranted:
+		return 2, true
+	case replySequenceValue:
+		return sequenceReplyExtraSize, true
+	case replyChargeGranted:
+		// Two masks, a sub-byte count, and that many sub bytes.
+		return -1, true
+	default:
+		return 0, false
+	}
+}
+
 type muxReply struct {
-	status byte
-	detail uint16
-	// extra is the reply's tail, empty on every opcode that has nothing more to say. On a charge
-	// it holds the sub-access bytes of the granted slots, verbatim as the daemon read them out of
-	// accesos_sub_computed.
-	extra []byte
+	// shape is the outcome. Every call site switches on it instead of decoding a status byte whose
+	// meaning depended on the request it answered.
+	shape byte
+	// body is what the shape carries, empty for the four shapes that carry nothing.
+	body []byte
 }
 
 type pendingRequest struct {
@@ -114,6 +154,12 @@ type pendingRequest struct {
 	identifier int64
 }
 
+// heldKey identifies one lock on one connection, which is what a LockLost push names.
+type heldKey struct {
+	action     uint16
+	identifier int64
+}
+
 type muxConnection struct {
 	conn  net.Conn
 	nonce [farewardNonceSize]byte
@@ -123,6 +169,12 @@ type muxConnection struct {
 
 	pendingMu sync.Mutex
 	pending   map[uint16]*pendingRequest
+
+	// heldMu guards the locks granted on this connection, so a LockLost push can find the Lock it
+	// names. Registered when a grant arrives and dropped on release, which keeps the map the size
+	// of what this process actually holds.
+	heldMu sync.Mutex
+	held   map[heldKey]*Lock
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -266,8 +318,7 @@ func (connection *muxConnection) write(secret []byte, opcode byte, payload []byt
 	sequence := connection.sequence
 	connection.sequence++
 
-	frame := buildFarewardLengthPrefixedFrame(
-		secret, &connection.nonce, sequence, opcode, payload)
+	frame := buildFarewardFrame(secret, &connection.nonce, sequence, opcode, payload)
 	writeErr := connection.conn.SetWriteDeadline(time.Now().Add(farewardWriteTimeout))
 	if writeErr == nil {
 		writeErr = writeCompleteFrame(connection.conn, frame)
@@ -311,6 +362,7 @@ func (client *FarewardClient) dial(ctx context.Context) (*muxConnection, error) 
 	connection := &muxConnection{
 		conn:    socket,
 		pending: map[uint16]*pendingRequest{},
+		held:    map[heldKey]*Lock{},
 		closed:  make(chan struct{}),
 	}
 	if err := socket.SetReadDeadline(time.Now().Add(farewardDialTimeout)); err != nil {
@@ -360,7 +412,7 @@ func (connection *muxConnection) exchange(
 	connection.pendingMu.Unlock()
 	connection.sequence++
 
-	frame := buildFrameForOpcode(secret, &connection.nonce, sequence, opcode, payload)
+	frame := buildFarewardFrame(secret, &connection.nonce, sequence, opcode, payload)
 	writeErr := connection.conn.SetWriteDeadline(time.Now().Add(farewardWriteTimeout))
 	if writeErr == nil {
 		writeErr = writeCompleteFrame(connection.conn, frame)
@@ -394,25 +446,51 @@ func (connection *muxConnection) exchange(
 // several callers share the connection.
 func (connection *muxConnection) readLoop(client *FarewardClient) {
 	for {
-		reply := [farewardReplyHeadSize]byte{}
-		if _, err := io.ReadFull(connection.conn, reply[:]); err != nil {
+		head := [farewardReplyHeadSize]byte{}
+		if _, err := io.ReadFull(connection.conn, head[:]); err != nil {
 			connection.fail(err)
 			return
 		}
-		correlation := binary.BigEndian.Uint16(reply[0:2])
-		answer := muxReply{status: reply[2], detail: binary.BigEndian.Uint16(reply[3:5])}
+		answer := muxReply{shape: head[0]}
+		correlation := binary.BigEndian.Uint16(head[1:3])
 
-		// The tail is read before anything is dispatched, because a stream left unread mid-frame
+		// The body is read before anything is dispatched, because a stream left unread mid-frame
 		// desynchronizes every reply after it — including the ones nobody is waiting for.
-		if extraLen := int(reply[5]); extraLen > 0 {
-			if extraLen > farewardReplyMaxExtraSize {
-				connection.fail(fmt.Errorf(
-					"fareward reply claims a %d-byte tail, over the %d maximum",
-					extraLen, farewardReplyMaxExtraSize))
+		//
+		// A push says how long it is, so an unknown one costs nothing: it is consumed and dropped.
+		// An unknown *reply* is fatal, because without a width there is no way to find where the
+		// next frame starts.
+		if answer.shape >= replyPushFloor {
+			if err := connection.readPush(answer.shape); err != nil {
+				connection.fail(err)
 				return
 			}
-			answer.extra = make([]byte, extraLen)
-			if _, err := io.ReadFull(connection.conn, answer.extra); err != nil {
+			continue
+		}
+		size, known := replyBodySize(answer.shape)
+		if !known {
+			connection.fail(fmt.Errorf(
+				"fareward sent reply shape 0x%02X, which this client does not know", answer.shape))
+			return
+		}
+		if size < 0 {
+			// The one variable body: two masks and the sub-byte count that follows them.
+			answer.body = make([]byte, 3)
+			if _, err := io.ReadFull(connection.conn, answer.body); err != nil {
+				connection.fail(err)
+				return
+			}
+			if subBytes := int(answer.body[2]); subBytes > 0 {
+				tail := make([]byte, subBytes)
+				if _, err := io.ReadFull(connection.conn, tail); err != nil {
+					connection.fail(err)
+					return
+				}
+				answer.body = append(answer.body, tail...)
+			}
+		} else if size > 0 {
+			answer.body = make([]byte, size)
+			if _, err := io.ReadFull(connection.conn, answer.body); err != nil {
 				connection.fail(err)
 				return
 			}
@@ -434,13 +512,75 @@ func (connection *muxConnection) readLoop(client *FarewardClient) {
 		if request.abandoned {
 			// The caller gave up, but the daemon may still have granted the lock. Hand it back
 			// straight away instead of leaving the key held by nobody until its lease expires.
-			if request.opcode == opcodeLockAcquire && answer.status == lockReplyOK {
-				go client.releaseAbandoned(connection, request.action, request.identifier, answer.detail)
+			if request.opcode == opcodeLockAcquire && answer.shape == replyLockGranted {
+				go client.releaseAbandoned(
+					connection, request.action, request.identifier, decodeLockGeneration(answer))
 			}
 			continue
 		}
 		request.reply <- answer
 	}
+}
+
+// readPush consumes one push and acts on it. A push answers nothing, so it never reaches the
+// pending map — and it states its own length, so one this client does not know is skipped rather
+// than fatal.
+func (connection *muxConnection) readPush(shape byte) error {
+	length := [1]byte{}
+	if _, err := io.ReadFull(connection.conn, length[:]); err != nil {
+		return err
+	}
+	body := make([]byte, length[0])
+	if _, err := io.ReadFull(connection.conn, body); err != nil {
+		return err
+	}
+	connection.handlePush(muxReply{shape: shape, body: body})
+	return nil
+}
+
+// handlePush acts on a frame the daemon sent without being asked.
+//
+// Only one shape reaches here today: the daemon noticed a lease elapse and dropped a hold this
+// process still believes it owns. Telling the Lock makes its Lost channel authoritative at the
+// daemon's own deadline instead of a round trip later, which is when the client's timer starts.
+func (connection *muxConnection) handlePush(answer muxReply) {
+	if answer.shape != replyLockLost {
+		// Already consumed by readPush, so the stream is still aligned: a newer daemon may simply
+		// push something this client predates.
+		logLine("fareward push with an unknown shape::", answer.shape)
+		return
+	}
+	if len(answer.body) < lockLostBodyLen {
+		logLine("fareward sent a short LockLost push::", len(answer.body))
+		return
+	}
+	action := binary.BigEndian.Uint16(answer.body[0:2])
+	identifier := int64(binary.BigEndian.Uint64(answer.body[2:10]))
+	logLine("fareward reports a lease expired::", action, identifier)
+
+	key := heldKey{action: action, identifier: identifier}
+	connection.heldMu.Lock()
+	lock := connection.held[key]
+	// Dropped here rather than waiting for a Release that may never come: the daemon has already
+	// let this hold go, so the entry can only keep a dead Lock alive for the life of the socket.
+	delete(connection.held, key)
+	connection.heldMu.Unlock()
+	if lock != nil {
+		lock.markLost()
+	}
+}
+
+// registerHeld files a granted lock so a LockLost push can find it.
+func (connection *muxConnection) registerHeld(lock *Lock) {
+	connection.heldMu.Lock()
+	connection.held[heldKey{action: lock.action, identifier: lock.identifier}] = lock
+	connection.heldMu.Unlock()
+}
+
+func (connection *muxConnection) forgetHeld(lock *Lock) {
+	connection.heldMu.Lock()
+	delete(connection.held, heldKey{action: lock.action, identifier: lock.identifier})
+	connection.heldMu.Unlock()
 }
 
 // releaseAbandoned returns a lock that was granted to a caller which had already stopped waiting.
@@ -491,38 +631,17 @@ func (connection *muxConnection) isClosed() bool {
 	}
 }
 
-// opcodeIsLengthPrefixed reports whether an opcode states its own payload length. Only the two
-// that carry a string do: every other operation describes a fixed record whose width the opcode
-// already implies. Mirrors Opcode::payload_width in fareward/src/service/protocol.rs — a
-// disagreement here would make the daemon read the length header as the payload's first bytes.
-func opcodeIsLengthPrefixed(opcode byte) bool {
-	return opcode == opcodeLogRequest ||
-		opcode == opcodeReserveSequence ||
-		opcode == opcodeSetSequence
-}
-
-func buildFrameForOpcode(
-	secret []byte, nonce *[farewardNonceSize]byte, sequence uint64, opcode byte, payload []byte,
-) []byte {
-	if opcodeIsLengthPrefixed(opcode) {
-		return buildFarewardLengthPrefixedFrame(secret, nonce, sequence, opcode, payload)
-	}
-	return buildFarewardFrame(secret, nonce, sequence, opcode, payload)
-}
-
+// buildFarewardFrame lays out one frame: the opcode, the payload's length, the payload, and the
+// tag over all three.
+//
+// Every opcode is length-prefixed. There used to be a second, fixed-width form for the operations
+// whose payload the opcode alone described, but no such operation is left: six of the eight are
+// colbin messages that write only the bytes a value needs, and the other two carry a counter name.
+// The tag covers the length header too, so a peer cannot make the daemon buffer a different amount
+// than the one that was signed.
+//
+// Mirrors the frame reader in fareward/src/service/protocol.rs.
 func buildFarewardFrame(
-	secret []byte, nonce *[farewardNonceSize]byte, sequence uint64, opcode byte, payload []byte,
-) []byte {
-	frame := make([]byte, 0, 1+len(payload)+farewardAuthTagSize)
-	frame = append(frame, opcode)
-	frame = append(frame, payload...)
-	return append(frame, farewardAuthTag(secret, nonce, sequence, frame)...)
-}
-
-// buildFarewardLengthPrefixedFrame is the variable-width form: the payload's length travels
-// between the opcode and the payload. The tag covers the length header too, so a peer cannot make
-// the daemon buffer a different amount than the one that was signed.
-func buildFarewardLengthPrefixedFrame(
 	secret []byte, nonce *[farewardNonceSize]byte, sequence uint64, opcode byte, payload []byte,
 ) []byte {
 	frame := make([]byte, 0, 1+farewardLengthPrefixSize+len(payload)+farewardAuthTagSize)

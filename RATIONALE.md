@@ -1,3 +1,205 @@
+## Six request shapes moved to colbin, and every frame is length-prefixed — `fareward:v11`
+
+**Context** — Phase 3 of `PROTOCOL_SHAPES.md`. Six of the eight request payloads were fixed
+layouts read by byte offset on the far side; the request log was the exception, and it was the only
+hand-written variable-length parser on the port — three length idioms, a bounds check before each,
+and seven error variants for the ways a peer can lie about a length.
+
+**Decision** — `ChargeCredits`, `LockAcquire`, `LockRelease`, `LogRequest`, `MutateCompanyBudget`
+and `InvalidateUserAccess` carry colbin messages, one numbered struct per shape with ids 1..16 so
+both sides keep four-bit keys. Mirrored by `#[derive(Colbin)]` on the Rust side, field id for field
+id. `ReserveSequence` and `SetSequence` stay hand-rolled, as instructed. Validation did **not** move
+into the codec: `company_id > 0`, the route ceiling, the no-gaps slot rule and the empty-frame check
+are protocol rules and stayed where they were.
+
+Two things fell out that are worth naming separately:
+
+- **Every opcode is length-prefixed now, and the fixed-width framing is gone.** A colbin payload
+  varies in length, so all six needed a length header; the two sequence opcodes already had one.
+  Nothing was left that a fixed width could describe, so `PayloadWidth`, `Opcode::fixed_frame_size`,
+  `opcodeIsLengthPrefixed` and `buildFarewardLengthPrefixedFrame` were all deleted and one path
+  replaced two on both sides. Each opcode now declares a `max_payload_size` instead, which is what
+  bounds what an unauthenticated peer can make the daemon buffer.
+- **The 65535 ms lease ceiling is gone.** `wait_ms` and `lease_ms` were `u16` because fifteen fixed
+  bytes had room for no more. They are `u32` now and a short lease still costs two bytes, because a
+  colbin integer costs what its value needs. §2.7 of `PROTOCOL_SHAPES.md` is closed rather than
+  raised.
+
+`DOMAIN` moved to `fareward:v11`. Backend and daemon cross this in one deploy.
+
+**Rationale** — The request log is the whole case on its own: a parser that acts on a length from a
+socket is the kind of code that has to be right every time, and it is now one `decode` call with
+the two ceilings that are actually about request logs left behind it. The rest is smaller and still
+worth it — an ungated charge is 12 bytes against 20 because the four empty access slots are not
+written, a budget mutation naming one resource does not carry the other, and the wildcard
+invalidation is the frame with no user field in it. The cost is two bytes of length header per
+frame, which the charge and the budget repay several times over and the invalidation does not: 6
+bytes fixed against 7 for a named user, 5 for the wildcard. That one is a wash, kept for uniformity
+rather than for bytes.
+
+The extra-credit flag came out of bit 15 of the route number in the same change. It rode there
+because widening a fixed payload for one boolean was not worth it; with a codec it is a field that
+costs one byte when true and nothing when false, and "is this route number clean" stops being a
+question either side has to ask.
+
+## colbin carries a slice at the root, and the Rust port had a list-element bug
+
+**Context** — Adopting the rewritten colbin across the ORM turned up two things that were not
+fareward's and had to be fixed in colbin before any of this could land.
+
+**Decision** — Both fixed upstream in `github.com/ivanjoz/colbin`:
+
+1. **A slice or map at the root is wrapped in a one-field envelope.** The new format encodes a
+   struct and nothing else, but `genix-orm` marshals `[]AccesoGrantRecord` into a blob column and
+   the previous format took it. A non-struct root is now written as a one-field message under key 0
+   — no format change, no port to update, two bytes, and no copy.
+2. **The Rust port closed a narrow list element like a keyed composite.** Any element body reaching
+   255 bytes produced a message the crate itself refused, and an encoded size a byte off Go's. That
+   is an ordinary request-log row with two errors in it, which is how it surfaced. Go already had
+   the fix (`Writer.CloseElement`); the Rust side did not.
+
+**Rationale** — The second one is why the cross-language vectors matter more than round-trip tests:
+every Rust test passed against Rust's own encoder, and only a record built to the real ceilings
+caught it. Go is the specification, so "what does Go write for this" is the question that settled
+both.
+
+## Every reply names its shape in byte 0, and `fareward:v10`
+
+**Context** — A reply was `[correlation:u16][status:u8][detail:u16][extra_len:u8]`, and neither
+`status` nor `detail` meant anything on its own: `status` was a five-bit credit-violation bitfield
+for a charge, one enum for a lock, a different one for a budget, a third for a sequence, and `0xFF`
+for "I could not answer" across all of them; `detail` was a lock generation, or a packed
+eleven-bit authorization verdict, or zero. A client could not read a reply without first looking up
+what it had asked, which also meant the daemon could not send a frame nobody asked for.
+
+**Decision** — Byte 0 of a reply is a shape: eleven of them, each with a body of its own and a width
+that follows from the name. `ReplyShape` and `Reply` in `service/protocol.rs` own the layout; the
+Go client mirrors them in `connection.go` and every call site switches on the shape instead of
+decoding a shared byte. `0x80` and up is a push range. `DOMAIN` moved to `fareward:v10`, so a peer
+still on `:v9` fails at the first frame rather than reading a shape byte as half a correlation.
+
+**Rationale** — The byte is free: it replaces the `extra_len` byte every reply used to carry,
+because a shape that knows its own width does not need to state one. Only `ChargeGranted` varies, so
+only it still counts its sub bytes. Every other reply came out the same size or smaller — a plain
+acknowledgement went from six bytes to three, a sequence value from fourteen to eleven.
+
+What it buys beyond size is that an outcome now has a name. `Ack` and `LockGranted` were the same
+`status = 0`; a refused release and a refused acquire shared an enum with a success value in it; and
+`0xFF` was a sentinel inside a field that also carried verdicts, which is why the charge decoder had
+to reject it by checking that its top bits were set. All of that is gone, and adding an outcome is
+now a shape rather than a hunt for space in a field that already means four things.
+
+## `LockLost`: the daemon says a lease expired instead of the client guessing
+
+**Context** — `Lock.Lost()` was a local timer started when the grant arrived, which is a round trip
+after the daemon started counting its lease. Its own doc comment called it advisory. The daemon knew
+exactly when a hold expired — `drop_expired` logged it — and had no way to say so, because every
+frame it could write had to answer a request.
+
+**Decision** — `drop_expired` returns the keys it dropped and the reader loop pushes
+`LockLost { action, identifier }` for each, correlation zero. The Go reader routes frames at or
+above `0x80` to `handlePush` before the pending map, looks the lock up in a per-connection registry
+of what this process holds, and closes its `lost` channel. The local timer stays as the backstop for
+the case where no push can arrive, which is the same case a dead connection already covered.
+
+**Rationale** — The push exists because the shape byte made it cheap: a frame with no correlation is
+just a shape the reader recognises, and a client that meets a push it does not know can skip it
+because a push states its own width. The registry is the only new state, and it is the size of what
+this process actually holds — filed when a grant arrives, dropped on release.
+
+It is still advisory under a partition, and work inside a lock still has to be safe to run twice.
+What changed is the common case: a slow critical section against a live daemon is now *reported* at
+the daemon's own deadline rather than inferred at a later one.
+
+## The sequence payloads read through a cursor, and the Go client pins them
+
+**Context** — `parse_reserve` and `parse_set` counted offsets by hand, and the rule that makes them
+work — the scalar leads so the counter name can be the rest of the frame, needing no length of its
+own — lived in a comment. Nothing enforced it, and the two sides had no shared vector for either
+frame.
+
+**Decision** — A small `Cursor` in `sequence/protocol.rs`: `u32`, `i64`, and `rest`. `rest` is that
+rule, stated once in code. Both parsers use it, and a new test parses the exact bytes
+`ReserveSequence` and `SetSequence` put on the wire, pasted from the Go client.
+
+**Rationale** — The cursor was measured at 1.1x the hand-rolled parser in Rust (the reads inline
+away) and it removes the last literal offsets from the two shapes that stay hand-rolled. The vector
+is the more important half: it is the mechanism that catches drift, and a comment saying "mirrors
+the Rust constant" is not.
+
+## Three decisions taken without asking, while the wire work ran unsupervised
+
+**Context** — The per-shape codec split was decided: `LockGranted`, `LockRefused`, `ReserveSequence`
+and `SetSequence` hand-rolled, everything else colbin. Three things the split did not say came up
+during implementation.
+
+**Decision** — (1) `SequenceValue`, the reply shared by the two hand-rolled sequence requests, is
+hand-rolled too: one `i64` behind a shape byte, in the same family as the requests it answers.
+(2) `ChargeGranted` keeps its hand-rolled body for now — two masks and a counted run of sub bytes —
+because it belongs to the colbin phase that is blocked, and a half-moved shape is worse than either
+end state. (3) The lock integration suite resolves the shape to an outcome code in one helper
+(`outcome_code`) rather than restating shapes across fifty assertions, and two new tests assert the
+shapes directly instead.
+
+**Rationale** — Each is reversible in one place, and each is flagged where a reader will meet it:
+(1) in `PROTOCOL_SHAPES.md` §10.1, (2) in §7 Phase 3, (3) in the helper's own comment. The
+alternative for (3) would have been churn without coverage — those fifty assertions are about lock
+behaviour, not byte layout, and `outcome_code` would have been the thing under test either way.
+
+## colbin cannot carry the frames yet, because here it is a database format
+
+**Context** — The plan's Phase 3 moves six request shapes and one reply onto colbin, which the
+current colbin earns: re-measured on 2026-09-13 it is 4x faster than its previous self on a charge
+and 22x–24x on the request log, at 3.5x–8.4x of the hand-rolled encoders rather than 35x–120x.
+
+**Decision** — Phase 3 is not started, and `fareward/go/go.mod` keeps its zero dependencies. Phases
+1, 2 and 4 — which need none of it — shipped instead.
+
+**Rationale** — colbin in this project is not only a wire codec. `genix-orm/scylla/reflect_accessors.go`
+and `converter.go` marshal struct fields into blob columns, `dynamo/client.go` does the same for
+DynamoDB, `cloud/company_config_blob.go` seals the company config with it, and `security/login.go`
+writes the session token. The rewritten colbin says in its own commit message that the format "is
+not compatible" — and because the backend imports `fareward/go`, the two share one module version.
+Adopting it for frames therefore means re-encoding every colbin blob already in ScyllaDB.
+
+That is a data migration with a deploy ordering across three implementations of the session token
+(Go writer, Rust reader, browser reader), not a wire change, and it is not something to start while
+nobody is watching. The daemon's own `bridge/token.rs` also will not compile against the new crate —
+`Kind`, `Schema`, `decode_one` and `Value` are all gone — so Phase 0 is a project of its own.
+
+## `kv16` lands as an unused module, with continued sizes and three departures from the sketch
+
+**Context** — The wire review in `PROTOCOL_SHAPES.md` measured colbin at 10x-120x the hand-rolled
+encoders on this port and recommended a cursor instead, which buys the ordering but none of the
+bytes. `kv16` is the third option: a byte-aligned `[key][value]` codec for records of at most sixteen
+primitive fields, in `go/kv16` and `src/kv16.rs`, pinned together by cross-language vectors and
+**carried by no frame** — `lib.rs` declares the module and nothing calls it.
+
+**Decision** — Sizes are continued rather than capped: a header holds a size's low bits and a flag,
+and LEB128 bytes carry whatever is above them, so no string, array or element has a ceiling. Three
+departures from the sketch it was drawn from, each recorded in `KV16_DRAFT.md` §2 with its numbers.
+The integer array header spends two bits on the element width and eight on the count, where the
+sketch drew one and nine. Integer size code 6, which was unassigned, now means "no content bytes, the
+magnitude is one", which makes a true bool a single byte. And the writer checks nothing at all — not
+the key, not the size — so it has no error and no `Err` method.
+
+**Rationale** — The width is the one place this knowingly diverges, and it is one-way: the sketch's
+array header and this one are both sixteen bits and the bit that means "wide" in one is a count bit
+in the other, so supporting both is not an option. Two widths cannot serve both a `[]uint16` of
+packed grants and a `[]int32` of error ids without one of them wasting half its bytes, and the count
+bit it costs stopped mattering once counts continue. The writer's missing checks are the same
+principle in two places — *the reader defends against the network, the writer trusts its own
+program*: a key is a constant of the record definition rather than data, and checking it once per
+field measured 8 ns of a 25 ns ten-field encode. The cost is that a key above fifteen writes a record
+nothing can read back, so `doc.go` prescribes a compile-time assertion where the key constants live.
+The reader keeps every bound, and gained two the writer does not need: a continuation run past nine
+bytes, or one describing more than an `int` holds, is refused rather than wrapped into a small size
+whose bounds check would then pass.
+
+The module ships unused because which frames should move to it, if any, is the open question
+`KV16_DRAFT.md` §7 puts to review; landing the codec separately from that decision is what lets the
+decision be made against real numbers instead of a proposal.
+
 ## The counter bind is pinned by a serialization test, and only the sequence log prints its chain
 
 **Context** — `ScyllaSequenceStore::bump` bound the delta as a bare `i64` against a `counter`

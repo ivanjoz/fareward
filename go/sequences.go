@@ -30,9 +30,6 @@ const (
 	sequenceNameMax = 128
 	// Both replies carry exactly one int64: the reserved value, or the value a set replaced.
 	sequenceReplyExtraSize = 8
-
-	sequenceReplyOK      = 0
-	sequenceReplyInvalid = 1
 )
 
 // A reservation is a single round trip to a daemon that usually answers from memory, so this only
@@ -157,16 +154,17 @@ func checkCounterName(name string) error {
 // decodeSequenceReply reads the int64 both sequence opcodes answer with, refusing anything that
 // would let a caller act on a value the daemon did not actually send.
 func decodeSequenceReply(reply muxReply, name string) (int64, error) {
-	switch reply.status {
-	case sequenceReplyOK:
-		if len(reply.extra) != sequenceReplyExtraSize {
+	switch reply.shape {
+	case replySequenceValue:
+		if len(reply.body) != sequenceReplyExtraSize {
 			return 0, fmt.Errorf("%w: sequence value is %d bytes, expected %d",
-				ErrSequenceUnavailable, len(reply.extra), sequenceReplyExtraSize)
+				ErrSequenceUnavailable, len(reply.body), sequenceReplyExtraSize)
 		}
-		return int64(binary.BigEndian.Uint64(reply.extra)), nil
-	case sequenceReplyInvalid:
+		return int64(binary.BigEndian.Uint64(reply.body)), nil
+	case replySequenceInvalid:
 		return 0, fmt.Errorf("fareward refused the request for counter %q as malformed", name)
 	default:
-		return 0, fmt.Errorf("%w: unexpected reply status %d", ErrSequenceUnavailable, reply.status)
+		return 0, fmt.Errorf("%w: sequence answered with shape 0x%02X",
+			ErrSequenceUnavailable, reply.shape)
 	}
 }

@@ -2,13 +2,28 @@ package fareward
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/ivanjoz/colbin"
 )
 
-const budgetMutationPayloadSize = 20
+// budgetMutationFrame is opcode 0x05 on the wire. Mirrored by `BudgetMutation` in
+// fareward/src/limiter/budget.rs, field id for field id.
+//
+// Both credit figures are almost always small, and colbin writes an integer in the bytes it needs
+// rather than in the eight the type declares — which is what turns a fixed twenty-byte payload
+// into nine. A zero field is not written at all, so `SetDaily` of a CPU budget alone carries no
+// inference field.
+type budgetMutationFrame struct {
+	CompanyID int32  `cb:"1"`
+	Operation uint8  `cb:"2"`
+	CPU       uint64 `cb:"3"`
+	Inference uint64 `cb:"4"`
+}
+
+var budgetMutationCodec = colbin.MustCodec[budgetMutationFrame]()
 
 type BudgetOperation uint8
 
@@ -41,15 +56,21 @@ func MutateCompanyCreditBudget(
 	if err != nil {
 		return err
 	}
-	switch reply.status {
-	case 0:
+	switch reply.shape {
+	case replyAck:
 		return nil
-	case 1:
-		return ErrBudgetMonthNotConfigured
-	case 2:
-		return ErrBudgetMutationOverflow
+	case replyBudgetRefused:
+		switch reply.body[0] {
+		case 1:
+			return ErrBudgetMonthNotConfigured
+		case 2:
+			return ErrBudgetMutationOverflow
+		}
+		return fmt.Errorf("%w: budget mutation refused with reason %d",
+			ErrFarewardUnavailable, reply.body[0])
 	default:
-		return fmt.Errorf("%w: budget mutation returned status %d", ErrFarewardUnavailable, reply.status)
+		return fmt.Errorf("%w: budget mutation answered with shape 0x%02X",
+			ErrFarewardUnavailable, reply.shape)
 	}
 }
 
@@ -67,10 +88,10 @@ func encodeBudgetMutation(
 	if cpuCredits > uint64(^uint64(0)>>1) || inferenceCredits > uint64(^uint64(0)>>1) {
 		return nil, errors.New("credit budget values must fit int64")
 	}
-	payload := make([]byte, budgetMutationPayloadSize)
-	writeUint24(payload[0:3], uint32(companyID))
-	payload[3] = byte(operation)
-	binary.BigEndian.PutUint64(payload[4:12], cpuCredits)
-	binary.BigEndian.PutUint64(payload[12:20], inferenceCredits)
-	return payload, nil
+	return budgetMutationCodec.Append(nil, &budgetMutationFrame{
+		CompanyID: companyID,
+		Operation: uint8(operation),
+		CPU:       cpuCredits,
+		Inference: inferenceCredits,
+	}), nil
 }

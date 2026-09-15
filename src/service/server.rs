@@ -22,27 +22,24 @@ use tracing::{debug, info, warn};
 
 use crate::{
     limiter::{
-        access::{AccessVerdict, INVALIDATE_ACCESS_PAYLOAD_SIZE, parse_access_invalidation},
-        budget::{MUTATE_BUDGET_PAYLOAD_SIZE, parse_budget_mutation},
-        protocol::{CHARGE_PAYLOAD_SIZE, parse_charge},
+        access::{AccessVerdict, parse_access_invalidation},
+        budget::{BudgetMutationReply, parse_budget_mutation},
+        protocol::parse_charge,
         quota::{Decision, RateLimiter},
     },
     lock::{
-        protocol::{
-            ACQUIRE_PAYLOAD_SIZE, LockReply, RELEASE_PAYLOAD_SIZE, parse_acquire, parse_release,
-        },
+        protocol::{LockReply, parse_acquire, parse_release},
         registry::{LockGuard, LockOutcome, LockRegistry},
     },
     reqlog::{protocol::parse_request_log, writer::RequestLogSink},
     sequence::{
         allocator::SequenceAllocator,
-        protocol::{SequenceReply, encode_sequence_value, parse_reserve, parse_set},
+        protocol::{parse_reserve, parse_set},
     },
     service::{
         auth,
         protocol::{
-            AUTH_TAG_SIZE, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE, OPCODE_SIZE, Opcode, PayloadWidth,
-            UNAVAILABLE_STATUS, encode_reply,
+            AUTH_TAG_SIZE, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE, OPCODE_SIZE, Opcode, Reply,
         },
     },
 };
@@ -197,7 +194,11 @@ async fn handle_connection(
     let mut frame = [0_u8; MAX_FRAME_SIZE];
 
     let outcome = loop {
-        drop_expired(&mut held, peer);
+        // Pushed before the read parks: the client is told the moment this loop notices, which is
+        // its own lease deadline rather than the one the client started a round trip later.
+        for (action, identifier) in drop_expired(&mut held, peer) {
+            send_push(&reply_sender, Reply::LockLost { action, identifier }).await;
+        }
 
         // Derived from stamped deadlines, never from the lease itself, so arriving traffic cannot
         // push a hold forward. A connection holding a lock is bounded by its earliest expiry and
@@ -245,33 +246,28 @@ async fn handle_connection(
             break Err(anyhow!("unknown opcode {}", frame[0]));
         };
 
-        // Where the payload starts and how long it is. Fixed-width opcodes answer both from the
-        // opcode alone; the request log states its own length, which is read first and checked
-        // against the ceiling before a single byte of it is buffered — a length header is an
-        // instruction from an unauthenticated peer until the tag at the end says otherwise.
-        let (payload_offset, payload_size) = match opcode.payload_width() {
-            PayloadWidth::Fixed(size) => (OPCODE_SIZE, size),
-            PayloadWidth::LengthPrefixed { maximum } => {
-                if let Err(error) = timeout(
-                    frame_timeout,
-                    reader.read_exact(&mut frame[OPCODE_SIZE..OPCODE_SIZE + LENGTH_PREFIX_SIZE]),
-                )
-                .await
-                .map_err(|_| anyhow!("frame length read timed out"))
-                .and_then(|read| read.context("frame length read failed"))
-                {
-                    break Err(error);
-                }
-                let declared =
-                    u16::from_be_bytes([frame[OPCODE_SIZE], frame[OPCODE_SIZE + 1]]) as usize;
-                if declared > maximum {
-                    break Err(anyhow!(
-                        "frame declares a {declared}-byte payload, over the {maximum}-byte ceiling"
-                    ));
-                }
-                (OPCODE_SIZE + LENGTH_PREFIX_SIZE, declared)
-            }
-        };
+        // How long the payload is. Every opcode states its own length, and every length is checked
+        // against that opcode's ceiling before a single byte of payload is buffered — a length
+        // header is an instruction from an unauthenticated peer until the tag at the end says
+        // otherwise.
+        if let Err(error) = timeout(
+            frame_timeout,
+            reader.read_exact(&mut frame[OPCODE_SIZE..OPCODE_SIZE + LENGTH_PREFIX_SIZE]),
+        )
+        .await
+        .map_err(|_| anyhow!("frame length read timed out"))
+        .and_then(|read| read.context("frame length read failed"))
+        {
+            break Err(error);
+        }
+        let payload_size = u16::from_be_bytes([frame[OPCODE_SIZE], frame[OPCODE_SIZE + 1]]) as usize;
+        let maximum = opcode.max_payload_size();
+        if payload_size > maximum {
+            break Err(anyhow!(
+                "frame declares a {payload_size}-byte payload, over the {maximum}-byte ceiling"
+            ));
+        }
+        let payload_offset = OPCODE_SIZE + LENGTH_PREFIX_SIZE;
         let frame_size = payload_offset + payload_size + AUTH_TAG_SIZE;
 
         // The rest of the frame is already in flight, so an EOF here is a truncated frame and
@@ -308,16 +304,14 @@ async fn handle_connection(
 
         match opcode {
             Opcode::ChargeCredits => {
-                let payload: &[u8; CHARGE_PAYLOAD_SIZE] = frame[OPCODE_SIZE..tag_offset]
-                    .try_into()
-                    .expect("the opcode fixes the payload width");
+                let payload = &frame[payload_offset..tag_offset];
                 let request = match parse_charge(payload) {
                     Ok(request) => request,
                     Err(error) => break Err(error).context("authenticated frame is invalid"),
                 };
                 let Some(permit) = permit else {
                     warn!(%peer, "in-flight ceiling reached, refusing a charge");
-                    send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
                     continue;
                 };
                 let limiter = limiter.clone();
@@ -327,87 +321,87 @@ async fn handle_connection(
                     // A cold subject loads its usage from Scylla, so this cannot be inlined in the
                     // reader without head-of-line blocking every other request behind it.
                     //
-                    // The two refusals travel in different fields: a credit violation in `status`,
-                    // which keeps its exact historical meaning, and an authorization denial in
-                    // `detail`, which was always zero for a charge until now. Because denial
-                    // short-circuits the charge, the two can never both be set and cannot
-                    // contradict each other.
-                    let (status, detail, extra) = match limiter.admit(request).await {
+                    // The two refusals are two shapes rather than two fields of one: a credit
+                    // violation and an authorization denial answer different questions, and
+                    // because denial short-circuits the charge they can never both apply.
+                    let reply = match limiter.admit(request).await {
                         Ok(Decision::Allowed(verdict)) => {
                             if request.requests_authorization() {
-                                (0, encode_access_detail(&verdict), verdict.sub_bytes)
+                                granted_reply(verdict)
                             } else {
-                                (0, 0, Vec::new())
+                                Reply::ChargeAllowed
                             }
                         }
                         Ok(Decision::CreditViolation(violation)) => {
-                            (violation.response_byte(), 0, Vec::new())
+                            Reply::ChargeCreditViolation(violation.response_byte())
                         }
-                        Ok(Decision::AccessDenied(denial)) => (0, denial.detail_code(), Vec::new()),
+                        Ok(Decision::AccessDenied(denial)) => {
+                            Reply::ChargeAccessDenied(denial.detail_code() as u8)
+                        }
                         Err(admit_error) => {
                             // Including a failed grant read: "I could not answer" is already a
-                            // status the client fails closed on, so it needs no code of its own.
+                            // shape the client fails closed on, so it needs no code of its own.
                             warn!(error = %admit_error, "charge admission failed");
-                            (UNAVAILABLE_STATUS, 0, Vec::new())
+                            Reply::Unavailable
                         }
                     };
-                    send_reply_with_extra(&reply_sender, frame_sequence, status, detail, &extra)
-                        .await;
+                    send_reply(&reply_sender, frame_sequence, reply).await;
                 });
             }
             Opcode::MutateCompanyBudget => {
-                let payload: &[u8; MUTATE_BUDGET_PAYLOAD_SIZE] = frame[OPCODE_SIZE..tag_offset]
-                    .try_into()
-                    .expect("the opcode fixes the payload width");
+                let payload = &frame[payload_offset..tag_offset];
                 let mutation = match parse_budget_mutation(payload) {
                     Ok(mutation) => mutation,
                     Err(error) => break Err(error).context("authenticated frame is invalid"),
                 };
                 let Some(permit) = permit else {
                     warn!(%peer, "in-flight ceiling reached, refusing a budget mutation");
-                    send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
                     continue;
                 };
                 let limiter = limiter.clone();
                 let reply_sender = reply_sender.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
-                    let status = match limiter.mutate_budget(mutation).await {
-                        Ok(outcome) => outcome as u8,
+                    let reply = match limiter.mutate_budget(mutation).await {
+                        Ok(BudgetMutationReply::Ok) => Reply::Ack,
+                        Ok(refusal) => Reply::BudgetRefused(refusal as u8),
                         Err(mutation_error) => {
                             warn!(error = %mutation_error, "budget mutation failed");
-                            UNAVAILABLE_STATUS
+                            Reply::Unavailable
                         }
                     };
-                    send_reply(&reply_sender, frame_sequence, status, 0).await;
+                    send_reply(&reply_sender, frame_sequence, reply).await;
                 });
             }
             Opcode::LockAcquire => {
-                let payload: &[u8; ACQUIRE_PAYLOAD_SIZE] = frame[OPCODE_SIZE..tag_offset]
-                    .try_into()
-                    .expect("the opcode fixes the payload width");
+                let payload = &frame[payload_offset..tag_offset];
                 let request = match parse_acquire(payload) {
                     Ok(request) => request,
                     Err(error) => break Err(error).context("authenticated frame is invalid"),
                 };
                 let Some(permit) = permit else {
                     warn!(%peer, "in-flight ceiling reached, refusing an acquire");
-                    send_reply(&reply_sender, frame_sequence, LockReply::Capacity as u8, 0).await;
+                    send_reply(
+                        &reply_sender,
+                        frame_sequence,
+                        Reply::LockRefused(LockReply::Capacity as u8),
+                    )
+                    .await;
                     continue;
                 };
                 let key = (request.action, request.identifier);
-                let lease = locks.clamp_lease(request.lease);
+                let lease = locks.clamp_lease(request.lease());
                 let locks = locks.clone();
                 let reply_sender = reply_sender.clone();
                 let acquire_sender = acquire_sender.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
-                    let (status, detail, granted) = match locks.acquire(request).await {
+                    let (reply, granted) = match locks.acquire(request).await {
                         LockOutcome::Acquired(guard) => {
                             let generation = guard.generation();
                             (
-                                LockReply::Ok as u8,
-                                generation,
+                                Reply::LockGranted { generation },
                                 Some(HeldLock {
                                     _guard: guard,
                                     generation,
@@ -415,9 +409,13 @@ async fn handle_connection(
                                 }),
                             )
                         }
-                        LockOutcome::Busy => (LockReply::Busy as u8, 0, None),
-                        LockOutcome::WaitTimeout => (LockReply::WaitTimeout as u8, 0, None),
-                        LockOutcome::Capacity => (LockReply::Capacity as u8, 0, None),
+                        LockOutcome::Busy => (Reply::LockRefused(LockReply::Busy as u8), None),
+                        LockOutcome::WaitTimeout => {
+                            (Reply::LockRefused(LockReply::WaitTimeout as u8), None)
+                        }
+                        LockOutcome::Capacity => {
+                            (Reply::LockRefused(LockReply::Capacity as u8), None)
+                        }
                     };
                     // Hand ownership to the reader before answering. If it is gone the guard
                     // drops here instead, which releases the lock rather than stranding it.
@@ -428,37 +426,38 @@ async fn handle_connection(
                     {
                         return;
                     }
-                    send_reply(&reply_sender, frame_sequence, status, detail).await;
+                    send_reply(&reply_sender, frame_sequence, reply).await;
                 });
             }
             Opcode::LockRelease => {
-                let payload: &[u8; RELEASE_PAYLOAD_SIZE] = frame[OPCODE_SIZE..tag_offset]
-                    .try_into()
-                    .expect("the opcode fixes the payload width");
-                let request = parse_release(payload);
+                let payload = &frame[payload_offset..tag_offset];
+                let request = match parse_release(payload) {
+                    Ok(request) => request,
+                    Err(error) => break Err(error).context("authenticated frame is invalid"),
+                };
                 let key = (request.action, request.identifier);
                 // Both the key and the generation must match. A caller that gave up while its
                 // release was already in flight would otherwise end whichever hold replaced it.
-                let status = match held.get(&key) {
+                let reply = match held.get(&key) {
                     Some(lock) if lock.generation == request.generation => {
                         held.remove(&key);
                         debug!(%peer, sequence = frame_sequence, action = key.0, identifier = key.1,
                                "released lock");
-                        LockReply::Ok as u8
+                        Reply::Ack
                     }
                     Some(lock) => {
                         warn!(%peer, action = key.0, identifier = key.1,
                               held = lock.generation, presented = request.generation,
                               "refusing a release from a superseded hold");
-                        LockReply::Misuse as u8
+                        Reply::LockRefused(LockReply::Misuse as u8)
                     }
                     None => {
                         warn!(%peer, action = key.0, identifier = key.1,
                               "release names a lock this connection does not hold");
-                        LockReply::Misuse as u8
+                        Reply::LockRefused(LockReply::Misuse as u8)
                     }
                 };
-                send_reply(&reply_sender, frame_sequence, status, 0).await;
+                send_reply(&reply_sender, frame_sequence, reply).await;
             }
             Opcode::LogRequest => {
                 // The only opcode that answers nothing, so it also takes no in-flight permit: the
@@ -479,9 +478,7 @@ async fn handle_connection(
                 }
             }
             Opcode::InvalidateUserAccess => {
-                let payload: &[u8; INVALIDATE_ACCESS_PAYLOAD_SIZE] = frame[OPCODE_SIZE..tag_offset]
-                    .try_into()
-                    .expect("the opcode fixes the payload width");
+                let payload = &frame[payload_offset..tag_offset];
                 let invalidation = match parse_access_invalidation(payload) {
                     Ok(invalidation) => invalidation,
                     Err(error) => break Err(error).context("authenticated frame is invalid"),
@@ -516,13 +513,7 @@ async fn handle_connection(
                     Err(parse_error) => {
                         warn!(%peer, sequence = frame_sequence, error = %parse_error,
                               "refusing a malformed sequence reservation");
-                        send_reply(
-                            &reply_sender,
-                            frame_sequence,
-                            SequenceReply::Invalid as u8,
-                            0,
-                        )
-                        .await;
+                        send_reply(&reply_sender, frame_sequence, Reply::SequenceInvalid).await;
                         continue;
                     }
                 };
@@ -531,7 +522,7 @@ async fn handle_connection(
                 // behind it.
                 let Some(permit) = permit else {
                     warn!(%peer, "in-flight ceiling reached, refusing a sequence reservation");
-                    send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
                     continue;
                 };
                 let sequences = sequences.clone();
@@ -540,14 +531,8 @@ async fn handle_connection(
                     let _permit = permit;
                     match sequences.reserve(&request.name, request.increment).await {
                         Ok(start) => {
-                            send_reply_with_extra(
-                                &reply_sender,
-                                frame_sequence,
-                                SequenceReply::Ok as u8,
-                                0,
-                                &encode_sequence_value(start),
-                            )
-                            .await;
+                            send_reply(&reply_sender, frame_sequence, Reply::SequenceValue(start))
+                                .await;
                         }
                         // Fails closed: the client turns any non-zero status into an error and
                         // refuses the write, because the alternative — falling back to its own
@@ -560,7 +545,7 @@ async fn handle_connection(
                             // so it is the last place to be economical about a log line.
                             warn!(counter = %request.name, error = %format_args!("{reserve_error:#}"),
                                   "sequence reservation failed");
-                            send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                            send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
                         }
                     }
                 });
@@ -571,19 +556,13 @@ async fn handle_connection(
                     Err(parse_error) => {
                         warn!(%peer, sequence = frame_sequence, error = %parse_error,
                               "refusing a malformed sequence assignment");
-                        send_reply(
-                            &reply_sender,
-                            frame_sequence,
-                            SequenceReply::Invalid as u8,
-                            0,
-                        )
-                        .await;
+                        send_reply(&reply_sender, frame_sequence, Reply::SequenceInvalid).await;
                         continue;
                     }
                 };
                 let Some(permit) = permit else {
                     warn!(%peer, "in-flight ceiling reached, refusing a sequence assignment");
-                    send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
                     continue;
                 };
                 let sequences = sequences.clone();
@@ -596,19 +575,17 @@ async fn handle_connection(
                             // and the value it replaced exists nowhere else afterwards.
                             info!(counter = %request.name, previous, assigned = request.value,
                                   "sequence counter reassigned");
-                            send_reply_with_extra(
+                            send_reply(
                                 &reply_sender,
                                 frame_sequence,
-                                SequenceReply::Ok as u8,
-                                0,
-                                &encode_sequence_value(previous),
+                                Reply::SequenceValue(previous),
                             )
                             .await;
                         }
                         Err(set_error) => {
                             warn!(counter = %request.name, error = %format_args!("{set_error:#}"),
                                   "sequence assignment failed");
-                            send_reply(&reply_sender, frame_sequence, UNAVAILABLE_STATUS, 0).await;
+                            send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
                         }
                     }
                 });
@@ -627,47 +604,46 @@ async fn handle_connection(
     outcome
 }
 
-/// Drops every hold whose stamped deadline has passed. Absolute, so no amount of arriving
-/// traffic can extend one.
-fn drop_expired(held: &mut HashMap<LockKey, HeldLock>, peer: SocketAddr) {
+/// Drops every hold whose stamped deadline has passed, and reports which ones. Absolute, so no
+/// amount of arriving traffic can extend one.
+///
+/// The keys come back rather than being logged and forgotten: the client still believes it owns
+/// those locks, and a `LockLost` push is what tells it otherwise. Until the push existed, the only
+/// thing on the other side was a timer started a round trip later than this deadline.
+fn drop_expired(held: &mut HashMap<LockKey, HeldLock>, peer: SocketAddr) -> Vec<LockKey> {
     if held.is_empty() {
-        return;
+        return Vec::new();
     }
     let now = Instant::now();
+    let mut expired = Vec::new();
     held.retain(|key, lock| {
         let alive = lock.expires_at > now;
         if !alive {
             warn!(%peer, action = key.0, identifier = key.1, "lock lease expired without a release");
+            expired.push(*key);
         }
         alive
     });
+    expired
 }
 
-/// Packs a granted verdict into the reply's `detail`.
-///
-/// Code 1 ("granted") stays where it was, in the low three bits, so the two masks occupy space that
-/// was previously always zero. The daemon never learns what a sub-access *is*: these are the raw
-/// bits the blob held, and "id 1 means all" is expanded on the Go side.
-fn encode_access_detail(verdict: &AccessVerdict) -> u16 {
-    const GRANTED_CODE: u16 = 1;
-    GRANTED_CODE | (u16::from(verdict.granted_mask) << 3) | (u16::from(verdict.has_subs_mask) << 7)
+/// The daemon never learns what a sub-access *is*: `sub_bytes` are the raw bits the blob held, and
+/// "id 1 means all" is expanded on the Go side.
+fn granted_reply(verdict: AccessVerdict) -> Reply {
+    Reply::ChargeGranted {
+        granted_mask: verdict.granted_mask,
+        has_subs_mask: verdict.has_subs_mask,
+        sub_bytes: verdict.sub_bytes,
+    }
 }
 
-async fn send_reply(sender: &mpsc::Sender<Vec<u8>>, sequence: u64, status: u8, detail: u16) {
-    send_reply_with_extra(sender, sequence, status, detail, &[]).await;
-}
-
-/// The charge path is the only caller that has a tail: the sub-access bytes of the required slots
-/// the user turned out to hold.
-async fn send_reply_with_extra(
-    sender: &mpsc::Sender<Vec<u8>>,
-    sequence: u64,
-    status: u8,
-    detail: u16,
-    extra: &[u8],
-) {
+async fn send_reply(sender: &mpsc::Sender<Vec<u8>>, sequence: u64, reply: Reply) {
     // A closed channel means the connection is already going away, so the reply has nowhere to go.
-    let _ = sender
-        .send(encode_reply(sequence, status, detail, extra))
-        .await;
+    let _ = sender.send(reply.encode(sequence)).await;
+}
+
+/// A push: no request asked for it, so it carries no correlation and the client routes it on the
+/// shape alone.
+async fn send_push(sender: &mpsc::Sender<Vec<u8>>, reply: Reply) {
+    let _ = sender.send(reply.encode(0)).await;
 }
