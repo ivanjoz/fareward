@@ -49,7 +49,7 @@ const (
 	// so a peer on `:v10` would read a length header as a payload's first two bytes.
 	// Mirrored byte for byte by DOMAIN in fareward/src/service/auth.rs; backend and daemon must
 	// cross this boundary in a single deploy.
-	farewardAuthDomain = "fareward:v11"
+	farewardAuthDomain = "fareward:v12"
 
 	opcodeChargeCredits = byte(0x01)
 	opcodeLockAcquire   = byte(0x02)
@@ -588,8 +588,12 @@ func (client *FarewardClient) releaseAbandoned(
 	connection *muxConnection, action uint16, identifier int64, generation uint16,
 ) {
 	logLine("fareward releasing a lock granted after its caller gave up::", action, identifier)
-	payload := makeLockReleasePayload(action, identifier, generation)
-	_, err := connection.exchange(
+	payload, err := makeLockReleasePayload(action, identifier, generation)
+	if err != nil {
+		logLine("fareward could not release an abandoned lock::", err)
+		return
+	}
+	_, err = connection.exchange(
 		context.Background(), client.secret, opcodeLockRelease, payload,
 		farewardWriteTimeout, action, identifier)
 	if err != nil {

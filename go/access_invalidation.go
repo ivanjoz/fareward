@@ -65,5 +65,5 @@ func encodeAccessInvalidation(companyID, userID int32) ([]byte, error) {
 	return accessInvalidationCodec.Append(nil, &accessInvalidationFrame{
 		CompanyID: companyID,
 		UserID:    userID,
-	}), nil
+	})
 }

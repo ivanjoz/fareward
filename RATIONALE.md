@@ -1,3 +1,27 @@
+## A lock release that cannot encode is logged, not returned
+
+**Context** — colbin v0.6's `Codec.Append` returns an error, and the decision was to pass it up to
+the caller. `Lock.Release` and `releaseAbandoned` return nothing: the first is deferred by callers,
+the second runs on the connection reader.
+
+**Decision** — `makeLockReleasePayload` returns `([]byte, error)`; both callers log the error and
+return, as they already do for a failed exchange. Every other `Append` error reaches the caller.
+
+**Rationale** — Giving `Release` an error return would change every `defer lock.Release()` for a
+fixed-width frame that does not fail to encode in practice; the lease is the backstop either way.
+
+## The "undeclared key is refused" token test is gone
+
+**Context** — `rejects_a_truncated_or_mistyped_session_token` asserted `colbin::Error::UnknownKey`
+for a narrow key the struct does not declare. colbin v0.6 sizes every field with a narrow nibble, so
+an undeclared key is skipped, and the variant no longer exists.
+
+**Decision** — The assertion was deleted, not rewritten. Truncation, a bad root and a wrong-width
+hash are still refused.
+
+**Rationale** — Skipping unknown fields is the format's intended behaviour now; pinning it here
+would test colbin, not the bridge.
+
 ## Six request shapes moved to colbin, and every frame is length-prefixed — `fareward:v11`
 
 **Context** — Phase 3 of `PROTOCOL_SHAPES.md`. Six of the eight request payloads were fixed

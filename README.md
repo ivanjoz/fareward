@@ -48,7 +48,7 @@ but the coupling is **four contracts, not a language**.
 
 | # | Contract | Defined by | What a different backend has to do |
 |---|---|---|---|
-| 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` and `go/siphash/` — eight-byte nonce at accept, then every frame tagged `SipHash-2-4(SHA-256(internal_apikey)[..16], fareward:v11 ‖ nonce ‖ sequence ‖ opcode ‖ length ‖ payload)`, big-endian. Six of the eight payloads are colbin messages, which has a Rust crate and a browser module as well as the Go one. |
+| 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` and `go/siphash/` — eight-byte nonce at accept, then every frame tagged `SipHash-2-4(SHA-256(internal_apikey)[..16], fareward:v12 ‖ nonce ‖ sequence ‖ opcode ‖ length ‖ payload)`, big-endian. Six of the eight payloads are colbin messages, which has a Rust crate and a browser module as well as the Go one. |
 | 2 | The ScyllaDB schema | nobody here — the daemon issues no `CREATE TABLE` | Create the tables and columns below before first start. |
 | 3 | The `accesos_computed` packing | `src/limiter/access.rs` | Write `users.accesos_computed` as little-endian `u16` grants. |
 | 4 | The browser session token | `src/bridge/token.rs`, `src/bridge/auth.rs` | Issue a colbin-encoded `core.UsuarioToken`, its 16-byte `Hash` a keyed BLAKE2s-128 tag over `usrToken:v3`. **The only Go-shaped contract** — see below. |
@@ -193,7 +193,7 @@ a database round trip:
 
 | Who proves what | How | Secret |
 |---|---|---|
-| Backend → raw-TCP port | An eight-byte random nonce written at accept, then every frame tagged with `SipHash-2-4(fareward:v11 ‖ nonce ‖ sequence ‖ opcode ‖ length ‖ payload)`, big-endian. | `internal_apikey` |
+| Backend → raw-TCP port | An eight-byte random nonce written at accept, then every frame tagged with `SipHash-2-4(fareward:v12 ‖ nonce ‖ sequence ‖ opcode ‖ length ‖ payload)`, big-endian. | `internal_apikey` |
 | Backend → SSE bridge | `X-Bridge-Auth: <unix seconds>.<16 hex characters>`, signed over `sse-bridge:v2\|<unix seconds>` and accepted within ±300 s of this host's clock. | `internal_apikey` |
 | Browser → SSE bridge | `Authorization: Bearer <session token>` — the colbin token the backend client issued, its own 128-bit keyed-BLAKE2s tag recomputed over `usrToken:v3 ‖ company ‖ user ‖ created ‖ username`. | `secret_phrase` |
 

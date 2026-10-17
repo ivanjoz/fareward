@@ -148,7 +148,11 @@ func (lock *Lock) Release() {
 		if lock.connection.isClosed() {
 			return
 		}
-		payload := makeLockReleasePayload(lock.action, lock.identifier, lock.generation)
+		payload, err := makeLockReleasePayload(lock.action, lock.identifier, lock.generation)
+		if err != nil {
+			logLine("lock release failed::", err)
+			return
+		}
 		reply, err := lock.connection.exchange(
 			context.Background(), lock.client.secret, opcodeLockRelease, payload,
 			farewardWriteTimeout, lock.action, lock.identifier)
@@ -213,13 +217,16 @@ func (client *FarewardClient) Acquire(
 		return nil, errors.New("LockOptions.Lease must be positive")
 	}
 
-	payload := lockAcquireCodec.Append(nil, &lockAcquireFrame{
+	payload, err := lockAcquireCodec.Append(nil, &lockAcquireFrame{
 		Action:     action,
 		Identifier: identifier,
 		MaxWaiters: options.MaxWaiters,
 		WaitMs:     waitMillis,
 		LeaseMs:    leaseMillis,
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	// The daemon holds the frame for up to Wait before answering, so our patience has to outlast
 	// the queue, not the round trip.
@@ -280,7 +287,7 @@ func newLock(
 	return lock
 }
 
-func makeLockReleasePayload(action uint16, identifier int64, generation uint16) []byte {
+func makeLockReleasePayload(action uint16, identifier int64, generation uint16) ([]byte, error) {
 	return lockReleaseCodec.Append(nil, &lockReleaseFrame{
 		Action:     action,
 		Identifier: identifier,

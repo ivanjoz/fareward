@@ -29,7 +29,7 @@ const TEST_SECRET: &[u8] = b"K1OzWIN0yarCc9ge";
 /// A colbin session token for company 7 / user 42 / "tester", produced by the Go
 /// `colbin.Marshal` + `core.ComputeUsuarioTokenHash` with TEST_SECRET, and printed by
 /// `go run ./fareward/vectors`.
-const SESSION_TOKEN: &str = "0AkHGSoq0gQwEKPF9f1VhoUc4pBU9cq/paxABnRlc3Rlcg==";
+const SESSION_TOKEN: &str = "0AQHFCol0gQ8EKPF9f1VhoUc4pBU9cq/paxJdGVzdGVy";
 
 /// Channel token for company 7 / user 42 / tab "N2xQaG8x", pinned by the cross-language vectors.
 const TEST_CHANNEL: &str = "Byo3bFBobzE";

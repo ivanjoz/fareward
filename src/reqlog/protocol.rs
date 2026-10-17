@@ -236,9 +236,9 @@ mod tests {
     /// `TestEncodeRequestLogWireBytes`. Regenerate it from there if the layout changes on purpose.
     #[test]
     fn parses_bytes_produced_by_the_go_encoder() {
-        let hex = "d00a14501e7ba8da769b01296638294907592a6a3e01703801360b87d61210107265737\
-                   06f6e7365732e676f3a353339201e6e6f207365207075646f206f6274656e657220656c20\
-                   726567697374726f";
+        let hex = "d0051450197ba8da769b01246634294407542a653e017c3801360687d6121c10726573706f6e\
+                   7365732e676f3a3533392c1e6e6f207365207075646f206f6274656e657220656c207265676973\
+                   74726f";
         let payload: Vec<u8> = (0..hex.len() / 2)
             .map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap())
             .collect();

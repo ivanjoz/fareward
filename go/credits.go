@@ -402,7 +402,7 @@ func encodeCharge(
 	for slot, packedAccess := range requiredAccess {
 		*slots[slot] = packedAccess
 	}
-	return chargeCodec.Append(nil, &frame), nil
+	return chargeCodec.Append(nil, &frame)
 }
 
 // Charge sends one authenticated frame and returns nil only when both verdicts allow the request.

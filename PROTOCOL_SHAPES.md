@@ -9,8 +9,8 @@ ordered implementation.
 
 **Status, 2026-09-13.** **All five phases are implemented and green.** The reply shape byte, the
 cursor under the hand-rolled sequence payloads, the `LockLost` push, the colbin dependency, and the
-six colbin request shapes. `DOMAIN` is now `fareward:v11`, so the backend and the daemon must deploy
-together.
+six colbin request shapes. `DOMAIN` is now `fareward:v12` (colbin v0.6.2 changed the frame bytes),
+so the backend and the daemon must deploy together.
 
 Two consequences of Phase 3 that were not in the plan and are worth knowing before reading further:
 **every opcode is length-prefixed now** — the fixed-width framing had nothing left to describe and
@@ -56,7 +56,7 @@ reply     [shape:1] [correlation:u16] [body]                the shape gives the 
 push      [shape:1] [0x0000] [len:u8] [body]                0x80 and up, sent unasked
 ```
 
-- `tag` is SipHash-2-4 over `DOMAIN ‖ nonce ‖ sequence ‖ frame-without-tag`, `DOMAIN = "fareward:v11"`.
+- `tag` is SipHash-2-4 over `DOMAIN ‖ nonce ‖ sequence ‖ frame-without-tag`, `DOMAIN = "fareward:v12"`.
   The length header is inside the signed bytes, so a peer cannot make the daemon buffer a different
   amount than the one it signed.
 - The connection is multiplexed; `correlation` is the low 16 bits of the frame sequence.

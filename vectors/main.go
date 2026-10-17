@@ -95,14 +95,13 @@ func main() {
 	// Printed rather than assumed: these are the bytes the Rust side must agree with,
 	// and reading them out of the encoder is the only spelling that cannot drift.
 	//
-	// FieldIDs reports the wire *key*, which is the `cb` id minus one — source counts
-	// from one, bytes count from zero. So `cb:"1"` prints as 0, and the Rust struct
-	// that reads this token declares #[cb(1)] for it.
-	fieldKeys, err := colbin.FieldIDs(UsuarioToken{})
+	// FieldIDs reports the `cb` id of each field, which is what the Rust struct that
+	// reads this token declares in #[cb(n)].
+	fieldIDs, err := colbin.FieldIDs(UsuarioToken{})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("field keys (cb id - 1): %v\n\n", fieldKeys)
+	fmt.Printf("field ids: %v\n\n", fieldIDs)
 	for _, c := range cases {
 		c.token.Hash = computeHash(c.token)
 		data, err := colbin.Marshal(c.token)

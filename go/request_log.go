@@ -98,7 +98,10 @@ func encodeRequestLog(record RequestLogRecord) ([]byte, error) {
 	}
 	record.Errors = clamped
 
-	payload := requestLogCodec.Append(nil, &record)
+	payload, err := requestLogCodec.Append(nil, &record)
+	if err != nil {
+		return nil, err
+	}
 	// Unreachable given the clamping above; kept because the daemon closes the connection on an
 	// oversized declared length, and a silent framing bug here would take the charges and locks
 	// on that connection down with it.

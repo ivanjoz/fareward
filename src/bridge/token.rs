@@ -229,7 +229,7 @@ mod tests {
     /// `encodes_the_bytes_the_go_encoder_writes` to re-encode.
     fn plain_vector() -> (&'static str, UserToken) {
         (
-            "0AkHGSoq0gQwEKPF9f1VhoUc4pBU9cq/paxABnRlc3Rlcg==",
+            "0AQHFCol0gQ8EKPF9f1VhoUc4pBU9cq/paxJdGVzdGVy",
             UserToken {
                 company_id: 7,
                 id: 42,
@@ -252,7 +252,7 @@ mod tests {
         let vectors: [(&str, UserToken); 6] = [
             plain_vector(),
             (
-                "0AkBGQEwEJiOTkiEnLTMP17BTxX6aHs=",
+                "0AAQPBCYjk5IhJy0zD9ewU8V+mh7",
                 UserToken {
                     company_id: 1,
                     id: 1,
@@ -264,7 +264,7 @@ mod tests {
                 },
             ),
             (
-                "0Az///9/HP///38s////fzAQ0+ETCkyqjMqzoW7D5ME/wEABeA==",
+                "0Af///9/F////38n////fzwQ0+ETCkyqjMqzoW7D5ME/wER4",
                 UserToken {
                     company_id: 2_147_483_647,
                     id: 2_147_483_647,
@@ -276,7 +276,7 @@ mod tests {
                 },
             ),
             (
-                "0As/Qg8aOTAsAPFTZTAQb3gk58L3PbRDFHVREif2J0ATw7FhbmTDukBleGFtcGxlLmNvbQ==",
+                "0AY/Qg8VOTAnAPFTZTwQb3gk58L3PbRDFHVREif2J0wTw7FhbmTDukBleGFtcGxlLmNvbQ==",
                 UserToken {
                     company_id: 999_999,
                     id: 12_345,
@@ -288,7 +288,7 @@ mod tests {
                 },
             ),
             (
-                "0AmAGX8rAAABMBBOvsNoiyfP8pNCRHhqrsyPQCdhLXZlcnktbG9uZy11c2VyLW5hbWUtZm9yLXdpZHRoLXRlc3Rpbmc=",
+                "0ASAFH8mAAABPBBOvsNoiyfP8pNCRHhqrsyPTCdhLXZlcnktbG9uZy11c2VyLW5hbWUtZm9yLXdpZHRoLXRlc3Rpbmc=",
                 UserToken {
                     company_id: 128,
                     id: 127,
@@ -300,7 +300,7 @@ mod tests {
                 },
             ),
             (
-                "0AkDGQQhBTAQIG+CiZBEwb9cCidNHrQ2cUADbmVn",
+                "0AIUBCwBBTwQIG+CiZBEwb9cCidNHrQ2cUZuZWc=",
                 UserToken {
                     company_id: 3,
                     id: 4,
@@ -351,13 +351,6 @@ mod tests {
             decode_session_token(&[0x0a, 0x01, 0x00]),
             Err(TokenError::Session(colbin::Error::BadRoot(0x0a)))
         );
-        // A four-bit key run holding a key this struct does not declare. It cannot be
-        // stepped over: four descriptor bits have no room for a class, so nothing can size
-        // a field it cannot classify.
-        assert!(matches!(
-            decode_session_token(&[colbin::ROOT_STRUCT_NARROW, 0x59, 0x00]),
-            Err(TokenError::Session(colbin::Error::UnknownKey(5)))
-        ));
         // A token carrying a hash of the wrong width is refused before the comparison, not
         // padded into one that could be compared.
         let mut short_hash = SessionMessage::default();

@@ -93,5 +93,5 @@ func encodeBudgetMutation(
 		Operation: uint8(operation),
 		CPU:       cpuCredits,
 		Inference: inferenceCredits,
-	}), nil
+	})
 }
