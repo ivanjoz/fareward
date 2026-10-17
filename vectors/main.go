@@ -16,7 +16,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"strings"
 
 	"github.com/ivanjoz/colbin"
 	"github.com/ivanjoz/fareward/go/siphash"
@@ -68,13 +67,11 @@ func makeServiceAuthHeader(unixSeconds int64) string {
 	return fmt.Sprintf("%d.%016x", unixSeconds, hasher.Sum64())
 }
 
-// makeB64UrlEncode is core.MakeB64UrlEncode, the alphabet the backend publishes
-// the token under.
-func makeB64UrlEncode(s string) string {
-	s = strings.ReplaceAll(s, "/", "_")
-	s = strings.ReplaceAll(s, "+", "-")
-	return strings.ReplaceAll(s, "=", "~")
-}
+// sortableBase64 is genix-orm's utils.Base64 ("-0-9A-Z_a-z", unpadded), the
+// encoding the backend publishes the token under. Copied so this module does not
+// depend on genix-orm.
+var sortableBase64 = base64.NewEncoding("-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz").
+	WithPadding(base64.NoPadding)
 
 func main() {
 	cases := []struct {
@@ -108,10 +105,8 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		standard := base64.StdEncoding.EncodeToString(data)
 		fmt.Printf("%-16s %2d B  hash=%x\n", c.name, len(data), c.token.Hash)
-		fmt.Printf("  base64      %s\n", standard)
-		fmt.Printf("  url-alphabet %s\n\n", makeB64UrlEncode(standard))
+		fmt.Printf("  %s\n\n", sortableBase64.EncodeToString(data))
 	}
 
 	// A token whose Hash is empty: colbin omits a zero-valued field entirely, so this payload
@@ -121,7 +116,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("hashless token: %s\n", makeB64UrlEncode(base64.StdEncoding.EncodeToString(hashless)))
+	fmt.Printf("hashless token: %s\n", sortableBase64.EncodeToString(hashless))
 
 	fmt.Printf("X-Bridge-Auth at 1700000000: %s\n", makeServiceAuthHeader(1_700_000_000))
 }

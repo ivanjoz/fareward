@@ -9,7 +9,10 @@
 //! Both are mirrors of Go code in another repository, so every rule here is pinned by
 //! vectors generated from that Go code — see `fareward/vectors`, which prints them.
 
-use base64::{Engine, engine::general_purpose};
+use base64::{
+    Engine, alphabet,
+    engine::{GeneralPurpose, general_purpose},
+};
 use colbin::Colbin;
 use thiserror::Error;
 
@@ -93,20 +96,20 @@ pub fn decode_session_token(payload: &[u8]) -> Result<UserToken, TokenError> {
     })
 }
 
-/// Undoes the backend's `MakeB64UrlEncode` alphabet substitution before standard base64
-/// decoding (`core/helpers.go`).
+/// genix-orm's sortable base64 (`utils.Base64`): URL-safe, in ASCII order, unpadded. The backend
+/// publishes the session token under it (`security/login.go`).
+const SORTABLE_ALPHABET: alphabet::Alphabet = match alphabet::Alphabet::new(
+    "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz",
+) {
+    Ok(sortable) => sortable,
+    Err(_) => panic!("the sortable base64 alphabet is invalid"),
+};
+const SORTABLE_BASE64: GeneralPurpose =
+    GeneralPurpose::new(&SORTABLE_ALPHABET, general_purpose::NO_PAD);
+
 pub fn decode_session_base64(encoded_token: &str) -> Result<Vec<u8>, TokenError> {
-    let standard_alphabet: String = encoded_token
-        .chars()
-        .map(|character| match character {
-            '_' => '/',
-            '-' => '+',
-            '~' => '=',
-            other => other,
-        })
-        .collect();
-    general_purpose::STANDARD
-        .decode(standard_alphabet)
+    SORTABLE_BASE64
+        .decode(encoded_token)
         .map_err(|_| TokenError::SessionBase64)
 }
 
@@ -229,7 +232,7 @@ mod tests {
     /// `encodes_the_bytes_the_go_encoder_writes` to re-encode.
     fn plain_vector() -> (&'static str, UserToken) {
         (
-            "0AQHFCol0gQ8EKPF9f1VhoUc4pBU9cq/paxJdGVzdGVy",
+            "o-F641c_oVFw39E4xUpKWcJRsd0JxRezdPl8S5KnS5Km",
             UserToken {
                 company_id: 7,
                 id: 42,
@@ -252,7 +255,7 @@ mod tests {
         let vectors: [(&str, UserToken); 6] = [
             plain_vector(),
             (
-                "0AAQPBCYjk5IhJy0zD9ewU8V+mh7",
+                "o--FE01NYZt7W8mon2xTkJwKyaWv",
                 UserToken {
                     company_id: 1,
                     id: 1,
@@ -264,7 +267,7 @@ mod tests {
                 },
             ),
             (
-                "0Af///9/F////38n////fzwQ0+ETCkyqjMqzoW7D5ME/wER4",
+                "o-Uzzzxz4zzzzrwbzzzzUnkFoy3I1ZmeYBencLv2tB3zk3Gs",
                 UserToken {
                     company_id: 2_147_483_647,
                     id: 2_147_483_647,
@@ -276,7 +279,7 @@ mod tests {
                 },
             ),
             (
-                "0AY/Qg8VOTAnAPFTZTwQb3gk58L3PbRDFHVREif2J0wTw7FhbmTDukBleGFtcGxlLmNvbQ==",
+                "o-NzFVwKDI-b-E4IOIkFQrVZtwArEQG246KG3XUq8okIkv4WQaI2iZ0_T54hR5l_AaCjQF",
                 UserToken {
                     company_id: 999_999,
                     id: 12_345,
@@ -288,7 +291,7 @@ mod tests {
                 },
             ),
             (
-                "0ASAFH8mAAABPBBOvsNoiyfP8pNCRHhqrsyPTCdhLXZlcnktbG9uZy11c2VyLW5hbWUtZm9yLXdpZHRoLXRlc3Rpbmc=",
+                "o-H-46wa---0E00DjgCcXmUEwdC1G6WefgmEI1SWAMO_RbZhQ5xiOmppRqKmALtWQLJhOaxmAMSdO6GcAMG_RrGdQaR",
                 UserToken {
                     company_id: 128,
                     id: 127,
@@ -300,7 +303,7 @@ mod tests {
                 },
             ),
             (
-                "0AIUBCwBBTwQIG+CiZBEwb9cCidNHrQ2cUZuZWc=",
+                "o-7J01k00IkF75y1XO03kQxR1XSC6fFqRJOiOLR",
                 UserToken {
                     company_id: 3,
                     id: 4,
@@ -319,22 +322,6 @@ mod tests {
                 decode_session_token(&payload).unwrap(),
                 expected,
                 "{encoded}"
-            );
-            // The backend publishes the same bytes under its own alphabet, so both spellings
-            // of one token must name one identity.
-            let url_alphabet: String = encoded
-                .chars()
-                .map(|character| match character {
-                    '/' => '_',
-                    '+' => '-',
-                    '=' => '~',
-                    other => other,
-                })
-                .collect();
-            assert_eq!(
-                decode_session_base64(&url_alphabet).unwrap(),
-                payload,
-                "{url_alphabet}"
             );
         }
     }
@@ -430,21 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn session_base64_undoes_the_backend_alphabet() {
-        // "_-~" stand in for "/+=" in the backend's URL-safe substitution.
-        let payload = [0xFF_u8, 0xFE, 0xFD, 0x01];
-        let standard = general_purpose::STANDARD.encode(payload);
-        let substituted: String = standard
-            .chars()
-            .map(|character| match character {
-                '/' => '_',
-                '+' => '-',
-                '=' => '~',
-                other => other,
-            })
-            .collect();
-        assert_eq!(decode_session_base64(&substituted).unwrap(), payload);
-        // Standard base64 is accepted unchanged, which is what the Go tests emit.
-        assert_eq!(decode_session_base64(&standard).unwrap(), payload);
+    fn session_base64_is_the_sortable_alphabet() {
+        // utils.Base64.EncodeToString([]byte{0xFF, 0xFE, 0xFD, 0x01}) in Go.
+        assert_eq!(decode_session_base64("zzvx-F").unwrap(), [0xFF_u8, 0xFE, 0xFD, 0x01]);
+        // Standard base64 is not the token's encoding: '/' and padding are outside the alphabet.
+        assert_eq!(decode_session_base64("//79AQ=="), Err(TokenError::SessionBase64));
     }
 }
