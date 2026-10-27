@@ -5,7 +5,7 @@ module github.com/ivanjoz/fareward/vectors
 go 1.27
 
 require (
-	github.com/ivanjoz/colbin v0.8.1
+	github.com/ivanjoz/colbin v0.8.2
 	github.com/ivanjoz/fareward/go v0.0.0
 	golang.org/x/crypto v0.56.0
 )

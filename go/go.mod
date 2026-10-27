@@ -13,4 +13,4 @@ module github.com/ivanjoz/fareward/go
 
 go 1.27
 
-require github.com/ivanjoz/colbin v0.8.1
+require github.com/ivanjoz/colbin v0.8.2
