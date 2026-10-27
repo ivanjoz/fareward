@@ -159,12 +159,18 @@ mod tests {
         );
     }
 
-    /// Bytes that are not a colbin message are refused by the codec rather than read as offsets,
-    /// which is what the hand-written parser could not do — every twenty bytes were a valid frame.
+    /// A message cut short is refused by the codec rather than read as offsets. colbin 0.8 has
+    /// no root byte, so arbitrary bytes can decode: the frame's auth tag is what keeps them out.
     #[test]
-    fn refuses_a_payload_that_is_not_colbin() {
+    fn refuses_a_truncated_payload() {
+        let payload = encoded(BudgetMutationFrame {
+            company_id: 7,
+            operation: BudgetOperation::SetDaily as u8,
+            cpu: 300,
+            inference: 25,
+        });
         assert!(matches!(
-            parse_budget_mutation(&[0x00; 20]),
+            parse_budget_mutation(&payload[..payload.len() - 1]),
             Err(BudgetProtocolError::Malformed(_))
         ));
     }

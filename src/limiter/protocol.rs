@@ -299,12 +299,13 @@ mod tests {
         );
     }
 
-    /// Bytes that are not a colbin message are refused rather than read as offsets. The fixed
-    /// layout could not do this: every twenty bytes were a structurally valid charge.
+    /// A charge cut short is refused rather than read as offsets. colbin 0.8 has no root byte,
+    /// so arbitrary bytes can decode: the frame's auth tag is what keeps them out.
     #[test]
-    fn refuses_a_payload_that_is_not_colbin() {
+    fn refuses_a_truncated_payload() {
+        let payload = charge_frame(103).encode();
         assert!(matches!(
-            parse_charge(&[0x00; 20]),
+            parse_charge(&payload[..payload.len() - 1]),
             Err(ProtocolError::Malformed(_))
         ));
     }

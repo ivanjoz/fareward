@@ -170,13 +170,29 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_payload_that_is_not_colbin() {
+    fn refuses_a_truncated_payload() {
+        // colbin 0.8 has no root byte, so a message is only refused where it breaks: one cut
+        // short ends inside a field. Arbitrary bytes are kept out by the frame's auth tag.
+        let acquire = AcquireRequest {
+            action: 9,
+            identifier: -7,
+            lease_ms: 600_000,
+            ..Default::default()
+        }
+        .encode();
         assert!(matches!(
-            parse_acquire(&[0x00; 15]),
+            parse_acquire(&acquire[..acquire.len() - 1]),
             Err(LockProtocolError::Malformed(_))
         ));
+        // A two-byte last field: cutting a one-byte one drops the whole field, still a valid message.
+        let release = ReleaseRequest {
+            action: 9,
+            identifier: -7,
+            generation: 300,
+        }
+        .encode();
         assert!(matches!(
-            parse_release(&[0x00; 12]),
+            parse_release(&release[..release.len() - 1]),
             Err(LockProtocolError::Malformed(_))
         ));
     }

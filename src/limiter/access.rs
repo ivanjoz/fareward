@@ -609,8 +609,9 @@ mod tests {
 
         // A frame naming no company at all is refused: there is nothing it could invalidate.
         assert!(parse_access_invalidation(&AccessInvalidation::default().encode()).is_err());
-        // And bytes that are not a colbin message are refused rather than read as offsets.
-        assert!(parse_access_invalidation(&[0; 6]).is_err());
+        // And a message cut short is refused rather than read as offsets.
+        let encoded = invalidation.encode();
+        assert!(parse_access_invalidation(&encoded[..encoded.len() - 1]).is_err());
     }
 
     #[test]

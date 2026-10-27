@@ -21,7 +21,7 @@ blake2 = "0.11.0"
 # `derive` brings in the proc-macro crate. Without it the trait is still here and an impl
 # can be hand-written; with it, `#[derive(Colbin)]` emits the straight-line encode and
 # decode, which is what every frame struct in src/ uses.
-colbin = { git = "https://github.com/ivanjoz/colbin", tag = "v0.6.2", features = ["derive"] }
+colbin = { git = "https://github.com/ivanjoz/colbin", tag = "v0.8.0", features = ["derive"] }
 getrandom = "0.4"
 # Only for statvfs, which is how the disk column is read: nothing under /proc reports free space.
 libc = "0.2"

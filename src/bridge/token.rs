@@ -223,16 +223,13 @@ mod tests {
             decode_session_base64(encoded).unwrap(),
             "the Rust encoder and the Go encoder disagree about this struct"
         );
-        // Four-bit keys, which is what the ids under sixteen buy and what a derived id
-        // would silently give up.
-        assert_eq!(message.encode()[0], colbin::ROOT_STRUCT_NARROW);
     }
 
     /// The first vector, kept apart because two tests need it: this one to decode and
     /// `encodes_the_bytes_the_go_encoder_writes` to re-encode.
     fn plain_vector() -> (&'static str, UserToken) {
         (
-            "o-F641c_oVFw39E4xUpKWcJRsd0JxRezdPl8S5KnS5Km",
+            "0-RJ9XMH02kFcwMpzKL5WGnXZ4Ipmfy_f3_oOMCoOM7",
             UserToken {
                 company_id: 7,
                 id: 42,
@@ -255,7 +252,7 @@ mod tests {
         let vectors: [(&str, UserToken); 6] = [
             plain_vector(),
             (
-                "o--FE01NYZt7W8mon2xTkJwKyaWv",
+                "-0-w38XDIZX3bAIBEpv0IlMuP6g",
                 UserToken {
                     company_id: 1,
                     id: 1,
@@ -267,7 +264,7 @@ mod tests {
                 },
             ),
             (
-                "o-Uzzzxz4zzzzrwbzzzzUnkFoy3I1ZmeYBencLv2tB3zk3Gs",
+                "0zzzzrwMzzzzUmUzzzxzE02IsGB9I9eBmfDWQgEZkIz-G6V",
                 UserToken {
                     company_id: 2_147_483_647,
                     id: 2_147_483_647,
@@ -279,7 +276,7 @@ mod tests {
                 },
             ),
             (
-                "o-NzFVwKDI-b-E4IOIkFQrVZtwArEQG246KG3XUq8okIkv4WQaI2iZ0_T54hR5l_AaCjQF",
+                "0Yx12lJtB1R-wKC_E00jT1IbkjRxh3BJSK3H8zNbI0E2gL4iOBDuF5KsNLpkQ5JiNqxh",
                 UserToken {
                     company_id: 999_999,
                     id: 12_345,
@@ -291,7 +288,7 @@ mod tests {
                 },
             ),
             (
-                "o-H-46wa---0E00DjgCcXmUEwdC1G6WefgmEI1SWAMO_RbZhQ5xiOmppRqKmALtWQLJhOaxmAMSdO6GcAMG_RrGdQaR",
+                "07-JUmN---3w33uykqXA8wzmZo83T5ein7xB8q3hSaKmTHpgQqtbAMKnOM7hQa4hOHpaQr7hSq_ZS5VhS5KnS5_iOk",
                 UserToken {
                     company_id: 128,
                     id: 127,
@@ -303,7 +300,7 @@ mod tests {
                 },
             ),
             (
-                "o-7J01k00IkF75y1XO03kQxR1XSC6fFqRJOiOLR",
+                "-WF3A-34E0-VQs98Z3I0jpk98ooTh2OlGat_Ok",
                 UserToken {
                     company_id: 3,
                     id: 4,
@@ -328,15 +325,15 @@ mod tests {
 
     #[test]
     fn rejects_a_truncated_or_mistyped_session_token() {
-        // No root byte at all, which is a message that ended before it began.
+        // colbin 0.8 writes no root byte, so an empty message is a record of zeros: refused for
+        // the hash it does not carry.
+        assert_eq!(decode_session_token(&[]), Err(TokenError::SessionHashWidth));
+        // A token cut short ends inside a field.
+        let (encoded, _) = plain_vector();
+        let payload = decode_session_base64(encoded).unwrap();
         assert_eq!(
-            decode_session_token(&[]),
+            decode_session_token(&payload[..payload.len() - 1]),
             Err(TokenError::Session(colbin::Error::Truncated))
-        );
-        // Outside colbin's reserved 0xD0..0xDF range, so not a colbin message at all.
-        assert_eq!(
-            decode_session_token(&[0x0a, 0x01, 0x00]),
-            Err(TokenError::Session(colbin::Error::BadRoot(0x0a)))
         );
         // A token carrying a hash of the wrong width is refused before the comparison, not
         // padded into one that could be compared.

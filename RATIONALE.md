@@ -1,3 +1,17 @@
+## colbin v0.8.0 keeps DOMAIN at fareward:v12; "not a colbin message" tests became truncation tests
+**Context** — genix-orm moved to colbin v0.8.0, which links the Go client at that version: its
+messages drop the `0xD0` root byte, and a v0.6.2 daemon closed every connection on the first frame.
+v0.8 also cannot recognise a message (minimal mode has no root), so `[0; 20]` and an empty payload
+decode as all-zero records.
+**Decision** — Cargo and `go/`, `vectors/` pin v0.8.0; every pinned frame, tag and session-token
+vector was regenerated from the Go encoders and checked by the Rust `compute_hash`. `DOMAIN` was
+not bumped. The four "refuses a payload that is not colbin" assertions now cut a valid message
+short and expect `Malformed`; the empty session token is refused for its hash width.
+**Rationale** — The v0.8 decoder still reads rooted messages, so without a domain bump a v0.8
+daemon serves v0.6.2 and v0.8 clients alike and can roll out first; a bump would have forced a
+lockstep deploy. Arbitrary bytes never reach a decoder anyway: the frame's auth tag is checked
+first, and session tokens carry their keyed hash.
+
 ## A lock release that cannot encode is logged, not returned
 
 **Context** — colbin v0.6's `Codec.Append` returns an error, and the decision was to pass it up to

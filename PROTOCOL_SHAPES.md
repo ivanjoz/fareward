@@ -12,6 +12,11 @@ cursor under the hand-rolled sequence payloads, the `LockLost` push, the colbin 
 six colbin request shapes. `DOMAIN` is now `fareward:v12` (colbin v0.6.2 changed the frame bytes),
 so the backend and the daemon must deploy together.
 
+**2026-10-26: colbin v0.8.0.** A message no longer starts with a root byte (`0xD0`), so every
+colbin payload is a byte shorter. The v0.8 decoder still reads the old rooted messages, so a daemon
+on v0.8 accepts both a v0.6.2 and a v0.8 client: **deploy the daemon first**, then the backend. A
+v0.6.2 daemon refuses a v0.8 client (it closes the connection on the first frame).
+
 Two consequences of Phase 3 that were not in the plan and are worth knowing before reading further:
 **every opcode is length-prefixed now** — the fixed-width framing had nothing left to describe and
 was deleted on both sides — and **the 65.5 s lease ceiling in §2.7 is gone** rather than raised.
