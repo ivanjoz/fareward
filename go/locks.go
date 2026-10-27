@@ -191,15 +191,24 @@ const (
 func AcquireLock(
 	ctx context.Context, action uint16, identifier int64, maxWaiters uint8,
 ) (*Lock, error) {
-	client := farewardClient()
-	if client == nil {
-		return nil, fmt.Errorf("%w: not configured", ErrLockUnavailable)
-	}
-	return client.Acquire(ctx, action, identifier, LockOptions{
+	return AcquireLockWithOptions(ctx, action, identifier, LockOptions{
 		MaxWaiters: maxWaiters,
 		Wait:       lockWait,
 		Lease:      lockLease,
 	})
+}
+
+// AcquireLockWithOptions is AcquireLock for a critical section that is not a request guard: a
+// background job longer than lockLease (a DataFrame compaction) whose waiters should queue for
+// it instead of being refused, since the holder's result is what they are waiting to read.
+func AcquireLockWithOptions(
+	ctx context.Context, action uint16, identifier int64, options LockOptions,
+) (*Lock, error) {
+	client := farewardClient()
+	if client == nil {
+		return nil, fmt.Errorf("%w: not configured", ErrLockUnavailable)
+	}
+	return client.Acquire(ctx, action, identifier, options)
 }
 
 func (client *FarewardClient) Acquire(
