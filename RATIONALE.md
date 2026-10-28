@@ -1,3 +1,13 @@
+## Inference is charged by tokens, in 2048-token blocks
+**Context** — `InferenceCredits` took the request and response bytes. The agent moved to Eino,
+whose model callbacks report the provider's token usage, not wire bytes.
+**Decision** — `InferenceCredits(inputTokens, outputTokens)` and `ChargeInferenceUsage` take tokens:
+one credit per 2048 input tokens, two per 2048 output tokens. The wire and the daemon are unchanged
+(the frame carries a credit count).
+**Rationale** — 2048 tokens is the old 8 KB block at ~4 bytes a token, so the price stays where it
+was without anyone deciding a new one. Tokens are what the provider bills, so the charge now tracks
+the cost instead of the JSON envelope's size.
+
 ## colbin v0.8.0 keeps DOMAIN at fareward:v12; "not a colbin message" tests became truncation tests
 **Context** — genix-orm moved to colbin v0.8.0, which links the Go client at that version: its
 messages drop the `0xD0` root byte, and a v0.6.2 daemon closed every connection on the first frame.

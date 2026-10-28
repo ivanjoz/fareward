@@ -166,13 +166,19 @@ func APICPUBaseCredits(method string) (uint16, error) {
 	return APICPUCredits(method, 0)
 }
 
-// InferenceCredits charges one credit per input block and two per output block.
-func InferenceCredits(inputBytes, outputBytes int) (uint16, error) {
-	if inputBytes < 0 || outputBytes < 0 {
-		return 0, errors.New("inference byte sizes cannot be negative")
+// inferenceTokenBlock is one inference credit block in tokens: 2048 tokens is the 8 KB block the
+// tariff charged in bytes at ~4 bytes a token, so moving to the provider's own token count kept the
+// price.
+const inferenceTokenBlock = 2048
+
+// InferenceCredits charges one credit per block of input tokens and two per block of output
+// tokens, counted by the provider (its usage report), not by the wire bytes.
+func InferenceCredits(inputTokens, outputTokens int) (uint16, error) {
+	if inputTokens < 0 || outputTokens < 0 {
+		return 0, errors.New("inference token counts cannot be negative")
 	}
-	credits := ceilDivide(uint64(inputBytes), creditBlockBytes) +
-		2*ceilDivide(uint64(outputBytes), creditBlockBytes)
+	credits := ceilDivide(uint64(inputTokens), inferenceTokenBlock) +
+		2*ceilDivide(uint64(outputTokens), inferenceTokenBlock)
 	if credits > uint64(^uint16(0)) {
 		return 0, fmt.Errorf("calculated inference credits %d exceed uint16", credits)
 	}
@@ -251,13 +257,14 @@ func WithCreditRateLimitIdentity(ctx context.Context, companyID, userID int32, r
 	})
 }
 
-// ChargeInferenceUsage submits actual successful provider input/output bytes when identity exists.
-func ChargeInferenceUsage(ctx context.Context, inputBytes, outputBytes int) error {
+// ChargeInferenceUsage submits one successful provider call's input/output tokens when identity
+// exists.
+func ChargeInferenceUsage(ctx context.Context, inputTokens, outputTokens int) error {
 	identity, ok := ctx.Value(creditRateLimitIdentityKey{}).(creditRateLimitIdentity)
 	if !ok {
 		return nil
 	}
-	inferenceCredits, err := InferenceCredits(inputBytes, outputBytes)
+	inferenceCredits, err := InferenceCredits(inputTokens, outputTokens)
 	if err != nil {
 		return err
 	}

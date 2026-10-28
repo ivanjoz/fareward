@@ -288,7 +288,8 @@ func TestCreditFormulasRoundPartialBlocksUp(t *testing.T) {
 		t.Fatal("an unknown method was given a tariff")
 	}
 
-	inference, err := InferenceCredits(8*1024+1, 8*1024+1)
+	// One token past a 2048-token block: two input blocks (2) plus two output blocks at double (4).
+	inference, err := InferenceCredits(2048+1, 2048+1)
 	if err != nil || inference != 6 {
 		t.Fatalf("InferenceCredits() = %d, %v; want 6", inference, err)
 	}
