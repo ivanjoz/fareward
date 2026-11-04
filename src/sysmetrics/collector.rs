@@ -38,12 +38,14 @@ const CGROUP_SEARCH_DEPTH: usize = 5;
 /// started after the daemon appears within half a minute.
 const CGROUP_SEARCH_RETRY: Duration = Duration::from_secs(30);
 
-/// The four units a row reports on, in the order the writer binds them.
+/// How many units a row reports on: the length of every per-unit array below.
+const SERVICE_UNIT_COUNT: usize = 3;
+
+/// The units a row reports on, in the order the writer binds them.
 #[derive(Clone, Debug)]
 pub struct ServiceUnits {
     pub backend: String,
     pub fareward: String,
-    pub search: String,
     pub scylla: String,
 }
 
@@ -58,7 +60,7 @@ struct PreviousCounters {
     taken_at: Instant,
     host_cpu_ticks: Option<(u64, u64)>,
     network_bytes: Option<(u64, u64)>,
-    service_cpu_usec: [Option<u64>; 4],
+    service_cpu_usec: [Option<u64>; SERVICE_UNIT_COUNT],
 }
 
 pub struct SystemMetricsCollector {
@@ -73,10 +75,10 @@ pub struct SystemMetricsCollector {
     previous: Option<PreviousCounters>,
     /// Each unit's cgroup directory once found, in the order of `unit_names`. Searching the tree on
     /// every sub-sample would be a directory walk a second for a path that almost never moves.
-    resolved_directories: [Option<PathBuf>; 4],
+    resolved_directories: [Option<PathBuf>; SERVICE_UNIT_COUNT],
     /// When each unit was last searched for, so a unit that is not on this box does not re-walk the
     /// tree every second forever.
-    last_search_attempt: [Option<Instant>; 4],
+    last_search_attempt: [Option<Instant>; SERVICE_UNIT_COUNT],
 }
 
 impl SystemMetricsCollector {
@@ -105,8 +107,8 @@ impl SystemMetricsCollector {
             network_interface,
             cpu_count,
             previous: None,
-            resolved_directories: [None, None, None, None],
-            last_search_attempt: [None; 4],
+            resolved_directories: [const { None }; SERVICE_UNIT_COUNT],
+            last_search_attempt: [None; SERVICE_UNIT_COUNT],
         }
     }
 
@@ -153,26 +155,29 @@ impl SystemMetricsCollector {
             network_tx_rate,
             backend: make_service(0),
             fareward: make_service(1),
-            search: make_service(2),
-            scylla: make_service(3),
+            scylla: make_service(2),
         })
     }
 
-    fn unit_names(&self) -> [&str; 4] {
+    fn unit_names(&self) -> [&str; SERVICE_UNIT_COUNT] {
         [
             &self.units.backend,
             &self.units.fareward,
-            &self.units.search,
             &self.units.scylla,
         ]
     }
 
-    /// Memory bytes and CPU microseconds for all four units, resolving each unit's directory once
+    /// Memory bytes and CPU microseconds for every unit, resolving each unit's directory once
     /// per sub-sample rather than once per file.
-    fn read_service_counters(&mut self) -> ([Option<u64>; 4], [Option<u64>; 4]) {
-        let mut memory_bytes = [None; 4];
-        let mut cpu_microseconds = [None; 4];
-        for index in 0..4 {
+    fn read_service_counters(
+        &mut self,
+    ) -> (
+        [Option<u64>; SERVICE_UNIT_COUNT],
+        [Option<u64>; SERVICE_UNIT_COUNT],
+    ) {
+        let mut memory_bytes = [None; SERVICE_UNIT_COUNT];
+        let mut cpu_microseconds = [None; SERVICE_UNIT_COUNT];
+        for index in 0..SERVICE_UNIT_COUNT {
             let Some(directory) = self.unit_directory(index) else {
                 continue;
             };
@@ -479,7 +484,7 @@ mod tests {
             Some(backend)
         );
         assert_eq!(
-            find_cgroup_directory(&root, "genixsearch.service", CGROUP_SEARCH_DEPTH),
+            find_cgroup_directory(&root, "absent.service", CGROUP_SEARCH_DEPTH),
             None
         );
         // The depth limit is a real bound, not decoration: Scylla sits below two slices.
@@ -504,7 +509,6 @@ mod tests {
             ServiceUnits {
                 backend: "late.service".into(),
                 fareward: String::new(),
-                search: String::new(),
                 scylla: String::new(),
             },
             "/".into(),
@@ -656,7 +660,6 @@ mod tests {
             ServiceUnits {
                 backend: "genix.service".into(),
                 fareward: "fareward.service".into(),
-                search: "genixsearch.service".into(),
                 scylla: "scylla-server.service".into(),
             },
             "/".into(),
@@ -669,12 +672,7 @@ mod tests {
         let sample = collector
             .sample()
             .expect("the second sample must produce a row");
-        for service in [
-            sample.backend,
-            sample.fareward,
-            sample.search,
-            sample.scylla,
-        ] {
+        for service in [sample.backend, sample.fareward, sample.scylla] {
             assert_eq!(service.memory_mb, NOT_MEASURED);
             assert_eq!(service.cpu_percent, NOT_MEASURED);
         }

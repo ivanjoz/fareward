@@ -63,9 +63,8 @@ impl ServerMetricsWriter {
         let insert_statement = format!(
             "INSERT INTO server_metrics (date, slot, cpu_percent, mem_percent, disk_percent, \
              net_rx_rate, net_tx_rate, backend_mem_mb, backend_cpu_percent, \
-             fareward_mem_mb, fareward_cpu_percent, search_mem_mb, search_cpu_percent, \
-             scylla_mem_mb, scylla_cpu_percent) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl_seconds}"
+             fareward_mem_mb, fareward_cpu_percent, scylla_mem_mb, scylla_cpu_percent) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl_seconds}"
         );
 
         Self {
@@ -122,7 +121,6 @@ impl ServerMetricsWriter {
                 ServiceUnits {
                     backend: config.backend_unit.clone(),
                     fareward: config.fareward_unit.clone(),
-                    search: config.search_unit.clone(),
                     scylla: config.scylla_unit.clone(),
                 },
                 config.disk_mount.clone(),
@@ -239,8 +237,8 @@ impl ServerMetricsWriter {
 
 /// The bound values, in the order the prepared statement names its columns. An array and not a
 /// tuple so the row can be compared and printed whole in a test — Rust stops deriving `Debug` and
-/// `PartialEq` for tuples at twelve elements, and this row has fifteen.
-fn row_values(date: i16, slot: i16, sample: &MetricsSample) -> [i16; 15] {
+/// `PartialEq` for tuples at twelve elements, and this row has thirteen.
+fn row_values(date: i16, slot: i16, sample: &MetricsSample) -> [i16; 13] {
     [
         date,
         slot,
@@ -253,8 +251,6 @@ fn row_values(date: i16, slot: i16, sample: &MetricsSample) -> [i16; 15] {
         sample.backend.cpu_percent,
         sample.fareward.memory_mb,
         sample.fareward.cpu_percent,
-        sample.search.memory_mb,
-        sample.search.cpu_percent,
         sample.scylla.memory_mb,
         sample.scylla.cpu_percent,
     ]
@@ -326,18 +322,14 @@ mod tests {
                 memory_mb: 8,
                 cpu_percent: 9,
             },
-            search: crate::sysmetrics::ServiceSample {
+            scylla: crate::sysmetrics::ServiceSample {
                 memory_mb: 10,
                 cpu_percent: 11,
-            },
-            scylla: crate::sysmetrics::ServiceSample {
-                memory_mb: 12,
-                cpu_percent: 13,
             },
         };
         assert_eq!(
             row_values(100, 200, &sample),
-            [100, 200, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            [100, 200, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
     }
 

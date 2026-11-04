@@ -37,7 +37,7 @@ const DEFAULT_SEQUENCE_BLOCK_SIZE: u32 = 64;
 const DEFAULT_SEQUENCE_MAX_TRACKED_NAMES: usize = 200_000;
 
 /// Keeps the bridge next to the other Genix services on the same hosts (14008 ScyllaDB,
-/// 14010 backend, 14013 this process's rate limiter, 14446 GenixSearch).
+/// 14010 backend, 14013 this process's rate limiter).
 const DEFAULT_BRIDGE_PORT: u16 = 14012;
 
 /// A month of request history is what a "what broke last week" question needs; the partition is
@@ -69,7 +69,6 @@ const DEFAULT_SERVER_METRICS_TTL_DAYS: u64 = 30;
 const MINIMUM_SERVER_METRICS_ROW_SECONDS: u64 = 3;
 const DEFAULT_SERVER_METRICS_BACKEND_UNIT: &str = "genix.service";
 const DEFAULT_SERVER_METRICS_FAREWARD_UNIT: &str = "fareward.service";
-const DEFAULT_SERVER_METRICS_SEARCH_UNIT: &str = "genixsearch.service";
 const DEFAULT_SERVER_METRICS_SCYLLA_UNIT: &str = "scylla-server.service";
 
 #[derive(Clone, Debug)]
@@ -127,7 +126,6 @@ pub struct ServerMetricsConfig {
     /// at all when it runs on Lambda, which is the case the `-1` sentinel exists for.
     pub backend_unit: String,
     pub fareward_unit: String,
-    pub search_unit: String,
     pub scylla_unit: String,
 }
 
@@ -454,11 +452,6 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
             "SERVER_METRICS_FAREWARD_UNIT",
             "server_metrics.fareward_unit",
             DEFAULT_SERVER_METRICS_FAREWARD_UNIT,
-        ),
-        search_unit: unit_name(
-            "SERVER_METRICS_SEARCH_UNIT",
-            "server_metrics.search_unit",
-            DEFAULT_SERVER_METRICS_SEARCH_UNIT,
         ),
         scylla_unit: unit_name(
             "SERVER_METRICS_SCYLLA_UNIT",
