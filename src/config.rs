@@ -551,18 +551,47 @@ fn load_config() -> Result<Table> {
         if !path.is_file() {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let value: Value =
-            toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
-        return value
-            .as_table()
-            .cloned()
-            .with_context(|| format!("{} must contain a TOML table", path.display()));
+        let mut config = read_config_table(&path)?;
+        // config.local.toml next to config.toml holds what only this host differs in; the Go
+        // backend (core/config_local.go) and the configure scripts apply it with the same rule.
+        let local_path = path.with_file_name(LOCAL_CONFIG_FILE_NAME);
+        if local_path.is_file() {
+            merge_config_override(&mut config, read_config_table(&local_path)?);
+        }
+        return Ok(config);
     }
 
     // An empty table still permits an environment-only deployment.
     Ok(Table::new())
+}
+
+/// The per-host override that sits next to config.toml. See merge_config_override.
+const LOCAL_CONFIG_FILE_NAME: &str = "config.local.toml";
+
+fn read_config_table(path: &std::path::Path) -> Result<Table> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let value: Value =
+        toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
+    value
+        .as_table()
+        .cloned()
+        .with_context(|| format!("{} must contain a TOML table", path.display()))
+}
+
+/// Lays the override over the base config. A table present in both merges key by key, recursively;
+/// any other value — scalar, array, or array of tables — replaces the base value whole.
+fn merge_config_override(base: &mut Table, override_config: Table) {
+    for (key, override_value) in override_config {
+        match (base.get_mut(&key), override_value) {
+            (Some(Value::Table(base_table)), Value::Table(override_table)) => {
+                merge_config_override(base_table, override_table)
+            }
+            (_, override_value) => {
+                base.insert(key, override_value);
+            }
+        }
+    }
 }
 
 fn value_text(config: &Table, env_key: &str, toml_path: &str) -> Option<String> {
@@ -641,6 +670,22 @@ fn optional_usize(config: &Table, env_key: &str, toml_path: &str) -> Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_override_merges_tables_and_replaces_arrays() {
+        let mut config: Table = toml::from_str(
+            "[fareward]\nport = 14013\npublic = true\n[[models]]\nid = 'a'\n[[models]]\nid = 'b'",
+        )
+        .unwrap();
+        let local: Table = toml::from_str("[fareward]\npublic = false\n[[models]]\nid = 'c'").unwrap();
+        merge_config_override(&mut config, local);
+
+        assert_eq!(optional_u64(&config, "IGNORED_PORT", "fareward.port").unwrap(), Some(14013));
+        assert_eq!(config["fareward"]["public"].as_bool(), Some(false));
+        let models = config["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"].as_str(), Some("c"));
+    }
 
     #[test]
     fn nested_numeric_and_string_values_are_accepted() {
