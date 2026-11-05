@@ -184,6 +184,14 @@ const (
 	lockLease = 15 * time.Second
 )
 
+// DefaultLockWait and DefaultLockLease are the same timings, for a caller that implements the
+// lock in-process (a single-process server needs no daemon to serialize itself) and must keep
+// the semantics the call sites were written against.
+const (
+	DefaultLockWait  = lockWait
+	DefaultLockLease = lockLease
+)
+
 // AcquireLock blocks until the key is free, the queue refuses us, or lockWait elapses.
 //
 // maxWaiters is the queue ceiling for this key, and the only knob a call site gets. Zero makes it a

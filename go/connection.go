@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ivanjoz/fareward/go/siphash"
@@ -176,8 +177,35 @@ type muxConnection struct {
 	heldMu sync.Mutex
 	held   map[heldKey]*Lock
 
+	// inflightSlots has one token per request the daemon will accept on this connection at once
+	// (rate_limit.max_inflight_per_connection). The daemon answers a frame past that cap with
+	// "unavailable" instead of queuing it, so the queue lives here: a caller past the cap waits for
+	// a slot, under its own deadline, rather than failing.
+	inflightSlots chan struct{}
+
 	closed    chan struct{}
 	closeOnce sync.Once
+}
+
+// defaultMaxInflightPerConnection mirrors the daemon's default max_inflight_per_connection.
+const defaultMaxInflightPerConnection = 64
+
+var maxInflightPerConnection atomic.Int32
+
+// SetMaxInflightPerConnection tells the client the daemon's rate_limit.max_inflight_per_connection,
+// for a deployment that changed it. It applies to connections dialed afterwards; call it before
+// the first request. Values below one are ignored.
+func SetMaxInflightPerConnection(maxInflight int) {
+	if maxInflight > 0 {
+		maxInflightPerConnection.Store(int32(maxInflight))
+	}
+}
+
+func currentMaxInflightPerConnection() int {
+	if configured := maxInflightPerConnection.Load(); configured > 0 {
+		return int(configured)
+	}
+	return defaultMaxInflightPerConnection
 }
 
 type FarewardClient struct {
@@ -360,10 +388,11 @@ func (client *FarewardClient) dial(ctx context.Context) (*muxConnection, error) 
 		return nil, err
 	}
 	connection := &muxConnection{
-		conn:    socket,
-		pending: map[uint16]*pendingRequest{},
-		held:    map[heldKey]*Lock{},
-		closed:  make(chan struct{}),
+		conn:          socket,
+		pending:       map[uint16]*pendingRequest{},
+		held:          map[heldKey]*Lock{},
+		inflightSlots: make(chan struct{}, currentMaxInflightPerConnection()),
+		closed:        make(chan struct{}),
 	}
 	if err := socket.SetReadDeadline(time.Now().Add(farewardDialTimeout)); err != nil {
 		socket.Close()
@@ -393,6 +422,24 @@ func (connection *muxConnection) exchange(
 		action:     action,
 		identifier: identifier,
 	}
+
+	// The wait for a slot counts against the same deadline as the reply: a caller does not get
+	// its full wait twice.
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case connection.inflightSlots <- struct{}{}:
+	case <-connection.closed:
+		return muxReply{}, errors.New("connection closed while waiting for an in-flight slot")
+	case <-ctx.Done():
+		return muxReply{}, ctx.Err()
+	case <-timer.C:
+		return muxReply{}, errors.New("timed out waiting for an in-flight slot")
+	}
+	// Released when this exchange returns. A caller that gave up on its reply frees the slot
+	// while the daemon may still be working on the frame; that window is one timeout wide and
+	// only reached when the daemon is already late, so the cap is not tracked past it.
+	defer func() { <-connection.inflightSlots }()
 
 	connection.writeMu.Lock()
 	if connection.sequence == ^uint64(0) {
@@ -425,8 +472,6 @@ func (connection *muxConnection) exchange(
 		return muxReply{}, writeErr
 	}
 
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
 	select {
 	case reply := <-pending.reply:
 		return reply, nil
