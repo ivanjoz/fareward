@@ -194,6 +194,12 @@ async fn handle_connection(
     let mut frame = [0_u8; MAX_FRAME_SIZE];
 
     let outcome = loop {
+        // A JoinSet keeps every task it spawned until it is joined, finished or not. A pooled
+        // connection lives as long as the backend does, so without reaping here each request it
+        // ever carried stayed allocated: memory grew with the request count until the socket
+        // closed. try_join_next never waits, and the in-flight permit already bounds what is live.
+        while handlers.try_join_next().is_some() {}
+
         // Pushed before the read parks: the client is told the moment this loop notices, which is
         // its own lease deadline rather than the one the client started a round trip later.
         for (action, identifier) in drop_expired(&mut held, peer) {
