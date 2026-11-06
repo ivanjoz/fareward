@@ -60,6 +60,10 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(config.listen_address)
         .await
         .with_context(|| format!("failed to bind {}", config.listen_address))?;
+    let unix_listener = match &config.unix_socket_path {
+        Some(socket_path) => Some(server::bind_unix_socket(socket_path)?),
+        None => None,
+    };
     let bridge_listener = TcpListener::bind(config.bridge.listen_address)
         .await
         .with_context(|| format!("failed to bind {}", config.bridge.listen_address))?;
@@ -127,6 +131,7 @@ async fn main() -> Result<()> {
 
     let server_task = tokio::spawn(server::run(
         listener,
+        unix_listener,
         limiter.clone(),
         locks,
         request_logs,

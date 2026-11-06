@@ -83,6 +83,10 @@ pub struct DatabaseConfig {
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub listen_address: SocketAddr,
+    /// Optional Unix domain socket served next to the TCP listener, never instead of it: a Lambda
+    /// backend can only reach the TCP port, while a backend on this same host skips the TCP/IP
+    /// stack through the socket. Same frames, same handshake, same secret on both.
+    pub unix_socket_path: Option<PathBuf>,
     pub flush_interval: Duration,
     pub frame_timeout: Duration,
     pub max_connections: usize,
@@ -175,6 +179,9 @@ impl AppConfig {
             [127, 0, 0, 1]
         };
         let listen_address = SocketAddr::from((listen_octets, listen_port));
+        let unix_socket_path =
+            optional_string(&config, "FAREWARD_UNIX_SOCKET", "fareward.unix_socket")
+                .map(PathBuf::from);
         let flush_seconds = optional_u64(
             &config,
             "RATE_LIMIT_FLUSH_SECONDS",
@@ -352,6 +359,7 @@ impl AppConfig {
 
         Ok(Self {
             listen_address,
+            unix_socket_path,
             flush_interval: Duration::from_secs(flush_seconds),
             frame_timeout: Duration::from_secs(frame_timeout_seconds),
             max_connections,

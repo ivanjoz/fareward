@@ -382,8 +382,14 @@ func (client *FarewardClient) connection(ctx context.Context) (*muxConnection, b
 }
 
 func (client *FarewardClient) dial(ctx context.Context) (*muxConnection, error) {
+	// "unix:/path" dials the daemon's Unix domain socket: same frames and handshake, without the
+	// TCP/IP stack, for a backend on the daemon's own host. Anything else is a host:port.
+	network, dialAddress := "tcp", client.address
+	if socketPath, isUnixSocket := strings.CutPrefix(client.address, "unix:"); isUnixSocket {
+		network, dialAddress = "unix", socketPath
+	}
 	dialer := net.Dialer{Timeout: farewardDialTimeout, KeepAlive: 30 * time.Second}
-	socket, err := dialer.DialContext(ctx, "tcp", client.address)
+	socket, err := dialer.DialContext(ctx, network, dialAddress)
 	if err != nil {
 		return nil, err
 	}

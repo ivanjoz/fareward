@@ -1,4 +1,5 @@
-//! Raw TCP listener, connection handshake, opcode dispatch, and graceful stop coordination.
+//! Raw TCP listener (plus an optional Unix domain socket), connection handshake, opcode dispatch,
+//! and graceful stop coordination.
 //!
 //! Each connection is a **single state owner**: the reader task is the only thing that touches
 //! the locks this connection holds. Handlers run as spawned tasks so a queued acquire cannot
@@ -7,13 +8,20 @@
 //! disconnect: there is only ever one writer.
 
 use std::{
-    collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration, time::Instant,
+    collections::HashMap,
+    fs,
+    io::{self, ErrorKind},
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UnixListener, UnixStream},
     sync::{Semaphore, mpsc, watch},
     task::JoinSet,
     time::timeout,
@@ -65,8 +73,48 @@ struct AcquireOutcome {
     granted: Option<HeldLock>,
 }
 
+/// One accepted connection from either listener. Both carry the identical protocol; the only
+/// difference is that TCP needs Nagle turned off and has a peer address worth logging.
+enum AcceptedSocket {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+/// Binds the Unix domain socket a backend on this same host dials instead of loopback TCP.
+///
+/// A socket file left by a crashed run would make bind fail with EADDRINUSE, so it is removed
+/// first — but only when it IS a socket, never a regular file someone pointed the setting at.
+/// 0660 keeps it to the daemon's user and group, which is the backend's under configure_fareward.
+pub fn bind_unix_socket(socket_path: &Path) -> Result<UnixListener> {
+    if let Ok(metadata) = fs::symlink_metadata(socket_path) {
+        if !metadata.file_type().is_socket() {
+            return Err(anyhow!(
+                "fareward.unix_socket {} exists and is not a socket",
+                socket_path.display()
+            ));
+        }
+        fs::remove_file(socket_path).with_context(|| {
+            format!("failed to remove stale socket {}", socket_path.display())
+        })?;
+    }
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))
+        .with_context(|| format!("failed to set permissions on {}", socket_path.display()))?;
+    Ok(listener)
+}
+
+/// Parks forever when no Unix socket is configured, so its `select!` branch simply never fires.
+async fn accept_unix(listener: Option<&UnixListener>) -> io::Result<UnixStream> {
+    match listener {
+        Some(listener) => listener.accept().await.map(|(socket, _)| socket),
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn run(
     listener: TcpListener,
+    unix_listener: Option<UnixListener>,
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
     request_logs: RequestLogSink,
@@ -80,62 +128,91 @@ pub async fn run(
     let connection_slots = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
     info!(address = %listener.local_addr()?, max_connections, max_inflight, "fareward listening");
+    if let Some(unix_listener) = &unix_listener {
+        info!(socket = ?unix_listener.local_addr()?, "fareward listening on unix socket");
+    }
 
     loop {
-        tokio::select! {
+        // Both listeners feed the same connection budget and the same handler below.
+        let accepted = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
+                continue;
             }
-            accepted = listener.accept() => {
-                // Transient accept failures (EMFILE when the fd limit is reached, a peer that
-                // vanished between the SYN and the accept) must not take the whole listener
-                // down: propagating here would silently stop serving every future connection.
-                let (socket, peer) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(accept_error) => {
-                        warn!(error = %accept_error, "accept failed, continuing to listen");
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        continue;
-                    }
-                };
-                let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
-                    warn!(%peer, "rejecting connection because the connection limit is full");
-                    drop(socket);
-                    continue;
-                };
-                socket.set_nodelay(true).context("failed to set TCP_NODELAY")?;
-                let limiter = limiter.clone();
-                let locks = locks.clone();
-                let request_logs = request_logs.clone();
-                let sequences = sequences.clone();
-                let secret = secret.clone();
-                let connection_shutdown = shutdown.clone();
-                connections.spawn(async move {
-                    let _slot = slot;
-                    if let Err(connection_error) = handle_connection(
-                        socket,
-                        peer,
-                        limiter,
-                        locks,
-                        request_logs,
-                        sequences,
-                        &secret,
-                        frame_timeout,
-                        max_inflight,
-                        connection_shutdown,
-                    ).await {
-                        debug!(%peer, error = %connection_error, "connection closed with error");
-                    }
-                });
-            }
+            accepted = listener.accept() => accepted.map(|(socket, _)| AcceptedSocket::Tcp(socket)),
+            accepted = accept_unix(unix_listener.as_ref()) => accepted.map(AcceptedSocket::Unix),
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(join_error)) = completed {
                     warn!(error = %join_error, "connection task failed");
                 }
+                continue;
             }
-        }
+        };
+
+        // Transient accept failures (EMFILE when the fd limit is reached, a peer that vanished
+        // between the SYN and the accept) must not take the whole listener down: propagating here
+        // would silently stop serving every future connection.
+        let socket = match accepted {
+            Ok(socket) => socket,
+            Err(accept_error) => {
+                warn!(error = %accept_error, "accept failed, continuing to listen");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+        };
+        let peer = match &socket {
+            AcceptedSocket::Tcp(stream) => stream
+                .peer_addr()
+                .map_or_else(|_| "tcp".to_owned(), |address| address.to_string()),
+            AcceptedSocket::Unix(_) => "unix".to_owned(),
+        };
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            warn!(%peer, "rejecting connection because the connection limit is full");
+            drop(socket);
+            continue;
+        };
+        let limiter = limiter.clone();
+        let locks = locks.clone();
+        let request_logs = request_logs.clone();
+        let sequences = sequences.clone();
+        let secret = secret.clone();
+        let connection_shutdown = shutdown.clone();
+        // Split here rather than inside handle_connection: `into_split` gives lock-free owned
+        // halves for both stream types, which `tokio::io::split` on a generic stream would not.
+        let (reader, writer): (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) =
+            match socket {
+                AcceptedSocket::Tcp(stream) => {
+                    stream.set_nodelay(true).context("failed to set TCP_NODELAY")?;
+                    let (reader, writer) = stream.into_split();
+                    (Box::new(reader), Box::new(writer))
+                }
+                AcceptedSocket::Unix(stream) => {
+                    let (reader, writer) = stream.into_split();
+                    (Box::new(reader), Box::new(writer))
+                }
+            };
+        connections.spawn(async move {
+            let _slot = slot;
+            if let Err(connection_error) = handle_connection(
+                reader,
+                writer,
+                &peer,
+                limiter,
+                locks,
+                request_logs,
+                sequences,
+                &secret,
+                frame_timeout,
+                max_inflight,
+                connection_shutdown,
+            )
+            .await
+            {
+                debug!(%peer, error = %connection_error, "connection closed with error");
+            }
+        });
     }
 
     // Connection tasks observe the same shutdown channel and drop their sockets promptly.
@@ -148,8 +225,9 @@ pub async fn run(
 }
 
 async fn handle_connection(
-    socket: TcpStream,
-    peer: SocketAddr,
+    mut reader: Box<dyn AsyncRead + Send + Unpin>,
+    mut writer: Box<dyn AsyncWrite + Send + Unpin>,
+    peer: &str,
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
     request_logs: RequestLogSink,
@@ -159,7 +237,6 @@ async fn handle_connection(
     max_inflight: usize,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (mut reader, mut writer) = socket.into_split();
     let nonce = auth::new_nonce()?;
     writer
         .write_all(&nonce)
@@ -616,7 +693,7 @@ async fn handle_connection(
 /// The keys come back rather than being logged and forgotten: the client still believes it owns
 /// those locks, and a `LockLost` push is what tells it otherwise. Until the push existed, the only
 /// thing on the other side was a timer started a round trip later than this deadline.
-fn drop_expired(held: &mut HashMap<LockKey, HeldLock>, peer: SocketAddr) -> Vec<LockKey> {
+fn drop_expired(held: &mut HashMap<LockKey, HeldLock>, peer: &str) -> Vec<LockKey> {
     if held.is_empty() {
         return Vec::new();
     }

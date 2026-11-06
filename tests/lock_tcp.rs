@@ -147,6 +147,7 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     tokio::spawn(server::run(
         listener,
+        None,
         limiter,
         locks,
         // These tests drive locks and charges; request logs would be written to a database this

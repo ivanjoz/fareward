@@ -160,6 +160,7 @@ async fn start_server() -> TestServer {
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     tokio::spawn(server::run(
         listener,
+        None,
         limiter,
         locks,
         // No database in this harness: the sink accepts and discards, which is exactly what the
