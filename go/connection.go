@@ -182,6 +182,10 @@ type muxConnection struct {
 	// "unavailable" instead of queuing it, so the queue lives here: a caller past the cap waits for
 	// a slot, under its own deadline, rather than failing.
 	inflightSlots chan struct{}
+	// sequenceSlots is the same queue for sequence reservations and assignments, which the daemon
+	// caps on a ceiling of their own: a block miss waits on ScyllaDB, and slow reservations must not
+	// hold the slots charges and locks wait on.
+	sequenceSlots chan struct{}
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -398,6 +402,7 @@ func (client *FarewardClient) dial(ctx context.Context) (*muxConnection, error) 
 		pending:       map[uint16]*pendingRequest{},
 		held:          map[heldKey]*Lock{},
 		inflightSlots: make(chan struct{}, currentMaxInflightPerConnection()),
+		sequenceSlots: make(chan struct{}, currentMaxInflightPerConnection()),
 		closed:        make(chan struct{}),
 	}
 	if err := socket.SetReadDeadline(time.Now().Add(farewardDialTimeout)); err != nil {
@@ -431,10 +436,14 @@ func (connection *muxConnection) exchange(
 
 	// The wait for a slot counts against the same deadline as the reply: a caller does not get
 	// its full wait twice.
+	slots := connection.inflightSlots
+	if opcode == opcodeReserveSequence || opcode == opcodeSetSequence {
+		slots = connection.sequenceSlots
+	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
-	case connection.inflightSlots <- struct{}{}:
+	case slots <- struct{}{}:
 	case <-connection.closed:
 		return muxReply{}, errors.New("connection closed while waiting for an in-flight slot")
 	case <-ctx.Done():
@@ -445,7 +454,7 @@ func (connection *muxConnection) exchange(
 	// Released when this exchange returns. A caller that gave up on its reply frees the slot
 	// while the daemon may still be working on the frame; that window is one timeout wide and
 	// only reached when the daemon is already late, so the cap is not tracked past it.
-	defer func() { <-connection.inflightSlots }()
+	defer func() { <-slots }()
 
 	connection.writeMu.Lock()
 	if connection.sequence == ^uint64(0) {

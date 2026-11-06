@@ -275,7 +275,9 @@ frame_timeout_seconds = 30
 max_connections       = 1024
 shards                = 0 # 0 uses the logical CPU count
 # Requests one connection may have in flight at once. Multiplexing removed the backpressure that
-# one-request-per-socket used to give for free, so it has to be stated.
+# one-request-per-socket used to give for free, so it has to be stated. Sequence reservations and
+# assignments have a ceiling of this size of their own, so reservations waiting on ScyllaDB cannot
+# refuse the charges and locks sharing the connection.
 max_inflight_per_connection = 64
 access_cache_seconds  = 600 # TTL of the cached user grants; INVALIDATE_USER_ACCESS is the fast path
 

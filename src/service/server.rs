@@ -258,6 +258,10 @@ async fn handle_connection(
 
     let (acquire_sender, mut acquire_receiver) = mpsc::channel::<AcquireOutcome>(max_inflight);
     let inflight = Arc::new(Semaphore::new(max_inflight));
+    // Sequences get their own ceiling: a block miss is a ScyllaDB counter update, which slows down
+    // with the database, and sharing one ceiling let a pile of slow reservations refuse the charges
+    // and locks that answer from memory. The client keeps a matching pool per class.
+    let sequence_inflight = Arc::new(Semaphore::new(max_inflight));
     // Dropping this aborts every spawned handler, including an acquire still parked in the
     // registry's queue. Without that, a disconnected client's queued acquire would still be
     // granted a lock that nobody holds and nobody will release.
@@ -383,7 +387,10 @@ async fn handle_connection(
 
         // Refusing beyond the ceiling keeps one connection from spawning without bound. Taken
         // before spawning so the permit's lifetime is exactly the handler's.
-        let permit = inflight.clone().try_acquire_owned().ok();
+        let permit = match opcode {
+            Opcode::ReserveSequence | Opcode::SetSequence => sequence_inflight.clone().try_acquire_owned().ok(),
+            _ => inflight.clone().try_acquire_owned().ok(),
+        };
 
         match opcode {
             Opcode::ChargeCredits => {
