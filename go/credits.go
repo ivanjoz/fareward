@@ -474,6 +474,13 @@ func decodeAccessDenied(body []byte) error {
 	}
 }
 
+// DecodeAccessGrant reads the grant the SPOE agent leaves in txn.fw.grant, which HAProxy forwards
+// hex-encoded as x-fareward-grant. It is the same tail a ChargeGranted reply carries, so it is read
+// by the same checks: a header that does not decode is refused, never half-read.
+func DecodeAccessGrant(body []byte) (*AccessGrant, error) {
+	return decodeAccessGrant(body)
+}
+
 // decodeAccessGrant splits a ChargeGranted body back out per slot.
 //
 //	[granted_mask:u8][has_subs_mask:u8][sub_len:u8][sub bytes…]

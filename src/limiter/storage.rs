@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use mysql_async::{Pool, prelude::Queryable};
 
 use crate::limiter::aggregation::{COMPANY_AGGREGATE_USER_ID, UsageKey};
+use crate::limiter::block::Rejections;
 use crate::limiter::credits_blob::Credits;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +104,15 @@ pub trait LimiterStore: Send + Sync {
     /// Writes only the usage columns, never the entitlement ones: the two writes race (a flush and a
     /// mutation can land in either order) and each must leave the other's columns untouched.
     async fn upsert_budget_usage(&self, usage: StoredBudgetUsage) -> Result<()>;
+    /// **Adds** to a company row's rejection counters; unlike every other write here it is not an
+    /// absolute replacement, because the counters are not loaded at start and memory only ever
+    /// holds what accumulated since the last flush. Never touches `used_credits` of an existing row.
+    async fn add_rejections(
+        &self,
+        company_id: i32,
+        time_frame: i32,
+        rejections: Rejections,
+    ) -> Result<()>;
     /// `None` means no such user in this company, which is a denial and not an error.
     async fn load_user_access(
         &self,
@@ -126,6 +136,14 @@ const UPSERT_COMPANY: &str = "INSERT INTO credit_usage_company (company_id, time
      VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE used_credits = VALUES(used_credits)";
 const UPSERT_USER: &str = "INSERT INTO credit_usage_user (company_id, user_id, time_frame, used_credits) \
      VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE used_credits = VALUES(used_credits)";
+// The one additive write. A row created here carries an empty used_credits, which decodes as "no
+// usage"; an existing row keeps its credits, since the update names only the counters.
+const ADD_REJECTIONS: &str = "INSERT INTO credit_usage_company \
+     (company_id, time_frame, used_credits, rejected_10s, rejected_1h, rejected_no_funds) \
+     VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
+     rejected_10s = COALESCE(rejected_10s, 0) + VALUES(rejected_10s), \
+     rejected_1h = COALESCE(rejected_1h, 0) + VALUES(rejected_1h), \
+     rejected_no_funds = COALESCE(rejected_no_funds, 0) + VALUES(rejected_no_funds)";
 
 const SELECT_BUDGET: &str = "SELECT daily_cpu, daily_inference, budget_month_start_day, \
      monthly_cpu_ceiling, monthly_inference_ceiling, last_set_cpu, last_set_inference, updated, \
@@ -239,6 +257,34 @@ impl LimiterStore for MariaLimiterStore {
                 .await
                 .context("credit_usage_user absolute upsert failed")?;
         }
+        Ok(())
+    }
+
+    async fn add_rejections(
+        &self,
+        company_id: i32,
+        time_frame: i32,
+        rejections: Rejections,
+    ) -> Result<()> {
+        let mut connection = self
+            .pool
+            .get_conn()
+            .await
+            .context("no MariaDB connection")?;
+        connection
+            .exec_drop(
+                ADD_REJECTIONS,
+                (
+                    company_id,
+                    time_frame,
+                    Vec::<u8>::new(),
+                    rejections.burst,
+                    rejections.hour,
+                    rejections.no_funds,
+                ),
+            )
+            .await
+            .context("credit_usage_company rejection counters update failed")?;
         Ok(())
     }
 

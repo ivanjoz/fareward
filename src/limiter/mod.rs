@@ -18,6 +18,7 @@
 
 pub mod access;
 pub mod aggregation;
+pub mod block;
 pub mod budget;
 pub mod credits_blob;
 pub mod protocol;

@@ -84,6 +84,14 @@ impl LimiterStore for EmptyStore {
     async fn upsert_budget_usage(&self, _usage: StoredBudgetUsage) -> Result<()> {
         Ok(())
     }
+    async fn add_rejections(
+        &self,
+        _company_id: i32,
+        _time_frame: i32,
+        _rejections: fareward::limiter::block::Rejections,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn load_user_access(&self, _c: i32, _u: i32) -> Result<Option<StoredUserAccess>> {
         Ok(None)
     }
@@ -114,6 +122,7 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
             // Neither test goes near a daily gate; the whole company allowance keeps this
             // fixture out of the way.
             user_daily_share_pct: 100,
+            disable_user_limit: false,
         },
         Arc::new(EmptyStore),
         600,

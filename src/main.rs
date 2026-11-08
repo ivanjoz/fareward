@@ -16,7 +16,9 @@ use fareward::{
     limiter::{quota::RateLimiter, storage::MariaLimiterStore},
     lock::registry::LockRegistry,
     reqlog::writer::{RequestLogSink, RequestLogWriter},
+    routes::RouteTableHandle,
     service::server,
+    spoe::{Agent, AgentLimits},
     sysmetrics::writer::ServerMetricsWriter,
 };
 use tokio::{net::TcpListener, sync::watch, time::MissedTickBehavior};
@@ -86,6 +88,41 @@ async fn main() -> Result<()> {
     } else {
         info!("server metrics collector disabled by configuration");
         None
+    };
+
+    // The HAProxy agent: one more front-end of the same limiter. A missing or invalid route table
+    // fails the start, because the agent must never run without the backend's policy.
+    let spoe_tasks = match &config.spoe {
+        Some(spoe_config) => {
+            let routes = RouteTableHandle::open(&spoe_config.routes_file)
+                .context("the SPOE agent needs the route table [fareward].routes_file")?;
+            let spoe_listener = server::bind_unix_socket(&spoe_config.socket_path)?;
+            let agent = Agent::new(
+                limiter.clone(),
+                routes.clone(),
+                Arc::new(config.secret_phrase.clone()),
+                AgentLimits {
+                    max_connections: spoe_config.max_connections,
+                    max_inflight_per_connection: spoe_config.max_inflight_per_connection,
+                    max_frame_size: spoe_config.max_frame_size,
+                    shadow: spoe_config.shadow,
+                },
+            );
+            info!(
+                socket = %spoe_config.socket_path.display(),
+                shadow = spoe_config.shadow,
+                "spoe agent enabled"
+            );
+            Some((
+                tokio::spawn(fareward::spoe::agent::run(
+                    agent,
+                    spoe_listener,
+                    shutdown_receiver.clone(),
+                )),
+                tokio::spawn(routes.watch(spoe_config.routes_poll, shutdown_receiver.clone())),
+            ))
+        }
+        None => None,
     };
 
     let flush_limiter = limiter.clone();
@@ -170,6 +207,11 @@ async fn main() -> Result<()> {
         error!(error = %bridge_error, "sse bridge stopped with an error");
     }
     server_task.await.context("server task failed")??;
+    // Before the final flush: the agent charges through the same limiter.
+    if let Some((agent_task, routes_task)) = spoe_tasks {
+        let _ = agent_task.await;
+        let _ = routes_task.await;
+    }
     let written = limiter.flush_dirty().await;
     info!(written, "final usage flush finished");
     if let Err(disconnect_error) = pool.disconnect().await {

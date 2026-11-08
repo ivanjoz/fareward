@@ -103,6 +103,27 @@ pub struct AppConfig {
     pub bridge: BridgeConfig,
     pub request_log: RequestLogConfig,
     pub server_metrics: ServerMetricsConfig,
+    /// The HAProxy SPOE agent; `None` unless `[spoe].socket` is set.
+    pub spoe: Option<SpoeConfig>,
+}
+
+/// `[spoe]`: the agent HAProxy asks before reading a request body (plan phase 4).
+#[derive(Clone, Debug)]
+pub struct SpoeConfig {
+    /// `[spoe].socket`: the Unix socket HAProxy connects to, its own and not the TCP protocol's.
+    /// Access is the filesystem's (mode 0660), so it carries no frame tag.
+    pub socket_path: PathBuf,
+    /// `[fareward].routes_file`: the route table the backend writes at startup. One key read by
+    /// both processes, so they cannot name two different files.
+    pub routes_file: PathBuf,
+    pub routes_poll: Duration,
+    /// `[spoe].mode = "shadow"` (the default) evaluates without charging and the backend keeps
+    /// deciding; `"enforce"` charges and HAProxy acts on the verdict. Enforcement has to be asked
+    /// for: a missing key must never start refusing traffic.
+    pub shadow: bool,
+    pub max_connections: usize,
+    pub max_inflight_per_connection: usize,
+    pub max_frame_size: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +269,13 @@ impl AppConfig {
                 "rate_limit.user_daily_share_pct",
             )?
             .unwrap_or(100),
+            // Off by default: turning it on drops every per-user gate, which is a policy decision
+            // and not something a missing key should make.
+            disable_user_limit: optional_bool(
+                &config,
+                "RATE_LIMIT_DISABLE_USER_LIMIT",
+                "rate_limit.disable_user_limit",
+            ),
         };
         validate_policy(policy)?;
 
@@ -321,6 +349,7 @@ impl AppConfig {
         };
 
         let server_metrics = load_server_metrics(&config)?;
+        let spoe = load_spoe(&config)?;
 
         let bridge_port = optional_u64(&config, "SSE_BRIDGE_PORT", "sse_bridge.port")?
             .map(|port| u16::try_from(port).context("sse_bridge.port must be a valid TCP port"))
@@ -364,6 +393,7 @@ impl AppConfig {
             locks,
             request_log,
             server_metrics,
+            spoe,
         })
     }
 }
@@ -605,6 +635,60 @@ fn optional_string(config: &Table, env_key: &str, toml_path: &str) -> Option<Str
     value_text(config, env_key, toml_path)
 }
 
+fn load_spoe(config: &Table) -> Result<Option<SpoeConfig>> {
+    let Some(socket) =
+        optional_string(config, "FAREWARD_SPOE_SOCKET", "spoe.socket").filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+    let routes_file = optional_string(config, "FAREWARD_ROUTES_FILE", "fareward.routes_file")
+        .filter(|path| !path.is_empty())
+        .context("[spoe].socket is set, so [fareward].routes_file must name the route table")?;
+    let shadow = match optional_string(config, "FAREWARD_SPOE_MODE", "spoe.mode").as_deref() {
+        None | Some("shadow") => true,
+        Some("enforce") => false,
+        Some(other) => bail!("spoe.mode must be \"shadow\" or \"enforce\", not {other:?}"),
+    };
+    let positive = |value: Option<usize>, default: usize, name: &str| -> Result<usize> {
+        let value = value.unwrap_or(default);
+        if value == 0 {
+            bail!("{name} must be positive");
+        }
+        Ok(value)
+    };
+    let max_frame_size = optional_u64(config, "FAREWARD_SPOE_MAX_FRAME_SIZE", "spoe.max_frame_size")?
+        .unwrap_or(16_384);
+    // HAProxy's own floor and its tune.bufsize ceiling; outside them the handshake cannot agree.
+    if !(256..=1_048_576).contains(&max_frame_size) {
+        bail!("spoe.max_frame_size must be between 256 and 1048576");
+    }
+    Ok(Some(SpoeConfig {
+        socket_path: PathBuf::from(socket),
+        routes_file: PathBuf::from(routes_file),
+        routes_poll: Duration::from_millis(
+            optional_u64(config, "FAREWARD_SPOE_ROUTES_POLL_MS", "spoe.routes_poll_ms")?
+                .unwrap_or(2_000)
+                .max(100),
+        ),
+        shadow,
+        max_connections: positive(
+            optional_usize(config, "FAREWARD_SPOE_MAX_CONNECTIONS", "spoe.max_connections")?,
+            64,
+            "spoe.max_connections",
+        )?,
+        max_inflight_per_connection: positive(
+            optional_usize(
+                config,
+                "FAREWARD_SPOE_MAX_INFLIGHT",
+                "spoe.max_inflight_per_connection",
+            )?,
+            256,
+            "spoe.max_inflight_per_connection",
+        )?,
+        max_frame_size: max_frame_size as u32,
+    }))
+}
+
 /// Absent reads as false, and "1" is accepted next to "true" so an environment override can be
 /// written either way.
 fn optional_bool(config: &Table, env_key: &str, toml_path: &str) -> bool {
@@ -745,6 +829,7 @@ mod tests {
             },
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 100,
+            disable_user_limit: false,
         };
 
         assert!(validate_policy(policy).is_err());
@@ -767,6 +852,7 @@ mod tests {
             user: scope,
             company_extra_daily_cpu: i64::MAX as u64 + 1,
             user_daily_share_pct: 100,
+            disable_user_limit: false,
         };
         assert!(validate_policy(policy).is_err());
 
@@ -792,6 +878,7 @@ mod tests {
             user: scope,
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 80,
+            disable_user_limit: false,
         };
         assert!(validate_policy(policy).is_ok());
         // Zero refuses every user of a company that still has credit; past 100 the gate can never be

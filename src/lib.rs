@@ -10,6 +10,8 @@ pub mod database;
 pub mod limiter;
 pub mod lock;
 pub mod reqlog;
+pub mod routes;
 pub mod service;
 pub mod siphash;
+pub mod spoe;
 pub mod sysmetrics;

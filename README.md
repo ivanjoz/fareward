@@ -8,6 +8,7 @@ One Rust process hosting four server-side services over two transports:
 | Lock service | Raw TCP, same port | `fareward` | Serializes an action across concurrent Lambdas. |
 | Request log | Raw TCP, same port | `fareward` | One row per finished request, plus the code lines that failed. |
 | SSE bridge | HTTP (TLS via Nginx) | `sse_bridge.port` (default `14012`) | Relays agent events between a backend and browser tabs, authenticating both ends. |
+| HAProxy edge agent (optional) | SPOP 2.0, Unix socket | `spoe.socket` | The access gate and credit limiter above, asked by HAProxy on the request headers before the body is read. See [HAProxy edge agent](#haproxy-edge-agent-spoe). |
 
 The limiter, the lock and the request log share the port, the connection, and the handshake —
 nothing else. Each opcode owns its own payload and its own module. That shared port is why its
@@ -68,7 +69,7 @@ one row (the budget's entitlement and usage halves) never overwrite each other.
 | Table | Access | Used for |
 |---|---|---|
 | `users` | read | `accesos_computed`, `status` — the grant cache behind `CHARGE_CREDITS` |
-| `credit_usage_company`, `credit_usage_user` | read + write | the quota windows, loaded at cold start |
+| `credit_usage_company`, `credit_usage_user` | read + write | the quota windows, loaded at cold start. `credit_usage_company` also carries three refusal counters, `rejected_10s`, `rejected_1h` and `rejected_no_funds` (nullable integers, **added to** by each flush rather than replaced) |
 | `company_credit_budget` | read + write | the extra-credit pool, its ceiling and the activated month |
 | `user_logs`, `request_errors` | write | the request log |
 | `server_metrics` | write | the metrics collector |
@@ -180,6 +181,9 @@ src/
 ├── lock/        # opcodes 0x02/0x03: registry.rs (sharded key mutexes), protocol
 ├── reqlog/      # opcode 0x04: protocol (the one variable-length payload), errors
 │                # (ten-minute write suppression), writer (batching, fails open)
+├── routes/      # the route table the backend generates: table (parse, lookup, tariff,
+│                # admission), watch (hot reload on change, keeps the old table on error)
+├── spoe/        # the HAProxy agent: codec (SPOP 2.0 frames), agent (the gate, replayed)
 ├── sysmetrics/  # no opcode: samples the machine once a second and writes the peak
 │                # of each five-second window to server_metrics. collector (/proc +
 │                # cgroup v2), writer (the tick loop and the insert)
@@ -240,6 +244,18 @@ the reference material it ties together.
 - Derives each user's daily allowance as `rate_limit.user_daily_share_pct` of its company's CPU and
   inference allowances. Below 100 a single-user company cannot reach the rest of what it bought,
   which is the trade the key exists to let you make.
+- With `rate_limit.disable_user_limit = true`, limits by company only: no per-user gate, state or
+  cold load. Each company is one customer who creates its own users, so the per-user rows stay as
+  accounting only, and since nothing loads them before a charge, the flush reads the stored row and
+  adds to it instead of replacing it.
+- Once a company gate refuses, **blocks the whole company** until that gate can reopen (the burst
+  bucket refills, the clock hour turns, the business day turns, or the budget changes) and answers
+  its requests without taking the limiter's lock, so an abuser cannot slow the other companies. A
+  request that charges nothing is never blocked, and a marked read still reaches the extra pool while
+  the pool has credit. Never by IP: an IP can be shared by many customers.
+- Counts every company refusal by cause, in the five-minute frame and in the day: `rejected_10s` and
+  `rejected_1h` (abuse) and `rejected_no_funds` (day, month or an extra pool that could not pay).
+  Counts only, not a request log.
 - Requires an explicitly activated current month; a new one stays blocked until `SET_CURRENT`. The
   month is the **local business month** (UTC-5), the same boundary the daily frames use — not the UTC
   month.
@@ -252,6 +268,58 @@ the reference material it ties together.
 
 Version one must run as a single active process. Two instances would have independent in-memory
 quota state and must not write the same absolute rows.
+
+## HAProxy edge agent (SPOE)
+
+Optional, and off unless `spoe.socket` is set. HAProxy (3.1 or later: SPOP 2.0) asks the agent once
+per request, on the headers, before the body is read. The agent replays the backend's gate with the
+same limiter the TCP port charges through: route, session token, route policy, then access and
+credits. A refused request never reaches the backend, and its body is never read. The design and its
+decisions are in [plans/plan.md](plans/plan.md); the HAProxy side is in
+[`deploy/haproxy/`](deploy/haproxy/).
+
+**The route table.** The backend writes it at startup to `[fareward].routes_file`, a TOML file with
+one row per served route: method, exact path, `route_id`, the packed access slots, `base_credits` and
+`step_credits` (0 = not charged), and `public`, `saas_only` or `deny` where they apply. A `[policy]`
+section carries the API prefixes, the SaaS company, the access-exempt user and the operator company;
+`[tariff.<METHOD>]` carries the size steps. **A route not in the table is refused.** The file is
+polled every `spoe.routes_poll_ms`; a changed file is validated whole and swapped in, and an invalid
+one keeps the previous table. A missing or invalid table at startup fails the start.
+
+**The verdict** is left in transaction variables, `txn.fw.*`:
+
+| Variable | Meaning |
+|---|---|
+| `status` | `0` go on; otherwise the HTTP status to answer (the backend's own: 400, 401, 403, 429, 500, 503; plus 411 for a charged write without Content-Length and 413 for a write whose charge overflows) |
+| `reason` | for the access log: `public`, `session`, `granted`, `operator`, `token`, `route`, `policy`, `no-access`, `identity`, `credit`, `unavailable` |
+| `company`, `user`, `route` | who was admitted, for which route |
+| `grant` | the granted slots and sub-accesses, the TCP reply's tail: `[mask][has_subs][len][bytes]` |
+
+On an admitted request HAProxy forwards these as `x-fareward-admitted`, `-company`, `-user`, `-route`
+and `-grant` (hex), after deleting any the client sent. A backend with
+`[fareward].trust_edge_headers = true` takes them from a loopback peer instead of charging again; it
+still charges a GET's response top-up itself, streams included.
+
+**Modes.** `spoe.mode = "shadow"` (the default) evaluates without charging and without blocking, so
+the access log can be compared with the backend's decisions before anything depends on it.
+`"enforce"` charges, and HAProxy refuses on the verdict. HAProxy's own mode (`FAREWARD_ENFORCE` in
+the reference config) must match. Any agent failure fails closed: a 503.
+
+```toml
+[fareward]
+routes_file = "/var/lib/genix/fareward-routes.toml"   # written by the backend, read here
+
+[spoe]
+socket                      = "/run/fareward/spoe.sock"
+mode                        = "shadow"   # or "enforce"
+routes_poll_ms              = 2000       # minimum 100
+max_connections             = 64
+max_inflight_per_connection = 256
+max_frame_size              = 16384      # 256 to 1048576
+```
+
+Under SELinux, a confined or containerized HAProxy cannot connect to a socket an unconfined daemon
+created: every request then fails closed with `txn.fw.error` set while the agent sees no connection.
 
 ## Configuration
 
@@ -294,6 +362,10 @@ user_cpu_10s          = 1000
 user_inference_10s    = 500
 user_cpu_1h           = 20000
 user_inference_1h     = 5000
+
+# Optional. true limits by company only: the user_* ceilings and user_daily_share_pct stop
+# applying (they are still required and validated). Default false.
+disable_user_limit    = false
 ```
 
 The eight burst/hour ceilings are the only settings here with no built-in default: a guessed quota
