@@ -71,6 +71,8 @@ pub struct DatabaseConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// [mariadb].socket: the server's Unix socket, dialed instead of host:port when it is set.
+    pub socket: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +357,8 @@ impl AppConfig {
                 database: required_string(&config, "DB_NAME", "db.name")?,
                 user: required_string(&config, "MARIADB_USER", "mariadb.user")?,
                 password: required_string(&config, "MARIADB_PASSWORD", "mariadb.password")?,
+                socket: optional_string(&config, "MARIADB_SOCKET", "mariadb.socket")
+                    .filter(|socket| !socket.is_empty()),
             },
             policy,
             locks,

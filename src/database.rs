@@ -18,6 +18,7 @@ pub async fn connect_pool(config: &DatabaseConfig) -> Result<Pool> {
     let options = OptsBuilder::default()
         .ip_or_hostname(config.host.clone())
         .tcp_port(config.port)
+        .socket(config.socket.clone())
         .user(Some(config.user.clone()))
         .pass(Some(config.password.clone()))
         .db_name(Some(config.database.clone()))
@@ -25,9 +26,13 @@ pub async fn connect_pool(config: &DatabaseConfig) -> Result<Pool> {
         .pool_opts(PoolOpts::default().with_constraints(constraints));
     let pool = Pool::new(options);
     let mut connection = pool.get_conn().await.with_context(|| {
+        let address = match &config.socket {
+            Some(socket) => socket.clone(),
+            None => format!("{}:{}", config.host, config.port),
+        };
         format!(
-            "failed to connect to MariaDB {}:{} database {}",
-            config.host, config.port, config.database
+            "failed to connect to MariaDB {address} database {}",
+            config.database
         )
     })?;
     connection
