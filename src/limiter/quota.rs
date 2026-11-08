@@ -24,7 +24,58 @@ use crate::limiter::{
 };
 
 const PLATFORM_AGGREGATE_COMPANY_ID: i32 = 0;
-const TOKEN_PERIOD: Duration = Duration::from_secs(10);
+
+/// The two rate-limit windows every scope is judged on, from `[rate_limit]`. Always two: a short
+/// token bucket against bursts and a long fixed clock window against sustained load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Windows {
+    /// `short_window_seconds`: the bucket's period. `short` credits refill over this many seconds,
+    /// continuously.
+    pub short_seconds: u64,
+    /// `long_window_minutes`: a fixed clock window, aligned to the Unix epoch (with 10, the
+    /// windows start at :00, :10, :20…). A multiple of five minutes, because a restart recovers it
+    /// by summing the five-minute usage rows.
+    pub long_minutes: u64,
+}
+
+impl Default for Windows {
+    /// Ten seconds and one hour: the windows the daemon had before they were configurable.
+    fn default() -> Self {
+        Self {
+            short_seconds: 10,
+            long_minutes: 60,
+        }
+    }
+}
+
+impl Windows {
+    pub fn short(&self) -> Duration {
+        Duration::from_secs(self.short_seconds)
+    }
+
+    pub fn long_seconds(&self) -> i64 {
+        i64::try_from(self.long_minutes.saturating_mul(60)).unwrap_or(i64::MAX)
+    }
+
+    /// The window as the 429 page words it: "en los últimos 10 segundos", "… 10 minutos",
+    /// "en la última hora".
+    pub fn describe(&self, window: Window) -> String {
+        let seconds = match window {
+            Window::Short => self.short_seconds,
+            Window::Long => self.long_minutes.saturating_mul(60),
+            Window::Day => return "hoy".into(),
+            Window::Month => return "este mes".into(),
+        };
+        match seconds {
+            1 => "en el último segundo".into(),
+            60 => "en el último minuto".into(),
+            3_600 => "en la última hora".into(),
+            seconds if seconds % 3_600 == 0 => format!("en las últimas {} horas", seconds / 3_600),
+            seconds if seconds % 60 == 0 => format!("en los últimos {} minutos", seconds / 60),
+            seconds => format!("en los últimos {seconds} segundos"),
+        }
+    }
+}
 
 /// What one frame was answered with.
 ///
@@ -41,10 +92,36 @@ pub enum Decision {
     AccessDenied(AccessDenial),
 }
 
+/// The figures a client is shown about its own consumption (the SPOE agent's `x-fareward-usage`
+/// header), read under the same shard lock as the verdict. CPU only: it is the dimension every
+/// route charges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageReport {
+    /// CPU credits the user may still spend today. `None` when users are not limited apart
+    /// (`disable_user_limit`), or when the verdict came from the block cache, which knows only the
+    /// company.
+    pub user_day_left: Option<u64>,
+    /// CPU credits the company may still spend today, out of its daily entitlement.
+    pub company_day_left: u64,
+    /// CPU credits the company has spent in the short-window bucket: what has not refilled yet.
+    pub company_short_used: u64,
+    /// CPU credits the company has spent in the current long window.
+    pub company_long_used: u64,
+    /// Set only on a refusal answered by the block cache (plan D9): how many requests the block has
+    /// refused, counting the one whose refusal created it. The other figures are then the ones the
+    /// block was created on.
+    pub blocked: Option<u32>,
+    /// On a credit refusal: CPU credits spent in the window that refused (the burst bucket, the
+    /// hour, the day or the month, of the scope that refused). Zero otherwise.
+    pub window_used: u64,
+    /// On a credit refusal: seconds to wait before the refusing gate can reopen, with a margin.
+    pub retry_after: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CreditLimits {
-    pub ten_seconds: u64,
-    pub hour: u64,
+    pub short: u64,
+    pub long: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +160,9 @@ pub struct LimitPolicy {
     /// loads them before the charge any more, the flush adds the stored row in
     /// (`UsageRecord::unseeded`).
     pub disable_user_limit: bool,
+    /// How long the short and the long window last. `CreditLimits::short` and `long` are credits
+    /// per window.
+    pub windows: Windows,
 }
 
 impl LimitPolicy {
@@ -102,18 +182,32 @@ fn daily_share(company_daily: u64, percent: u64) -> u64 {
     u64::try_from(u128::from(company_daily) * u128::from(percent) / 100).unwrap_or(u64::MAX)
 }
 
+/// `limit` credits per `period`, refilled continuously. Tokens are kept scaled by the period in
+/// nanoseconds, so a refill of `elapsed × limit` is exact integer arithmetic.
 #[derive(Debug)]
 struct TokenBucket {
     scaled_tokens: u128,
     last_refill: Instant,
+    period: Duration,
 }
 
 impl TokenBucket {
-    fn full(limit: u64, now: Instant) -> Self {
-        Self {
-            scaled_tokens: capacity(limit),
+    fn full(limit: u64, period: Duration, now: Instant) -> Self {
+        let mut bucket = Self {
+            scaled_tokens: 0,
             last_refill: now,
-        }
+            period,
+        };
+        bucket.scaled_tokens = bucket.capacity(limit);
+        bucket
+    }
+
+    fn capacity(&self, limit: u64) -> u128 {
+        u128::from(limit) * self.period.as_nanos()
+    }
+
+    fn scaled(&self, credits: u64) -> u128 {
+        u128::from(credits) * self.period.as_nanos()
     }
 
     fn refill(&mut self, limit: u64, now: Instant) {
@@ -122,47 +216,51 @@ impl TokenBucket {
         self.scaled_tokens = self
             .scaled_tokens
             .saturating_add(refill)
-            .min(capacity(limit));
+            .min(self.capacity(limit));
         self.last_refill = now;
     }
 
     fn can_charge(&self, credits: u64) -> bool {
-        self.scaled_tokens >= u128::from(credits) * TOKEN_PERIOD.as_nanos()
+        self.scaled_tokens >= self.scaled(credits)
     }
 
     fn charge(&mut self, credits: u64) {
-        self.scaled_tokens -= u128::from(credits) * TOKEN_PERIOD.as_nanos();
+        self.scaled_tokens -= self.scaled(credits);
+    }
+
+    /// Credits taken and not refilled yet, rounded up. Valid right after a refill.
+    fn used(&self, limit: u64) -> u64 {
+        let used = self.capacity(limit).saturating_sub(self.scaled_tokens);
+        u64::try_from(used.div_ceil(self.period.as_nanos())).unwrap_or(u64::MAX)
     }
 
     /// How long until `credits` fit, counted from the last refill. A charge larger than the whole
     /// bucket never fits; it waits one full period and is judged again.
     fn wait_for(&self, credits: u64, limit: u64) -> Duration {
-        let needed = u128::from(credits) * TOKEN_PERIOD.as_nanos();
+        let needed = self.scaled(credits);
         if needed <= self.scaled_tokens {
             return Duration::ZERO;
         }
-        if limit == 0 || needed > capacity(limit) {
-            return TOKEN_PERIOD;
+        if limit == 0 || needed > self.capacity(limit) {
+            return self.period;
         }
         let nanos = (needed - self.scaled_tokens).div_ceil(u128::from(limit));
         Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 }
 
-fn capacity(limit: u64) -> u128 {
-    u128::from(limit) * TOKEN_PERIOD.as_nanos()
-}
-
 #[derive(Debug)]
 struct SubjectState {
     cpu_bucket: TokenBucket,
     inference_bucket: TokenBucket,
-    hour_period: i64,
+    /// The long window's length; `long_period` is the Unix time divided by it.
+    long_seconds: i64,
+    long_period: i64,
     // The local business UnixDay, not the UTC one: this counter is seeded from the daily usage row,
     // which is bucketed by `time_frame::daily`, so counting it on any other day would both reset the
     // daily cap five hours early and reseed it from a window it does not cover.
     day_period: i64,
-    hour_used: Credits,
+    long_used: Credits,
     day_used: Credits,
 }
 
@@ -312,18 +410,21 @@ impl CompanyBudgetState {
 impl SubjectState {
     fn recovered(
         limits: ScopeLimits,
+        windows: Windows,
         unix_seconds: i64,
         day_period: i64,
         now: Instant,
-        hour_used: Credits,
+        long_used: Credits,
         day_used: Credits,
     ) -> Self {
+        let long_seconds = windows.long_seconds();
         Self {
-            cpu_bucket: TokenBucket::full(limits.cpu.ten_seconds, now),
-            inference_bucket: TokenBucket::full(limits.inference.ten_seconds, now),
-            hour_period: unix_seconds / 3_600,
+            cpu_bucket: TokenBucket::full(limits.cpu.short, windows.short(), now),
+            inference_bucket: TokenBucket::full(limits.inference.short, windows.short(), now),
+            long_seconds,
+            long_period: unix_seconds / long_seconds,
             day_period,
-            hour_used,
+            long_used,
             day_used,
         }
     }
@@ -332,10 +433,10 @@ impl SubjectState {
     /// when the refills were last brought up to `now`.
     fn burst_wait(&self, limits: ScopeLimits, requested: Credits) -> Duration {
         self.cpu_bucket
-            .wait_for(requested.cpu, limits.cpu.ten_seconds)
+            .wait_for(requested.cpu, limits.cpu.short)
             .max(
                 self.inference_bucket
-                    .wait_for(requested.inference, limits.inference.ten_seconds),
+                    .wait_for(requested.inference, limits.inference.short),
             )
     }
 
@@ -346,13 +447,12 @@ impl SubjectState {
         day_period: i64,
         now: Instant,
     ) {
-        self.cpu_bucket.refill(limits.cpu.ten_seconds, now);
-        self.inference_bucket
-            .refill(limits.inference.ten_seconds, now);
-        let hour_period = unix_seconds / 3_600;
-        if self.hour_period != hour_period {
-            self.hour_period = hour_period;
-            self.hour_used = Credits::default();
+        self.cpu_bucket.refill(limits.cpu.short, now);
+        self.inference_bucket.refill(limits.inference.short, now);
+        let long_period = unix_seconds / self.long_seconds;
+        if self.long_period != long_period {
+            self.long_period = long_period;
+            self.long_used = Credits::default();
         }
         if self.day_period != day_period {
             self.day_period = day_period;
@@ -368,16 +468,16 @@ impl SubjectState {
         requested: Credits,
     ) -> Option<LimitViolation> {
         let (cpu, inference) = match window {
-            Window::TenSeconds => (
+            Window::Short => (
                 !self.cpu_bucket.can_charge(requested.cpu),
                 !self.inference_bucket.can_charge(requested.inference),
             ),
-            Window::Hour => (
-                exceeds(self.hour_used.cpu, requested.cpu, limits.cpu.hour),
+            Window::Long => (
+                exceeds(self.long_used.cpu, requested.cpu, limits.cpu.long),
                 exceeds(
-                    self.hour_used.inference,
+                    self.long_used.inference,
                     requested.inference,
-                    limits.inference.hour,
+                    limits.inference.long,
                 ),
             ),
             // Daily/monthly entitlement belongs to the company budget, not static policy.
@@ -393,7 +493,7 @@ impl SubjectState {
 
     /// `count_daily` is false only for a charge paid out of the extra daily pool.
     ///
-    /// The buckets and the hourly counter are charged either way, and that is not an oversight: they
+    /// The buckets and the long-window counter are charged either way, and that is not an oversight: they
     /// are rate limits protecting the machine, so a tenant spending its extra allowance must still
     /// queue behind them. Skipping them would give a company in read-only mode unlimited burst.
     /// `day_used` is different — it is the meter the entitlement gates judge, and extra spending is
@@ -401,8 +501,8 @@ impl SubjectState {
     fn charge(&mut self, requested: Credits, count_daily: bool) -> Result<()> {
         self.cpu_bucket.charge(requested.cpu);
         self.inference_bucket.charge(requested.inference);
-        self.hour_used = self
-            .hour_used
+        self.long_used = self
+            .long_used
             .checked_add(requested)
             .ok_or_else(|| anyhow!("hour usage overflowed uint64"))?;
         if count_daily {
@@ -489,9 +589,25 @@ impl RateLimiter {
         }
     }
 
+    /// How long the short and the long window last, for whoever words a refusal.
+    pub fn windows(&self) -> Windows {
+        self.policy.windows
+    }
+
     pub async fn admit(&self, request: Request) -> Result<Decision> {
         let unix_seconds = current_unix_seconds()?;
         self.admit_at(request, unix_seconds, Instant::now()).await
+    }
+
+    /// `admit`, plus the figures the SPOE agent shows the client. The report is `None` when the
+    /// verdict came before any quota state was read: an authorization refusal.
+    pub async fn admit_reported(
+        &self,
+        request: Request,
+    ) -> Result<(Decision, Option<UsageReport>)> {
+        let unix_seconds = current_unix_seconds()?;
+        self.judge(request, unix_seconds, Instant::now(), false)
+            .await
     }
 
     /// The verdict `admit` would give, without acting on it: nothing is charged, no row is dirtied,
@@ -523,13 +639,23 @@ impl RateLimiter {
         now: Instant,
         dry_run: bool,
     ) -> Result<Decision> {
+        Ok(self.judge(request, unix_seconds, now, dry_run).await?.0)
+    }
+
+    async fn judge(
+        &self,
+        request: Request,
+        unix_seconds: i64,
+        now: Instant,
+        dry_run: bool,
+    ) -> Result<(Decision, Option<UsageReport>)> {
         let blocked = if dry_run {
             self.blocks.peek(&request, unix_seconds, now)
         } else {
             self.blocks.check(&request, unix_seconds, now)
         };
-        if let Some(violation) = blocked {
-            return Ok(Decision::CreditViolation(violation));
+        if let Some((violation, report)) = blocked {
+            return Ok((Decision::CreditViolation(violation), Some(report)));
         }
         let shard_index = request.company_id as usize % self.shards.len();
         let mut shard = self.shards[shard_index].lock().await;
@@ -561,7 +687,7 @@ impl RateLimiter {
                         ?denial,
                         "authorization refused"
                     );
-                    return Ok(Decision::AccessDenied(denial));
+                    return Ok((Decision::AccessDenied(denial), None));
                 }
             }
         }
@@ -624,7 +750,7 @@ impl RateLimiter {
         budget.refresh_day(current_day_period);
 
         // Shortest window and company scope win, matching the documented response priority.
-        for window in [Window::TenSeconds, Window::Hour] {
+        for window in [Window::Short, Window::Long] {
             let company = shard
                 .subjects
                 .get(&company_key)
@@ -632,10 +758,19 @@ impl RateLimiter {
             if let Some(violation) =
                 company.violation(Scope::Company, window, self.policy.company, request.credits)
             {
+                let report = self.refused_report(&shard, &request, violation, unix_seconds, now);
                 if !dry_run {
-                    self.block_company(&request, violation, company, true, unix_seconds, now);
+                    self.block_company(
+                        &request,
+                        violation,
+                        company,
+                        report,
+                        true,
+                        unix_seconds,
+                        now,
+                    );
                 }
-                return Ok(Decision::CreditViolation(violation));
+                return Ok((Decision::CreditViolation(violation), Some(report)));
             }
             if user_limited {
                 let user = shard
@@ -645,7 +780,9 @@ impl RateLimiter {
                 if let Some(violation) =
                     user.violation(Scope::User, window, self.policy.user, request.credits)
                 {
-                    return Ok(Decision::CreditViolation(violation));
+                    let report =
+                        self.refused_report(&shard, &request, violation, unix_seconds, now);
+                    return Ok((Decision::CreditViolation(violation), Some(report)));
                 }
             }
         }
@@ -699,17 +836,27 @@ impl RateLimiter {
                 // Marked reads stay unblocked while the pool still has credit: a smaller one may fit.
                 let pool = self.policy.company_extra_daily_cpu;
                 let pool_spent = pool == 0 || budget.day_extra_used >= pool;
+                let report = self.refused_report(&shard, &request, violation, unix_seconds, now);
                 if !dry_run {
-                    self.block_company(&request, violation, company, pool_spent, unix_seconds, now);
+                    self.block_company(
+                        &request,
+                        violation,
+                        company,
+                        report,
+                        pool_spent,
+                        unix_seconds,
+                        now,
+                    );
                 }
-                return Ok(Decision::CreditViolation(violation));
+                return Ok((Decision::CreditViolation(violation), Some(report)));
             };
             extra_cpu = grant;
         }
         let paid_from_extra = extra_cpu > 0;
         // Every gate has answered; what follows only acts on the verdict.
         if dry_run {
-            return Ok(Decision::Allowed(access_verdict));
+            let report = self.usage_report(&shard, request.company_id, request.user_id);
+            return Ok((Decision::Allowed(access_verdict), Some(report)));
         }
 
         // Load the reserved absolute row before mutating accepted usage. A storage failure then
@@ -757,34 +904,109 @@ impl RateLimiter {
         // paid for out of the pool was served like any other.
         increment_usage(&mut shard.usage, request, unix_seconds, !user_limited)?;
         increment_platform_usage(&mut platform_usage, request, unix_seconds)?;
-        Ok(Decision::Allowed(access_verdict))
+        // After the charge, so the client sees what is left once this request is paid for.
+        let report = self.usage_report(&shard, request.company_id, request.user_id);
+        Ok((Decision::Allowed(access_verdict), Some(report)))
     }
 
-    /// Blocks the company until the gate that refused can reopen, and counts the refusal. A user
-    /// refusal blocks nothing and counts nothing: the block and the counters describe the company.
-    ///
-    /// `marked_reads_too` only matters for a day or month refusal: while the extra pool still has
-    /// credit, marked reads must keep reaching it. Burst and hourly refusals block them as well,
-    /// because the pool never relaxes a burst gate.
-    fn block_company(
+    /// The client's figures, read from the state the verdict was just reached on. Valid only after
+    /// `refresh_periods` and the budget's own refreshes, which bring the buckets and the counters up
+    /// to now.
+    fn usage_report(&self, shard: &ShardState, company_id: i32, user_id: i32) -> UsageReport {
+        let company = shard
+            .subjects
+            .get(&(company_id, COMPANY_AGGREGATE_USER_ID))
+            .expect("company state initialized");
+        let daily = shard
+            .budgets
+            .get(&company_id)
+            .expect("company budget initialized")
+            .stored
+            .daily;
+        let user_day_left = if self.policy.disable_user_limit {
+            None
+        } else {
+            shard.subjects.get(&(company_id, user_id)).map(|user| {
+                self.policy
+                    .user_daily(daily)
+                    .cpu
+                    .saturating_sub(user.day_used.cpu)
+            })
+        };
+        UsageReport {
+            user_day_left,
+            company_day_left: daily.cpu.saturating_sub(company.day_used.cpu),
+            company_short_used: company.cpu_bucket.used(self.policy.company.cpu.short),
+            company_long_used: company.long_used.cpu,
+            blocked: None,
+            window_used: 0,
+            retry_after: None,
+        }
+    }
+
+    /// `usage_report` for a credit refusal: the same figures plus what the refusing window had
+    /// spent and how long until its gate reopens, so the client is told why and when to retry.
+    fn refused_report(
         &self,
+        shard: &ShardState,
         request: &Request,
         violation: LimitViolation,
-        company: &SubjectState,
-        marked_reads_too: bool,
         unix_seconds: i64,
         now: Instant,
-    ) {
-        if violation.scope != Scope::Company {
-            return;
+    ) -> UsageReport {
+        let (subject_id, limits) = match violation.scope {
+            Scope::Company => (COMPANY_AGGREGATE_USER_ID, self.policy.company),
+            Scope::User => (request.user_id, self.policy.user),
+        };
+        let subject = shard
+            .subjects
+            .get(&(request.company_id, subject_id))
+            .expect("refusing subject initialized");
+        let window_used = match violation.window {
+            Window::Short => subject.cpu_bucket.used(limits.cpu.short),
+            Window::Long => subject.long_used.cpu,
+            Window::Day => subject.day_used.cpu,
+            Window::Month => {
+                shard
+                    .budgets
+                    .get(&request.company_id)
+                    .expect("company budget initialized")
+                    .month_used
+                    .cpu
+            }
+        };
+        let until = self.reopens(
+            violation.window,
+            subject,
+            limits,
+            request,
+            unix_seconds,
+            now,
+        );
+        UsageReport {
+            window_used,
+            retry_after: Some(until.retry_after(unix_seconds, now)),
+            ..self.usage_report(shard, request.company_id, request.user_id)
         }
-        let (until, marked_reads_too) = match violation.window {
-            Window::TenSeconds => (
-                Until::Monotonic(now + company.burst_wait(self.policy.company, request.credits)),
-                true,
-            ),
-            // The hourly counter is a fixed clock hour (`refresh_periods`), not a rolling one.
-            Window::Hour => (Until::UnixSeconds((unix_seconds / 3_600 + 1) * 3_600), true),
+    }
+
+    /// When the gate of `window` can admit `request` again, on the clock that gate runs on.
+    fn reopens(
+        &self,
+        window: Window,
+        subject: &SubjectState,
+        limits: ScopeLimits,
+        request: &Request,
+        unix_seconds: i64,
+        now: Instant,
+    ) -> Until {
+        match window {
+            Window::Short => Until::Monotonic(now + subject.burst_wait(limits, request.credits)),
+            // The long counter is a fixed clock window (`refresh_periods`), not a rolling one.
+            Window::Long => {
+                let length = subject.long_seconds;
+                Until::UnixSeconds((unix_seconds / length + 1) * length)
+            }
             // The month is re-judged every business day too: a block shorter than the verdict is
             // only ever conservative, and a budget mutation lifts it at once anyway.
             Window::Day | Window::Month => {
@@ -794,8 +1016,43 @@ impl RateLimiter {
                         (day + 1) * time_frame::DAY_SECONDS - time_frame::DAY_ZONE_OFFSET_SECONDS
                     })
                     .unwrap_or(unix_seconds);
-                (Until::UnixSeconds(next_day_start), marked_reads_too)
+                Until::UnixSeconds(next_day_start)
             }
+        }
+    }
+
+    /// Blocks the company until the gate that refused can reopen, and counts the refusal. A user
+    /// refusal blocks nothing and counts nothing: the block and the counters describe the company.
+    ///
+    /// `marked_reads_too` only matters for a day or month refusal: while the extra pool still has
+    /// credit, marked reads must keep reaching it. Short- and long-window refusals block them as well,
+    /// because the pool never relaxes a burst gate.
+    fn block_company(
+        &self,
+        request: &Request,
+        violation: LimitViolation,
+        company: &SubjectState,
+        report: UsageReport,
+        marked_reads_too: bool,
+        unix_seconds: i64,
+        now: Instant,
+    ) {
+        if violation.scope != Scope::Company {
+            return;
+        }
+        let until = self.reopens(
+            violation.window,
+            company,
+            self.policy.company,
+            request,
+            unix_seconds,
+            now,
+        );
+        // Short- and long-window refusals block marked reads as well, because the pool never relaxes
+        // them; a day or month block lets them through while the pool can still pay.
+        let marked_reads_too = match violation.window {
+            Window::Short | Window::Long => true,
+            Window::Day | Window::Month => marked_reads_too,
         };
         self.blocks.record(
             request.company_id,
@@ -803,6 +1060,12 @@ impl RateLimiter {
                 violation,
                 until,
                 applies_to_marked_reads: marked_reads_too,
+                // The block answers every user of the company, so it keeps only the company's
+                // figures: the user's belong to whoever happened to trigger it.
+                report: UsageReport {
+                    user_day_left: None,
+                    ..report
+                },
             },
             unix_seconds,
         );
@@ -1017,7 +1280,7 @@ impl RateLimiter {
     ///
     /// The ScyllaDB read happens while holding the shard mutex, which is head-of-line blocking for
     /// other callers in the same shard. That is worth saying out loud, but it is exactly what
-    /// `ensure_subject` already does for the daily and hourly usage rows: this adds a third awaited
+    /// `ensure_subject` already does for the daily and long-window usage rows: this adds a third awaited
     /// read to a path that already had two. `server.rs` spawns each charge onto its own task
     /// specifically so none of them block the frame reader.
     async fn ensure_access(
@@ -1091,19 +1354,20 @@ impl RateLimiter {
             decode_optional(daily_row.as_ref().map(|row| row.used_credits.as_slice()))?;
         merge_loaded(&mut shard.usage, daily_key, daily_routes.clone());
 
-        let (hour_start, hour_end) = time_frame::hour_five_minute_range(unix_seconds)?;
-        let hour_rows = self
+        let (long_start, long_end) =
+            time_frame::window_five_minute_range(unix_seconds, self.policy.windows.long_seconds())?;
+        let long_rows = self
             .store
-            .load_range(company_id, user_id, hour_start, hour_end)
+            .load_range(company_id, user_id, long_start, long_end)
             .await
-            .context("failed to initialize hourly usage")?;
-        let mut hour_used = Credits::default();
-        for row in hour_rows {
+            .context("failed to initialize long-window usage")?;
+        let mut long_used = Credits::default();
+        for row in long_rows {
             let routes = decode(&row.used_credits)
                 .with_context(|| format!("corrupt usage blob in time frame {}", row.time_frame))?;
-            hour_used = hour_used
+            long_used = long_used
                 .checked_add(sum(&routes)?)
-                .ok_or_else(|| anyhow!("recovered hour usage overflowed uint64"))?;
+                .ok_or_else(|| anyhow!("recovered long-window usage overflowed uint64"))?;
             merge_loaded(
                 &mut shard.usage,
                 UsageKey {
@@ -1131,18 +1395,19 @@ impl RateLimiter {
             (company_id, user_id),
             SubjectState::recovered(
                 limits,
+                self.policy.windows,
                 unix_seconds,
                 time_frame::local_unix_day(unix_seconds)?,
                 now,
-                hour_used,
+                long_used,
                 day_used,
             ),
         );
         debug!(
             company_id,
             user_id,
-            hour_cpu = hour_used.cpu,
-            hour_inference = hour_used.inference,
+            long_cpu = long_used.cpu,
+            long_inference = long_used.inference,
             day_cpu = day_used.cpu,
             day_inference = day_used.inference,
             "initialized quota state"
@@ -1170,12 +1435,13 @@ impl RateLimiter {
                     .filter_map(|(&key, record)| record.snapshot(key)),
             );
         }
+        // No early return when nothing is dirty: a company that is only being refused still has
+        // refusal counters to write, and the budget counters roll with the day.
         if snapshots.is_empty() {
-            debug!("usage flush skipped because no records are dirty");
-            return 0;
+            debug!("no usage record is dirty");
+        } else {
+            info!(dirty_records = snapshots.len(), "starting usage flush");
         }
-
-        info!(dirty_records = snapshots.len(), "starting usage flush");
         let mut written = 0;
         for snapshot in snapshots {
             match self.flush_snapshot(&snapshot).await {
@@ -1199,8 +1465,34 @@ impl RateLimiter {
         }
         written += self.flush_dirty_budget_usage().await;
         written += self.flush_rejections().await;
-        info!(written, "usage flush completed");
+        if written > 0 {
+            // One durable step for the whole flush rather than one per row.
+            if let Err(persist_error) = self.store.flush_completed().await {
+                error!(error = %persist_error, "usage flush written but not made durable");
+            }
+            info!(written, "usage flush completed");
+        }
         written
+    }
+
+    /// Stores pushed grants, then drops those users' cached ones, so the next charge reads what was
+    /// just stored. Stored first: a cache dropped before the write could reload the old grants.
+    pub async fn put_grants(&self, entries: Vec<crate::store::grants::GrantEntry>) -> Result<()> {
+        let users: Vec<(i32, i32)> = entries
+            .iter()
+            .map(|entry| (entry.company_id, entry.user_id))
+            .collect();
+        self.store.put_grants(entries).await?;
+        for (company_id, user_id) in users {
+            self.invalidate_access(company_id, user_id).await;
+        }
+        Ok(())
+    }
+
+    /// Answers a report query (opcode `0x09`) from the store. Reports read what was flushed, so
+    /// they lag the limiter by at most one flush interval.
+    pub async fn report(&self, query: crate::store::query::ReportQuery) -> Result<Vec<u8>> {
+        self.store.report(query).await
     }
 
     /// Adds the refusals counted since the last flush to the company rows. A failed write puts its
@@ -1671,12 +1963,12 @@ mod tests {
     fn test_policy(limit: u64) -> LimitPolicy {
         let limits = ScopeLimits {
             cpu: CreditLimits {
-                ten_seconds: limit,
-                hour: limit,
+                short: limit,
+                long: limit,
             },
             inference: CreditLimits {
-                ten_seconds: limit,
-                hour: limit,
+                short: limit,
+                long: limit,
             },
         };
         LimitPolicy {
@@ -1688,6 +1980,7 @@ mod tests {
             // below 100.
             user_daily_share_pct: 50,
             disable_user_limit: false,
+            windows: Windows::default(),
         }
     }
 
@@ -1844,7 +2137,7 @@ mod tests {
             .unwrap();
         match refused {
             Decision::CreditViolation(violation) => {
-                assert_eq!(violation.window, Window::TenSeconds);
+                assert_eq!(violation.window, Window::Short);
             }
             other => panic!("a burst gate was relaxed by the extra pool: {other:?}"),
         }
@@ -2228,15 +2521,15 @@ mod tests {
             .unwrap()
             .violation();
         assert_eq!(violation.scope, Scope::Company);
-        assert_eq!(violation.window, Window::TenSeconds);
+        assert_eq!(violation.window, Window::Short);
         assert!(violation.cpu);
         // The rejected second request must not create another dirty usage mutation. What it does
         // write is its refusal, counted in the five-minute frame and in the day: 6 + 2.
         assert_eq!(limiter.flush_dirty().await, 8);
         assert_eq!(limiter.flush_dirty().await, 0);
         let counted = Rejections {
-            burst: 1,
-            hour: 0,
+            short: 1,
+            long: 0,
             no_funds: 0,
         };
         let rejections = store.rejections.lock().unwrap();
@@ -2414,9 +2707,190 @@ mod tests {
         assert_eq!(violation.window, Window::Day);
     }
 
+    /// The usage header's figures: what each subject may still spend today once this request is paid
+    /// for, and what the company spent in the short and the long window. A refusal reports the state
+    /// it was judged on; the user's daily share (50 %) is what the user figure is measured against.
+    #[tokio::test]
+    async fn the_report_shows_what_is_left_after_the_charge() {
+        let store = Arc::new(MemoryStore::default());
+        let unix_seconds = 1_800_000_000;
+        store.put_budget(stored_budget(7, unix_seconds, 10, 100));
+        let limiter = RateLimiter::new(1, test_policy(1_000), store, 600);
+        let now = Instant::now();
+
+        let (decision, report) = limiter
+            .judge(read_request(2, false), unix_seconds, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, allowed());
+        assert_eq!(
+            report,
+            Some(UsageReport {
+                user_day_left: Some(3),
+                company_day_left: 8,
+                company_short_used: 2,
+                company_long_used: 2,
+                blocked: None,
+                window_used: 0,
+                retry_after: None,
+            })
+        );
+
+        limiter
+            .judge(read_request(2, false), unix_seconds, now, false)
+            .await
+            .unwrap();
+        let (decision, report) = limiter
+            .judge(read_request(2, false), unix_seconds, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision.violation().scope, Scope::User);
+        let report = report.unwrap();
+        assert_eq!(report.user_day_left, Some(1));
+        assert_eq!(report.company_day_left, 6);
+        assert_eq!(report.company_long_used, 4);
+        // The refusal names the window that refused (the user's day: four credits spent) and the
+        // wait until the next business day, which is never zero.
+        assert_eq!(report.window_used, 4);
+        assert!(report.retry_after.unwrap() > 1);
+
+        // With users not limited apart there is no user state, so no user figure.
+        let company_only = RateLimiter::new(
+            1,
+            company_only_policy(1_000),
+            Arc::new(MemoryStore::default()),
+            600,
+        );
+        let (_, report) = company_only
+            .judge(read_request(2, false), unix_seconds, now, false)
+            .await
+            .unwrap();
+        assert_eq!(report.unwrap().user_day_left, None);
+    }
+
+    fn windowed_limiter(short: u64, long: u64, windows: Windows) -> RateLimiter {
+        let store = Arc::new(MemoryStore::default());
+        store.put_budget(stored_budget(7, 1_800_000_000, 1_000_000, 1_000_000));
+        let limits = ScopeLimits {
+            cpu: CreditLimits { short, long },
+            inference: CreditLimits { short, long },
+        };
+        let policy = LimitPolicy {
+            company: limits,
+            user: limits,
+            windows,
+            ..test_policy(1_000)
+        };
+        RateLimiter::new(1, policy, store, 600)
+    }
+
+    /// A ten-minute long window: four credits fit, the fifth waits for the next ten-minute boundary,
+    /// and the boundary resets the counter.
+    #[tokio::test]
+    async fn a_ten_minute_long_window_reopens_on_its_boundary() {
+        let windows = Windows {
+            short_seconds: 10,
+            long_minutes: 10,
+        };
+        let limiter = windowed_limiter(1_000, 4, windows);
+        // On a ten-minute boundary, so the whole window lies ahead.
+        let start = 1_800_000_000;
+        assert_eq!(start % 600, 0);
+        let now = Instant::now();
+        for _ in 0..2 {
+            let (decision, _) = limiter
+                .judge(read_request(2, false), start, now, false)
+                .await
+                .unwrap();
+            assert_eq!(decision, allowed());
+        }
+        let (decision, report) = limiter
+            .judge(read_request(2, false), start + 30, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision.violation().window, Window::Long);
+        let report = report.unwrap();
+        assert_eq!(report.window_used, 4);
+        assert_eq!(report.retry_after, Some(600 - 30 + 1));
+
+        // Still inside the window, the block answers; one second past it, the counter is fresh.
+        assert!(matches!(
+            limiter
+                .judge(read_request(2, false), start + 599, now, false)
+                .await
+                .unwrap()
+                .0,
+            Decision::CreditViolation(_)
+        ));
+        let (decision, report) = limiter
+            .judge(read_request(2, false), start + 600, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, allowed());
+        assert_eq!(report.unwrap().company_long_used, 2);
+    }
+
+    /// A thirty-second short window: three credits refill over thirty seconds, one every ten.
+    #[tokio::test]
+    async fn the_short_window_refills_over_its_configured_period() {
+        let windows = Windows {
+            short_seconds: 30,
+            long_minutes: 60,
+        };
+        let limiter = windowed_limiter(3, 1_000, windows);
+        let unix_seconds = 1_800_000_000;
+        let now = Instant::now();
+        let (decision, _) = limiter
+            .judge(read_request(3, false), unix_seconds, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, allowed());
+        let (decision, report) = limiter
+            .judge(read_request(1, false), unix_seconds, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision.violation().window, Window::Short);
+        // One credit takes ten seconds to come back, plus the margin.
+        assert_eq!(report.unwrap().retry_after, Some(11));
+
+        let later = now + Duration::from_secs(10);
+        let (decision, _) = limiter
+            .judge(read_request(1, false), unix_seconds + 10, later, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, allowed());
+    }
+
+    #[test]
+    fn windows_are_worded_for_the_refusal_page() {
+        let windows = |short_seconds, long_minutes| Windows {
+            short_seconds,
+            long_minutes,
+        };
+        assert_eq!(
+            windows(10, 10).describe(Window::Short),
+            "en los últimos 10 segundos"
+        );
+        assert_eq!(
+            windows(10, 10).describe(Window::Long),
+            "en los últimos 10 minutos"
+        );
+        assert_eq!(
+            windows(60, 60).describe(Window::Short),
+            "en el último minuto"
+        );
+        assert_eq!(windows(10, 60).describe(Window::Long), "en la última hora");
+        assert_eq!(
+            windows(10, 120).describe(Window::Long),
+            "en las últimas 2 horas"
+        );
+        assert_eq!(windows(10, 60).describe(Window::Day), "hoy");
+    }
+
     fn company_only_policy(limit: u64) -> LimitPolicy {
         LimitPolicy {
             disable_user_limit: true,
+            windows: Windows::default(),
             ..test_policy(limit)
         }
     }
@@ -2522,7 +2996,7 @@ mod tests {
             allowed()
         );
         let refused = dry(1).await.unwrap().violation();
-        assert_eq!(refused.window, Window::TenSeconds);
+        assert_eq!(refused.window, Window::Short);
         assert_eq!(
             limiter
                 .blocks
@@ -2562,7 +3036,7 @@ mod tests {
         .unwrap()
         .violation();
         assert_eq!(blocked, first);
-        assert_eq!(blocked.window, Window::TenSeconds);
+        assert_eq!(blocked.window, Window::Short);
     }
 
     /// A day block lasts until the next business day, unless the budget changes: the figures it was

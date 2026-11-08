@@ -17,7 +17,7 @@ import (
 // sends it right after rewriting the column, so a revoked access stops working immediately instead
 // of at the end of the window.
 //
-// Unanswered, like the request log, and for the same kind of reason — the TTL already bounds the
+// Unanswered: the TTL already bounds the
 // damage if the frame is lost, so a user save must not wait on the daemon to acknowledge it. The
 // payload layout is mirrored in fareward/src/limiter/access.rs.
 

@@ -10,15 +10,15 @@ use std::{
 };
 
 use anyhow::Result;
-use colbin::Colbin;
 use async_trait::async_trait;
+use colbin::Colbin;
 use fareward::{
     limiter::{
         aggregation::UsageKey,
-        credits_blob::Credits,
         budget::BudgetMutationFrame,
+        credits_blob::Credits,
         protocol::ChargeFrame,
-        quota::{CreditLimits, LimitPolicy, RateLimiter, ScopeLimits},
+        quota::{CreditLimits, LimitPolicy, RateLimiter, ScopeLimits, Windows},
         storage::{
             LimiterStore, StoredBudget, StoredBudgetRow, StoredBudgetUsage, StoredUsage,
             StoredUserAccess,
@@ -29,7 +29,6 @@ use fareward::{
         protocol::{AcquireRequest, ReleaseRequest},
         registry::{LockLimits, LockRegistry},
     },
-    reqlog::writer::RequestLogSink,
     service::{auth::DOMAIN, protocol::ReplyShape, server},
     siphash::{SipHasher24, derive_key},
 };
@@ -106,8 +105,8 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let limits = CreditLimits {
-        ten_seconds: 1_000,
-        hour: 10_000,
+        short: 1_000,
+        long: 10_000,
     };
     let scope = ScopeLimits {
         cpu: limits,
@@ -123,6 +122,7 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
             // fixture out of the way.
             user_daily_share_pct: 100,
             disable_user_limit: false,
+            windows: Windows::default(),
         },
         Arc::new(EmptyStore),
         600,
@@ -141,9 +141,6 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
         None,
         limiter,
         locks,
-        // These tests drive locks and charges; request logs would be written to a database this
-        // harness does not have, so the sink accepts and discards.
-        RequestLogSink::disabled(),
         Arc::new(SECRET.to_vec()),
         frame_timeout,
         64,
@@ -371,6 +368,7 @@ fn outcome_code(shape: ReplyShape, body: &[u8]) -> u8 {
         // What 0xFF used to mean when it was a status rather than a shape.
         ReplyShape::Unavailable => 0xFF,
         ReplyShape::LockLost => panic!("a push is not an outcome"),
+        ReplyShape::Report => panic!("no lock answers with a report"),
     }
 }
 
@@ -453,7 +451,9 @@ async fn every_reply_names_its_own_shape() {
 
     // A refusal, from a second connection that cannot have the same key.
     let mut rival = Client::connect(&server).await;
-    rival.write_frame(0x02, &Client::acquire_payload(400, 0, 0, 15000)).await;
+    rival
+        .write_frame(0x02, &Client::acquire_payload(400, 0, 0, 15000))
+        .await;
     let (_, shape, body) = rival.read_reply().await;
     assert_eq!(shape, ReplyShape::LockRefused);
     assert_eq!(body, vec![1], "busy");

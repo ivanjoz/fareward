@@ -12,13 +12,12 @@ use anyhow::{Context, Result};
 use fareward::{
     bridge::{self, channel::ChannelRegistry, http::BridgeState},
     config::AppConfig,
-    database::connect_pool,
-    limiter::{quota::RateLimiter, storage::MariaLimiterStore},
+    limiter::quota::RateLimiter,
     lock::registry::LockRegistry,
-    reqlog::writer::{RequestLogSink, RequestLogWriter},
     routes::RouteTableHandle,
     service::server,
     spoe::{Agent, AgentLimits},
+    store::{FjallStore, limiter::StoreBackend},
     sysmetrics::writer::ServerMetricsWriter,
 };
 use tokio::{net::TcpListener, sync::watch, time::MissedTickBehavior};
@@ -34,12 +33,14 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AppConfig::load().context("fareward configuration is invalid")?;
-    // One pool shared by the limiter and both writers. Fails the start: the limiter must load the
-    // existing usage before admitting anything.
-    let pool = connect_pool(&config.database)
-        .await
-        .context("MariaDB connection failed")?;
-    let store = Arc::new(MariaLimiterStore::new(pool.clone()));
+    // Fareward's own store: usage, budgets and server metrics. Fails the start, because the limiter
+    // must load the existing usage before admitting anything.
+    let fjall_store = FjallStore::open(&config.store_path)?;
+    info!(path = %config.store_path.display(), "store opened");
+    let store = Arc::new(StoreBackend::new(
+        fjall_store.clone(),
+        Arc::new(fjall_store.clone()),
+    ));
     let limiter = Arc::new(RateLimiter::new(
         config.shard_count,
         config.policy,
@@ -64,25 +65,12 @@ async fn main() -> Result<()> {
     let internal_apikey = Arc::new(config.internal_apikey.clone());
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
 
-    // Fails open, unlike the limiter: a write that fails drops its rows rather than stopping the
-    // daemon. A missing log row is not worth stopping the limiter and the bridge for.
-    let request_logs = if config.request_log.enabled {
-        RequestLogWriter::new(pool.clone(), config.request_log.clone())
-            .spawn(shutdown_receiver.clone())
-    } else {
-        info!("request log writer disabled by configuration");
-        RequestLogSink::disabled()
-    };
-
-    // Fails open like the request log, and for a stronger reason: nothing calls into this task, so
-    // a metrics row that is never written costs a gap in a chart and nothing else. It is also the
+    // Fails open, unlike the limiter: nothing calls into this task, so a metrics row that is never written costs a gap in a chart and nothing else. It is also the
     // only task here that keeps running when the backend is a Lambda, which is the whole point of
     // sampling the machine from this process rather than from the backend.
     let metrics_task = if config.server_metrics.enabled {
-        // No fallible startup step: a daemon that starts before `fn-homologate` has created the
-        // table only drops rows until it exists.
         Some(
-            ServerMetricsWriter::new(pool.clone(), &config.server_metrics)
+            ServerMetricsWriter::new(Arc::new(fjall_store.clone()), &config.server_metrics)
                 .spawn(config.server_metrics.clone(), shutdown_receiver.clone()),
         )
     } else {
@@ -153,7 +141,6 @@ async fn main() -> Result<()> {
         unix_listener,
         limiter.clone(),
         locks,
-        request_logs,
         internal_apikey.clone(),
         config.frame_timeout,
         config.max_connections,
@@ -214,8 +201,5 @@ async fn main() -> Result<()> {
     }
     let written = limiter.flush_dirty().await;
     info!(written, "final usage flush finished");
-    if let Err(disconnect_error) = pool.disconnect().await {
-        error!(error = %disconnect_error, "MariaDB pool did not close cleanly");
-    }
     Ok(())
 }

@@ -238,8 +238,8 @@ A bounded refactor with no behavior change; the existing `MemoryStore` pattern c
 | Key | `company_id` | u32 BE | 4 |
 | Key | `time_frame` | i32 BE, sign flipped | 4 |
 | Value | `version` | u8 | 1 |
-| Value | `rejected_10s` | u32: requests refused by the company's 10-second gate (D9) | 4 |
-| Value | `rejected_1h` | u32: requests refused by the company's one-hour gate (D9) | 4 |
+| Value | `rejected_short` | u32: requests refused by the company's short-window gate (D9, D11) | 4 |
+| Value | `rejected_long` | u32: requests refused by the company's long-window gate (D9, D11) | 4 |
 | Value | `rejected_no_funds` | u32: requests refused for lack of credits, day or month (D9) | 4 |
 | Value | `used_credits` | the existing `credits_blob.rs` encoding, unchanged, to the end | variable |
 
@@ -365,6 +365,52 @@ Consequences:
 - **Order:** this goes after the SPOE work, or in parallel with it, but never mixed in the same
   change. Step 1 (ports) can start at any time; it does not depend on this decision.
 
+#### D7 as implemented (first step)
+
+Done:
+
+- **Ports.** `AccessSource` (the grants) and `MetricsSink` (server metrics) are their own traits.
+  `LimiterStore` keeps its shape; `StoreBackend` implements it over the fjall store and delegates
+  the grants to an `AccessSource`, which is now the store itself.
+- **The fjall store** (`src/store/`) with `usage_company`, `usage_user`, `budget`, `server_metrics`
+  and `meta`. Every value starts with a version byte; every key is big-endian with the sign flipped
+  (also the company id, which the plan had as unsigned). Each flush ends with one fsync.
+- **Reports, opcode `0x09`**, reply shape `0x0B` `[length:u32][body]`: company usage, user usage
+  (one user or all), every company's usage (a skip scan per company), budgets (one or all), server
+  metrics. Go client in `go/reports.go`, with a request vector pinned on both sides and an end-to-end
+  run of the Go client against the daemon.
+- **Genix reads all of it from Fareward**: the credits, budget, company report, server metrics and
+  observability panels (`config/fareward_reports.go`). The observability backfill exec was deleted:
+  Fareward writes the platform rows itself.
+- **Grants push, opcode `0x0A`** (`src/store/grants.rs`, `go/grants.go`): per user only the status
+  and the two blobs. A frame is validated whole (the blobs with `UserAccessState::from_row`), stored
+  in one batch, the users' cached grants dropped, then `Ack`. A deleted user is removed. Fareward no
+  longer reads `users`.
+- **Genix pushes** (`security/fareward_grants.go`): `SyncAllFarewardGrants` sends every user of
+  every company — in the background at a VPS start, and as `fn-sync-fareward-grants` — and every
+  save that used to invalidate now pushes that user (or the whole company), a missing user as
+  deleted.
+- **The request log moved to Genix.** Opcode `0x04` is retired (unassigned, like `0x07`/`0x08`);
+  `src/reqlog/`, `src/database.rs`, the `[mariadb]`/`db.name`/`[request_log]` settings and
+  `mysql_async` are gone, and so is `go/request_log.go`. Genix writes `user_logs` itself, into a
+  MyRocks table: compressed, written without the WAL, rows expired by a TTL instead of a purge.
+  **Fareward has no database dependency left** but its own store.
+
+Departures from the layout above:
+
+- Budget figures are **u64**, not u32: the panel and the load tests set entitlements past four
+  billion. The value is a fixed 111 bytes.
+- **No import from MariaDB**: the product is pre-alpha, so the store starts empty and the old tables
+  are left behind.
+
+Still to do:
+
+- **Genix cleanup:** the ORM still declares `credit_usage_company`, `credit_usage_user`,
+  `company_credit_budget` and `server_metrics`; nothing reads or writes them. Remove the
+  declarations with the controller generator. `fn-wipe-company-data` does not clear a company's
+  rows in Fareward: that needs a delete opcode.
+- **Retention** of the five-minute buckets (still kept forever) and the **backup** routine.
+
 ### D8. `disableUserLimit`: rate limit by company only
 
 **Why the company is the unit.** Genix is a free service where each `company_id` is one registered
@@ -417,13 +463,13 @@ customer.
 
 | Gate that refused | `blocked_until` |
 |---|---|
-| 10-second burst | When the bucket has refilled enough for the refused request (monotonic clock) |
-| One hour | The next clock hour: the hourly counter is a fixed clock hour, not a rolling one (wall clock) |
+| Short window (burst) | When the bucket has refilled enough for the refused request (monotonic clock) |
+| Long window | The next window boundary: the long counter is a fixed clock window, not a rolling one (wall clock); see D11 |
 | Day | The next Lima business day (wall clock), **or** a budget mutation for that company |
 | Month | Re-judged at the next Lima business day too (a shorter block is only conservative), **or** a budget mutation |
 
-The hour, day and month are calendar windows, so their blocks lift on the wall clock even when it is
-stepped; only the burst block runs on the monotonic clock.
+The long window, the day and the month are calendar windows, so their blocks lift on the wall clock
+even when it is stepped; only the short-window block runs on the monotonic clock.
 
 **Status:** D8 and D9 are implemented on the current MariaDB store (`src/limiter/block.rs`,
 `src/limiter/quota.rs`). The three counters need their columns in `credit_usage_company` (Genix
@@ -446,8 +492,8 @@ Rules:
 entry, so a blocked request increments them without the shard lock. Each counts refusals by the gate
 itself and by its block:
 
-- `rejected_10s`: the 10-second burst gate. A sign of **abuse**.
-- `rejected_1h`: the one-hour gate. A sign of **abuse**.
+- `rejected_short`: the short-window (burst) gate. A sign of **abuse**.
+- `rejected_long`: the long-window gate. A sign of **abuse**.
 - `rejected_no_funds`: the daily entitlement, the monthly ceiling, and a marked read the extra pool
   could not pay. A sign of **lack of credits**, not abuse: a commercial signal (the company needs a
   bigger budget), kept apart so it never inflates the abuse figures.
@@ -458,6 +504,101 @@ columns of its value (D7). Accumulated counts, not a request log.
 
 With `disable_user_limit` off, a `Scope::User` refusal neither blocks the company nor counts here:
 these counters describe the company.
+
+### D10. Usage header for the client: `x-fareward-usage`
+
+**Goal.** Tell the client, on every answer, what it has left and why it was refused, in one compact
+header it can parse.
+
+**Format.** Groups separated by `;`, values inside a group by `.`; a figure that is not known is
+left empty:
+
+```
+{user}.{user_day_left};{company}.{company_day_left};{short}.{long};{code}[;{blocked}]
+```
+
+| Field | Meaning |
+|---|---|
+| `user`, `company` | The verified identity; `0` when there is none (bad token, public route) |
+| `user_day_left` | CPU credits the user may still spend today (its share of the company's daily entitlement). Empty with `disable_user_limit` (D8) and on a block-cache refusal |
+| `company_day_left` | CPU credits the company may still spend today, out of its daily entitlement |
+| `short` | CPU credits the company spent in the short-window bucket (what has not refilled yet) |
+| `long` | CPU credits the company spent in the current long window |
+| `code` | 0 let through · 1 bad or missing token · 2 unknown or inactive user · 3 no access · 4 route or route policy · 5/6 company short/long window · 7/8 user short/long window · 9/10 company/user day · 11 month · 12 limiter unavailable |
+| `blocked` | Only on a refusal answered by the block cache (D9): requests that block has refused, counting the limiter refusal that created it |
+
+Examples: `42.1840;7.48200;31.902;0` (let through), `42.;7.48200;31.902;0` (company-only
+limiting), `0.;0.;.;1` (bad token), `42.;7.0;1000.9800;5;37` (blocked company).
+
+Decisions:
+
+- **Credits, not requests.** `short` and `long` are credits, as the limiter counts them; counting
+  requests would add state to every subject. Daily figures, because the daily entitlement is what
+  the customer pays for; CPU only, the dimension every route charges.
+- **Block cache.** It answers without the shard lock, so it shows the company's figures from the
+  moment the block was created (they barely move: a blocked company spends nothing) and its own
+  refusal count. That count is kept apart from the D9 counters: those are drained by every flush,
+  this one restarts only with a new block.
+- **After the charge.** An admitted request's figures already include its own pre-handler charge.
+  They never include the GET top-up, which the backend charges after the response leaves (D2): it
+  shows up on the next request.
+- **Enforce mode only.** In shadow mode the backend still decides and charges over TCP, so the
+  agent's figures and code would describe a verdict nobody gave: the agent does not set the
+  variable and HAProxy sends nothing.
+- **SPOE path only.** The TCP reply (`0x01`) does not change; Lambda never gets the header.
+
+**The 429 page.** A credit refusal also tells the client why and when to come back, in an inline HTML
+body and in the standard `Retry-After` header. The agent sets four more variables on every credit
+refusal: `window` (the window that refused, worded for the sentence from its configured length,
+D11), `spent` (credits spent in that
+window, of the scope that refused), `refused` (requests refused since the block began, this one
+counting; 1 when no block was created, as for a user refusal) and `retry` (seconds until the refusing
+gate reopens, rounded up, plus one second of margin). The wait is recomputed on every read from the
+block's `until`, so it shrinks while the block lasts. The page is one `lf-string` in `haproxy.cfg`,
+the same for every client; an API client that wants JSON can be given a second rule keyed on `Accept`.
+
+**As implemented.** The limiter returns the figures with the verdict (`RateLimiter::admit_reported`
+→ `UsageReport`, `src/limiter/quota.rs`), read under the same shard lock. A `Block` keeps the
+company's report and `CompanyGate` a refusal count per block (`src/limiter/block.rs`). The agent
+formats the header into `txn.fw.usage` (`Verdict::usage_header`, `src/spoe/agent.rs`). HAProxy adds
+it to every refusal that has a verdict (`hdr` on `deny`/`return`) and to the backend's response
+(`http-response set-header`). Verified end to end against HAProxy 3.2.
+
+### D11. Configurable rate-limit windows: short and long
+
+**Problem.** The two rate-limit windows were fixed in the code: a 10-second burst bucket and a
+one-hour clock window. A shorter long window (ten minutes) catches sustained abuse sooner without
+waiting for an hour to run out.
+
+**Decision.** Always exactly two windows, each with a configurable length:
+
+```toml
+[rate_limit]
+short_window_seconds = 10   # token bucket: credits refill continuously over this many seconds
+long_window_minutes  = 10   # fixed clock window, in steps of 5 minutes
+company_cpu_short = 2000    # credits per short window
+company_cpu_long  = 40000   # credits per long window
+```
+
+- **Two, not three.** A third window would need a new code in the TCP reply byte, whose two window
+  bits are all taken (short, long, day, month), and a new column in `usage_company`. With two, the
+  wire format, the stored layout and the header keep their shape; only the lengths change.
+- **Defaults keep the old behaviour:** absent lengths are 10 seconds and 60 minutes.
+- **The long window steps by five minutes** (and is at most a day, and longer than the short one).
+  A restart rebuilds it by summing the five-minute usage rows (`time_frame::window_five_minute_range`),
+  which is exact only when the window starts and ends on frame boundaries. It is aligned to the Unix
+  epoch: with 10, windows start at :00, :10, :20…
+- **Names by role, not length:** `_short`/`_long` for the limits, `rejected_short`/`rejected_long`
+  for the counters, `Window::Short`/`Window::Long` in the code, `Short`/`Long` in the Go client's
+  `Rejections`, and "short window"/"long window" in its `CreditLimitExceeded`. The old limit names
+  (`company_cpu_10s`, `_1h`, and their `RATE_LIMIT_*_10S`/`_1H` variables) are still read with a
+  warning, and the new name wins when both are set. The counters' byte layout is unchanged.
+- **The 429 page words the window from its length:** "en los últimos 10 segundos", "en los últimos
+  10 minutos", "en la última hora" (`Windows::describe`).
+
+**As implemented.** `Windows` in `LimitPolicy` (`src/limiter/quota.rs`): the bucket carries its
+period, the subject its long-window length. Loaded and validated in `src/config.rs`
+(`load_windows`, `validate_windows`).
 
 ### As implemented: where the code departs from D1–D5
 
@@ -491,7 +632,8 @@ Recorded here, as section 5 asks, so the decisions above stay readable as they w
 Status: phases 1–6 are implemented and tested (unit, integration over a real socket, and a real
 HAProxy 3.2 run). Phase 0's measurements (latency, body-not-read over HTTP/2 and HTTP/3, Cloudflare)
 and phase 7 (shadow on real traffic) need the production environment. D7 is not started: it is its
-own change, after this one is committed.
+own change, after this one is committed. Its first step is now implemented; see "D7 as
+implemented".
 
 ## 6. Phases
 

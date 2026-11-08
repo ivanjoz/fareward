@@ -21,16 +21,17 @@ use std::{
 
 use crate::limiter::{
     protocol::{LimitViolation, Request, Window},
+    quota::UsageReport,
     time_frame,
 };
 
 /// Refusals of one company in one time frame, by cause.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rejections {
-    /// The 10-second burst gate: a sign of abuse.
-    pub burst: u32,
-    /// The one-hour gate: a sign of abuse.
-    pub hour: u32,
+    /// The short-window (burst) gate: a sign of abuse.
+    pub short: u32,
+    /// The long-window gate: a sign of abuse.
+    pub long: u32,
     /// The daily entitlement, the monthly ceiling, and a marked read the extra pool could not pay:
     /// a lack of credits rather than abuse, kept apart so it never inflates the abuse figures.
     pub no_funds: u32,
@@ -39,16 +40,16 @@ pub struct Rejections {
 impl Rejections {
     fn count(&mut self, window: Window) {
         let counter = match window {
-            Window::TenSeconds => &mut self.burst,
-            Window::Hour => &mut self.hour,
+            Window::Short => &mut self.short,
+            Window::Long => &mut self.long,
             Window::Day | Window::Month => &mut self.no_funds,
         };
         *counter = counter.saturating_add(1);
     }
 
     pub fn add(&mut self, other: Rejections) {
-        self.burst = self.burst.saturating_add(other.burst);
-        self.hour = self.hour.saturating_add(other.hour);
+        self.short = self.short.saturating_add(other.short);
+        self.long = self.long.saturating_add(other.long);
         self.no_funds = self.no_funds.saturating_add(other.no_funds);
     }
 }
@@ -58,7 +59,7 @@ impl Rejections {
 pub enum Until {
     /// The burst bucket refills on the monotonic clock.
     Monotonic(Instant),
-    /// The hour, the day and the month are calendar windows: they turn over with the wall clock,
+    /// The long window, the day and the month are calendar windows: they turn over with the wall clock,
     /// including when it is stepped, so their blocks must too.
     UnixSeconds(i64),
 }
@@ -70,6 +71,16 @@ impl Until {
             Until::UnixSeconds(until) => unix_seconds >= until,
         }
     }
+
+    /// Seconds a client should wait before trying again: what is left, rounded up, plus one second
+    /// of margin so the retry does not land on the very instant the gate reopens.
+    pub fn retry_after(self, unix_seconds: i64, now: Instant) -> u64 {
+        let left = match self {
+            Until::Monotonic(until) => until.saturating_duration_since(now).as_secs_f64().ceil(),
+            Until::UnixSeconds(until) => (until - unix_seconds).max(0) as f64,
+        };
+        left as u64 + 1
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +91,10 @@ pub struct Block {
     /// False for a day or month block while the extra pool may still pay a marked read: those reads
     /// go through the limiter, which consults the pool.
     pub applies_to_marked_reads: bool,
+    /// The company's figures when the block was created, shown to every request it refuses (the
+    /// SPOE agent's usage header). Without the shard lock there is nothing fresher to read, and
+    /// while the company is blocked it spends nothing, so they barely move.
+    pub report: UsageReport,
 }
 
 impl Block {
@@ -98,6 +113,9 @@ struct CompanyGate {
     /// One slot per window, in `Window` order, so the shortest window answers first, as it does in
     /// the limiter.
     blocks: [Option<Block>; 4],
+    /// Requests each block has refused, counting the limiter refusal that created it. Reset by
+    /// `record`, unlike `pending`, which the flush drains: this one is shown to the client.
+    refused: [u32; 4],
     /// Refusals not yet flushed, by time frame: each one is counted in its five-minute frame and in
     /// its day, like the credits.
     pending: BTreeMap<i32, Rejections>,
@@ -113,6 +131,23 @@ impl CompanyGate {
         .flatten()
         {
             self.pending.entry(time_frame).or_default().count(window);
+        }
+    }
+
+    /// The slot of the first block that refuses `request`, shortest window first.
+    fn applying(&self, request: &Request, unix_seconds: i64, now: Instant) -> Option<usize> {
+        self.blocks
+            .iter()
+            .position(|block| block.is_some_and(|block| block.applies(request, unix_seconds, now)))
+    }
+
+    /// The block's figures with what changes while it lasts: the refusals so far and the wait left.
+    fn report(&self, index: usize, unix_seconds: i64, now: Instant) -> UsageReport {
+        let block = self.blocks[index].expect("an applying block exists");
+        UsageReport {
+            blocked: Some(self.refused[index]),
+            retry_after: Some(block.until.retry_after(unix_seconds, now)),
+            ..block.report
         }
     }
 
@@ -168,7 +203,7 @@ impl CompanyBlocks {
             .clone()
     }
 
-    /// The violation a blocked company gets, counted, or `None` when the request must go through the
+    /// The violation a blocked company gets and the figures shown with it, counted, or `None` when the request must go through the
     /// limiter. A request that charges nothing is never blocked: the credit panel's own reads are
     /// free precisely so a company out of credit can still see why.
     pub fn check(
@@ -176,20 +211,17 @@ impl CompanyBlocks {
         request: &Request,
         unix_seconds: i64,
         now: Instant,
-    ) -> Option<LimitViolation> {
+    ) -> Option<(LimitViolation, UsageReport)> {
         if request.credits.cpu == 0 && request.credits.inference == 0 {
             return None;
         }
         let gate = self.gate(request.company_id)?;
         let mut gate = gate.lock().unwrap_or_else(PoisonError::into_inner);
-        let violation = gate
-            .blocks
-            .iter()
-            .flatten()
-            .find(|block| block.applies(request, unix_seconds, now))?
-            .violation;
-        gate.count(violation.window, unix_seconds);
-        Some(violation)
+        let index = gate.applying(request, unix_seconds, now)?;
+        let block = gate.blocks[index].expect("an applying block exists");
+        gate.count(block.violation.window, unix_seconds);
+        gate.refused[index] = gate.refused[index].saturating_add(1);
+        Some((block.violation, gate.report(index, unix_seconds, now)))
     }
 
     /// `check` without counting: the verdict a dry run must see, with no effect.
@@ -198,24 +230,24 @@ impl CompanyBlocks {
         request: &Request,
         unix_seconds: i64,
         now: Instant,
-    ) -> Option<LimitViolation> {
+    ) -> Option<(LimitViolation, UsageReport)> {
         if request.credits.cpu == 0 && request.credits.inference == 0 {
             return None;
         }
         let gate = self.gate(request.company_id)?;
         let gate = gate.lock().unwrap_or_else(PoisonError::into_inner);
-        gate.blocks
-            .iter()
-            .flatten()
-            .find(|block| block.applies(request, unix_seconds, now))
-            .map(|block| block.violation)
+        let index = gate.applying(request, unix_seconds, now)?;
+        let block = gate.blocks[index].expect("an applying block exists");
+        Some((block.violation, gate.report(index, unix_seconds, now)))
     }
 
     /// Records a refusal the limiter just made, and blocks the company until `block.until`.
     pub fn record(&self, company_id: i32, block: Block, unix_seconds: i64) {
         let gate = self.gate_or_insert(company_id);
         let mut gate = gate.lock().unwrap_or_else(PoisonError::into_inner);
-        gate.blocks[block.violation.window as usize] = Some(block);
+        let index = block.violation.window as usize;
+        gate.blocks[index] = Some(block);
+        gate.refused[index] = 1;
         gate.count(block.violation.window, unix_seconds);
     }
 
@@ -287,6 +319,7 @@ mod tests {
             },
             until: Until::Monotonic(until),
             applies_to_marked_reads: marked_too,
+            report: UsageReport::default(),
         }
     }
 
@@ -297,9 +330,9 @@ mod tests {
         assert_eq!(blocks.check(&request(2, 0, false), CLOCK, now), None);
 
         let until = now + Duration::from_secs(3);
-        blocks.record(7, block(Window::TenSeconds, until, true), CLOCK);
-        let refused = blocks.check(&request(2, 0, false), CLOCK, now).unwrap();
-        assert_eq!(refused.window, Window::TenSeconds);
+        blocks.record(7, block(Window::Short, until, true), CLOCK);
+        let (refused, _) = blocks.check(&request(2, 0, false), CLOCK, now).unwrap();
+        assert_eq!(refused.window, Window::Short);
         assert_eq!(blocks.check(&request(2, 0, false), CLOCK, until), None);
     }
 
@@ -328,7 +361,7 @@ mod tests {
         let now = Instant::now();
         blocks.record(
             7,
-            block(Window::Hour, now + Duration::from_secs(60), true),
+            block(Window::Long, now + Duration::from_secs(60), true),
             CLOCK,
         );
         let other_user = Request {
@@ -378,15 +411,15 @@ mod tests {
         let blocks = CompanyBlocks::new(1);
         let now = Instant::now();
         let later = now + Duration::from_secs(60);
-        blocks.record(7, block(Window::TenSeconds, later, true), CLOCK);
+        blocks.record(7, block(Window::Short, later, true), CLOCK);
         blocks.check(&request(2, 0, false), CLOCK, now);
         blocks.record(7, block(Window::Month, later, true), CLOCK);
 
         let mut pending = blocks.take_pending(CLOCK, now);
         pending.sort_by_key(|(_, time_frame, _)| *time_frame);
         let expected = Rejections {
-            burst: 2,
-            hour: 0,
+            short: 2,
+            long: 0,
             no_funds: 1,
         };
         assert_eq!(
@@ -399,17 +432,70 @@ mod tests {
         assert!(blocks.take_pending(CLOCK, now).is_empty());
     }
 
+    /// The client sees the figures the block was created on and how many requests it has refused,
+    /// the limiter's own refusal included; a new block starts the count again.
+    #[test]
+    fn a_blocked_request_reports_the_blocks_figures_and_refusals() {
+        let blocks = CompanyBlocks::new(1);
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        let figures = UsageReport {
+            user_day_left: None,
+            company_day_left: 40,
+            company_short_used: 1_000,
+            company_long_used: 9_800,
+            blocked: None,
+            window_used: 1_000,
+            retry_after: None,
+        };
+        blocks.record(
+            7,
+            Block {
+                report: figures,
+                ..block(Window::Short, later, true)
+            },
+            CLOCK,
+        );
+        let refused = |blocks: &CompanyBlocks| blocks.check(&request(2, 0, false), CLOCK, now);
+        assert_eq!(refused(&blocks).unwrap().1.blocked, Some(2));
+        let (_, report) = refused(&blocks).unwrap();
+        assert_eq!(
+            report,
+            UsageReport {
+                blocked: Some(3),
+                // The wait is recomputed on every read: sixty seconds left plus the margin.
+                retry_after: Some(61),
+                ..figures
+            }
+        );
+        // And it shrinks as the clock advances.
+        let (_, later_report) = blocks
+            .peek(
+                &request(2, 0, false),
+                CLOCK,
+                now + Duration::from_millis(29_500),
+            )
+            .unwrap();
+        assert_eq!(later_report.retry_after, Some(32));
+        // A peek reports without counting.
+        let (_, peeked) = blocks.peek(&request(2, 0, false), CLOCK, now).unwrap();
+        assert_eq!(peeked.blocked, Some(3));
+
+        blocks.record(7, block(Window::Short, later, true), CLOCK);
+        assert_eq!(refused(&blocks).unwrap().1.blocked, Some(2));
+    }
+
     #[test]
     fn an_idle_company_is_dropped_and_a_failed_write_is_retried() {
         let blocks = CompanyBlocks::new(1);
         let now = Instant::now();
-        blocks.record(7, block(Window::TenSeconds, now, true), CLOCK);
+        blocks.record(7, block(Window::Short, now, true), CLOCK);
         assert_eq!(blocks.take_pending(CLOCK, now).len(), 2);
         assert!(blocks.shards[0].read().unwrap().is_empty());
 
         let failed = Rejections {
-            burst: 3,
-            hour: 0,
+            short: 3,
+            long: 0,
             no_funds: 0,
         };
         blocks.restore(7, 100, failed);

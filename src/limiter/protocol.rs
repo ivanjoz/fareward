@@ -80,8 +80,8 @@ pub enum Scope {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Window {
-    TenSeconds = 0,
-    Hour = 1,
+    Short = 0,
+    Long = 1,
     Day = 2,
     Month = 3,
 }
@@ -348,7 +348,7 @@ mod tests {
     fn response_bits_follow_the_contract() {
         let response = LimitViolation {
             scope: Scope::User,
-            window: Window::Hour,
+            window: Window::Long,
             cpu: true,
             inference: true,
         };

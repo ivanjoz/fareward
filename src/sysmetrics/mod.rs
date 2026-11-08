@@ -1,9 +1,8 @@
 //! One row every five seconds in `server_metrics` with what this machine was doing.
 //!
-//! This daemon owns the writes and the Go ORM owns the schema, the same split `reqlog` uses for
-//! `user_logs`. Here it is not a preference: the backend may be a Lambda, so `fareward` is the
-//! only Genix process guaranteed to be on the box and therefore the only one that can promise a
-//! continuous series.
+//! The rows live in Fareward's own store (`store::metrics`). This daemon writes them because the
+//! backend may be a Lambda, so `fareward` is the only Genix process guaranteed to be on the box
+//! and therefore the only one that can promise a continuous series.
 //!
 //! **Every stored value is a peak, not an average.** The collector samples once a second and the
 //! row carries the highest of the five sub-samples in its window, so a one-second spike survives
@@ -11,7 +10,7 @@
 //! these rows cannot be summed into totals, because each value is a peak standing in for five
 //! seconds.
 //!
-//! Like `reqlog` and unlike the limiter, everything here fails open. A dropped row costs a gap in a
+//! Unlike the limiter, everything here fails open. A dropped row costs a gap in a
 //! chart; taking the process down would stop the rate limiter, the lock service and the SSE bridge
 //! along with it.
 

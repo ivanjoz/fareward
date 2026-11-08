@@ -35,11 +35,11 @@ use crate::{
         protocol::parse_charge,
         quota::{Decision, RateLimiter},
     },
+    store::{grants::parse_grants, query::parse_report_query},
     lock::{
         protocol::{LockReply, parse_acquire, parse_release},
         registry::{LockGuard, LockOutcome, LockRegistry},
     },
-    reqlog::{protocol::parse_request_log, writer::RequestLogSink},
     service::{
         auth,
         protocol::{
@@ -113,7 +113,6 @@ pub async fn run(
     unix_listener: Option<UnixListener>,
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
-    request_logs: RequestLogSink,
     secret: Arc<Vec<u8>>,
     frame_timeout: Duration,
     max_connections: usize,
@@ -170,7 +169,6 @@ pub async fn run(
         };
         let limiter = limiter.clone();
         let locks = locks.clone();
-        let request_logs = request_logs.clone();
         let secret = secret.clone();
         let connection_shutdown = shutdown.clone();
         // Split here rather than inside handle_connection: `into_split` gives lock-free owned
@@ -195,7 +193,6 @@ pub async fn run(
                 &peer,
                 limiter,
                 locks,
-                request_logs,
                 &secret,
                 frame_timeout,
                 max_inflight,
@@ -223,7 +220,6 @@ async fn handle_connection(
     peer: &str,
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
-    request_logs: RequestLogSink,
     secret: &[u8],
     frame_timeout: Duration,
     max_inflight: usize,
@@ -393,7 +389,7 @@ async fn handle_connection(
                 let reply_sender = reply_sender.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
-                    // A cold subject loads its usage from MariaDB, so this cannot be inlined in the
+                    // A cold subject loads its usage from the store, so this cannot be inlined in the
                     // reader without head-of-line blocking every other request behind it.
                     //
                     // The two refusals are two shapes rather than two fields of one: a credit
@@ -443,6 +439,56 @@ async fn handle_connection(
                         Ok(refusal) => Reply::BudgetRefused(refusal as u8),
                         Err(mutation_error) => {
                             warn!(error = %mutation_error, "budget mutation failed");
+                            Reply::Unavailable
+                        }
+                    };
+                    send_reply(&reply_sender, frame_sequence, reply).await;
+                });
+            }
+            Opcode::Report => {
+                let payload = &frame[payload_offset..tag_offset];
+                let query = match parse_report_query(payload) {
+                    Ok(query) => query,
+                    Err(error) => break Err(error).context("authenticated frame is invalid"),
+                };
+                let Some(permit) = permit else {
+                    warn!(%peer, "in-flight ceiling reached, refusing a report");
+                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
+                    continue;
+                };
+                let limiter = limiter.clone();
+                let reply_sender = reply_sender.clone();
+                handlers.spawn(async move {
+                    let _permit = permit;
+                    let reply = match limiter.report(query).await {
+                        Ok(body) => Reply::Report(body),
+                        Err(report_error) => {
+                            warn!(error = %report_error, ?query, "report failed");
+                            Reply::Unavailable
+                        }
+                    };
+                    send_reply(&reply_sender, frame_sequence, reply).await;
+                });
+            }
+            Opcode::PutGrants => {
+                let payload = &frame[payload_offset..tag_offset];
+                let entries = match parse_grants(payload) {
+                    Ok(entries) => entries,
+                    Err(error) => break Err(error).context("authenticated frame is invalid"),
+                };
+                let Some(permit) = permit else {
+                    warn!(%peer, "in-flight ceiling reached, refusing a grants push");
+                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
+                    continue;
+                };
+                let limiter = limiter.clone();
+                let reply_sender = reply_sender.clone();
+                handlers.spawn(async move {
+                    let _permit = permit;
+                    let reply = match limiter.put_grants(entries).await {
+                        Ok(()) => Reply::Ack,
+                        Err(grants_error) => {
+                            warn!(error = %grants_error, "grants push failed");
                             Reply::Unavailable
                         }
                     };
@@ -534,32 +580,14 @@ async fn handle_connection(
                 };
                 send_reply(&reply_sender, frame_sequence, reply).await;
             }
-            Opcode::LogRequest => {
-                // The only opcode that answers nothing, so it also takes no in-flight permit: the
-                // work is a channel send that cannot block, and parking a slot for it would let a
-                // burst of log frames starve the charges and locks sharing this connection.
-                drop(permit);
-                match parse_request_log(&frame[payload_offset..tag_offset]) {
-                    // Submit never blocks: a full queue drops the record and counts it.
-                    Ok(record) => request_logs.submit(record),
-                    // A malformed payload is a client bug worth seeing, but not worth closing a
-                    // connection over — that would take this backend's charges and locks with it,
-                    // for the sake of a log row. The other opcodes break the loop here because
-                    // their frames decide whether a request is admitted at all.
-                    Err(parse_error) => {
-                        warn!(%peer, sequence = frame_sequence, error = %parse_error,
-                              "discarding a malformed request log frame");
-                    }
-                }
-            }
             Opcode::InvalidateUserAccess => {
                 let payload = &frame[payload_offset..tag_offset];
                 let invalidation = match parse_access_invalidation(payload) {
                     Ok(invalidation) => invalidation,
                     Err(error) => break Err(error).context("authenticated frame is invalid"),
                 };
-                // Takes a permit, unlike the request log: this awaits the shard mutex, which the
-                // charge path holds across MariaDB reads, so it can genuinely wait. At the ceiling
+                // Takes a permit: this awaits the shard mutex, which the charge path holds across
+                // store reads, so it can genuinely wait. At the ceiling
                 // the frame is dropped — there is nobody to answer, and the TTL is precisely the
                 // backstop for an invalidation that did not land.
                 let Some(permit) = permit else {

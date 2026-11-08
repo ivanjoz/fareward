@@ -6,3 +6,4 @@
 
 # Release staging directory used by .github/workflows/release-binaries.yml.
 /dist/
+plans/

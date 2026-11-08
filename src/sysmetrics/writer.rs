@@ -1,4 +1,4 @@
-//! Turns sub-samples into `server_metrics` rows.
+//! Turns sub-samples into `server_metrics` rows, written to Fareward's own store.
 //!
 //! The loop ticks once a second and writes on the tick that crosses a five-second boundary of the
 //! wall clock, never on every fifth tick of a counter. That distinction is the whole reason a
@@ -7,9 +7,11 @@
 //!
 //! Fails open throughout: a write that does not land is a warning and a counter.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
-use mysql_async::{Pool, prelude::Queryable};
 use tokio::{
     sync::watch,
     task::JoinHandle,
@@ -19,45 +21,28 @@ use tracing::{info, warn};
 
 use crate::{
     config::ServerMetricsConfig,
-    database::purge_days_before,
+    store::metrics::MetricsSink,
     sysmetrics::{
-        MetricsSample, WindowPeaks,
+        WindowPeaks,
         collector::{ServiceUnits, SystemMetricsCollector},
     },
 };
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
-/// Every column is named: the Go side owns these names, and a rename there fails the write instead
-/// of putting values into the wrong columns. A whole-row upsert, so a retried window rewrites its
-/// row. The scylla_* pair holds the database unit's sample (server_metrics.scylla_unit), whatever
-/// that database is: the Go schema has not renamed it.
-const UPSERT_SERVER_METRICS: &str = "INSERT INTO server_metrics (date, slot, cpu_percent, \
-     mem_percent, disk_percent, net_rx_rate, net_tx_rate, backend_mem_mb, backend_cpu_percent, \
-     fareward_mem_mb, fareward_cpu_percent, scylla_mem_mb, scylla_cpu_percent) \
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
-     cpu_percent = VALUES(cpu_percent), mem_percent = VALUES(mem_percent), \
-     disk_percent = VALUES(disk_percent), net_rx_rate = VALUES(net_rx_rate), \
-     net_tx_rate = VALUES(net_tx_rate), backend_mem_mb = VALUES(backend_mem_mb), \
-     backend_cpu_percent = VALUES(backend_cpu_percent), fareward_mem_mb = VALUES(fareward_mem_mb), \
-     fareward_cpu_percent = VALUES(fareward_cpu_percent), scylla_mem_mb = VALUES(scylla_mem_mb), \
-     scylla_cpu_percent = VALUES(scylla_cpu_percent)";
-
 /// How often days past the retention are deleted. The key is a day, so hourly is plenty.
 const PURGE_INTERVAL: Duration = Duration::from_secs(3_600);
 
-/// No startup step can fail: a daemon that starts before `fn-homologate` has created the table
-/// only loses the rows written until it exists, and recovers by itself.
 pub struct ServerMetricsWriter {
-    pool: Pool,
+    sink: Arc<dyn MetricsSink>,
     retention_days: i16,
     last_purge: Option<Instant>,
 }
 
 impl ServerMetricsWriter {
-    pub fn new(pool: Pool, config: &ServerMetricsConfig) -> Self {
+    pub fn new(sink: Arc<dyn MetricsSink>, config: &ServerMetricsConfig) -> Self {
         Self {
-            pool,
+            sink,
             retention_days: config.retention_days,
             last_purge: None,
         }
@@ -171,16 +156,7 @@ impl ServerMetricsWriter {
         let date = (window_start / SECONDS_PER_DAY) as i16;
         let slot = ((window_start % SECONDS_PER_DAY) / row_seconds) as i16;
 
-        let values = row_values(date, slot, &sample);
-        let write_result = match self.pool.get_conn().await {
-            Ok(mut connection) => {
-                connection
-                    .exec_drop(UPSERT_SERVER_METRICS, values.to_vec())
-                    .await
-            }
-            Err(connection_error) => Err(connection_error),
-        };
-        match write_result {
+        match self.sink.write(date, slot, &sample) {
             Ok(()) => *rows_written += 1,
             Err(write_error) => {
                 *write_failures += 1;
@@ -199,33 +175,11 @@ impl ServerMetricsWriter {
             return;
         }
         self.last_purge = Some(Instant::now());
-        if let Err(purge_error) =
-            purge_days_before(&self.pool, "server_metrics", self.retention_days).await
-        {
+        let cutoff_day = ((unix_seconds() / 86_400) as i16).saturating_sub(self.retention_days);
+        if let Err(purge_error) = self.sink.purge_before(cutoff_day) {
             warn!(error = %purge_error, "server_metrics retention purge failed");
         }
     }
-}
-
-/// The bound values, in the order the prepared statement names its columns. An array and not a
-/// tuple so the row can be compared and printed whole in a test — Rust stops deriving `Debug` and
-/// `PartialEq` for tuples at twelve elements, and this row has thirteen.
-fn row_values(date: i16, slot: i16, sample: &MetricsSample) -> [i16; 13] {
-    [
-        date,
-        slot,
-        sample.cpu_percent,
-        sample.memory_percent,
-        sample.disk_percent,
-        sample.network_rx_rate,
-        sample.network_tx_rate,
-        sample.backend.memory_mb,
-        sample.backend.cpu_percent,
-        sample.fareward.memory_mb,
-        sample.fareward.cpu_percent,
-        sample.scylla.memory_mb,
-        sample.scylla.cpu_percent,
-    ]
 }
 
 /// Wall-clock seconds. The slot is a position in the day, so it can only come from an absolute
@@ -248,7 +202,6 @@ fn nanoseconds_to_next_second() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sysmetrics::NOT_MEASURED;
 
     /// The identity of a row is derived from the window's start, not from a counter. These are the
     /// three cases that would corrupt a day: the first window, the last, and the rollover.
@@ -274,48 +227,6 @@ mod tests {
             (20_454, 17_279)
         );
         assert_eq!(window_identity(midnight + SECONDS_PER_DAY, 5), (20_455, 0));
-    }
-
-    /// The bound tuple is positional against a column list the Go side owns, so this pins the two
-    /// orders together: a field read into the wrong position would silently mislabel every row.
-    #[test]
-    fn bound_values_follow_the_column_order() {
-        let sample = MetricsSample {
-            cpu_percent: 1,
-            memory_percent: 2,
-            disk_percent: 3,
-            network_rx_rate: 4,
-            network_tx_rate: 5,
-            backend: crate::sysmetrics::ServiceSample {
-                memory_mb: 6,
-                cpu_percent: 7,
-            },
-            fareward: crate::sysmetrics::ServiceSample {
-                memory_mb: 8,
-                cpu_percent: 9,
-            },
-            scylla: crate::sysmetrics::ServiceSample {
-                memory_mb: 10,
-                cpu_percent: 11,
-            },
-        };
-        assert_eq!(
-            row_values(100, 200, &sample),
-            [100, 200, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        );
-    }
-
-    /// The Lambda row: the backend's two columns carry the sentinel while everything else is real.
-    #[test]
-    fn an_absent_backend_binds_the_sentinel() {
-        let sample = MetricsSample {
-            cpu_percent: 2_345,
-            ..MetricsSample::default()
-        };
-        let values = row_values(20_454, 17_279, &sample);
-        assert_eq!(values[2], 2_345);
-        assert_eq!(values[7], NOT_MEASURED);
-        assert_eq!(values[8], NOT_MEASURED);
     }
 
     #[test]

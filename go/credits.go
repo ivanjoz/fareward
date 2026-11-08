@@ -317,7 +317,7 @@ const OperatorCompanyID int32 = 1
 //
 // The charge still goes out and is still metered — being metered is the point — but running out of
 // budget must not lock out the one session that has to get in and raise it. It covers all three
-// ceilings alike: the 10s burst, the hour and the day, plus a transport failure, because none of
+// ceilings alike: the short and the long window and the day, plus a transport failure, because none of
 // them is a reason to shut the operator out of its own platform.
 //
 // An AccessDenied is never tolerated: what is exempt is the credit, not the permission.
@@ -561,7 +561,9 @@ func decodeCreditLimitResponse(code uint8) error {
 	if code&0b1110_0000 != 0 || code&0b0001_1000 == 0 {
 		return fmt.Errorf("%w: credit limiter sent violation bits %08b", ErrFarewardUnavailable, code)
 	}
-	windows := [...]string{"10 seconds", "1 hour", "24 hours", "month"}
+	// The short and long windows last what the daemon's [rate_limit] says (short_window_seconds,
+	// long_window_minutes), so they are named by role, not by length.
+	windows := [...]string{"short window", "long window", "24 hours", "month"}
 	return &CreditLimitExceeded{
 		Code:      code,
 		Company:   code&1 == 0,

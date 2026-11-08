@@ -1,16 +1,16 @@
 # Fareward
 
-One Rust process hosting four server-side services over two transports:
+One Rust process hosting server-side services over two transports:
 
 | Service | Transport | Port | Purpose |
 |---|---|---|---|
 | Access gate + credit limiter | Raw TCP, loopback | `fareward` (default `127.0.0.1:14013`) | Authorizes the caller against its cached grants, then charges CPU/inference quota — both in one round trip. |
 | Lock service | Raw TCP, same port | `fareward` | Serializes an action across concurrent Lambdas. |
-| Request log | Raw TCP, same port | `fareward` | One row per finished request, plus the code lines that failed. |
+| Reports and grants | Raw TCP, same port | `fareward` | Usage, budgets and server metrics read out of its store; the grants the backend pushes. |
 | SSE bridge | HTTP (TLS via Nginx) | `sse_bridge.port` (default `14012`) | Relays agent events between a backend and browser tabs, authenticating both ends. |
 | HAProxy edge agent (optional) | SPOP 2.0, Unix socket | `spoe.socket` | The access gate and credit limiter above, asked by HAProxy on the request headers before the body is read. See [HAProxy edge agent](#haproxy-edge-agent-spoe). |
 
-The limiter, the lock and the request log share the port, the connection, and the handshake —
+The limiter, the lock, the reports and the grants push share the port, the connection, and the handshake —
 nothing else. Each opcode owns its own payload and its own module. That shared port is why its
 address is the root-level `fareward` key rather than something under `[rate_limit]`: it
 belongs to the process, not to any one service inside it.
@@ -33,11 +33,15 @@ formats), [PLAN_LOCK_SERVICE.md](PLAN_LOCK_SERVICE.md) and
 [PLAN_SSE_BRIDGE.md](PLAN_SSE_BRIDGE.md) (bridge). Deployment:
 [`../scripts/configure/CONFIGURE_FAREWARD.md`](../scripts/configure/CONFIGURE_FAREWARD.md).
 
-> **One process, shared fate.** The rate limiter loads existing usage from MariaDB before
-> admitting anything and exits when it cannot — which also stops the bridge. Deploy the tables
-> [it expects](#the-tables-it-expects-to-already-exist) before starting the daemon. The request log
-> and the metrics collector are the two halves that do *not* share that fate: they drop rows rather
-> than propagate a failure, because taking the process down would stop everything else.
+> **One process, shared fate.** The rate limiter loads existing usage from its own store before
+> admitting anything and exits when it cannot open it — which also stops the bridge. The grants live
+> in that store too, pushed by the backend, so Fareward depends on **no database** but its own. The
+> metrics collector is the half that does *not* share that fate: it drops rows rather than propagate
+> a failure, because taking the process down would stop everything else.
+>
+> The request log is not here any more: the backend writes `user_logs` and `request_errors` itself
+> (Genix keeps `user_logs` in a compressed MyRocks table, written without the WAL and expired by a
+> TTL). Opcode `0x04` is retired.
 
 ## The backend contract
 
@@ -45,42 +49,59 @@ This repository is standalone: it builds, tests and runs with no Go in the pictu
 non-crates.io build dependency is `colbin`, a Rust crate. What it is *not* is self-contained. The
 daemon answers questions something asks it and writes rows something reads, so a backend has to play
 the client. The Go backend in `github.com/ivanjoz/genix` is that client today, and the only one —
-but the coupling is **four contracts, not a language**.
+but the coupling is **three contracts, not a language**.
 
 | # | Contract | Defined by | What a different backend has to do |
 |---|---|---|---|
 | 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` and `go/siphash/` — eight-byte nonce at accept, then every frame tagged `SipHash-2-4(SHA-256(internal_apikey)[..16], fareward:v12 ‖ nonce ‖ sequence ‖ opcode ‖ length ‖ payload)`, big-endian. Every payload is a colbin message, which has a Rust crate and a browser module as well as the Go one. |
-| 2 | The MariaDB schema | nobody here — the daemon issues no `CREATE TABLE` | Create the tables and columns below before first start. |
-| 3 | The `accesos_computed` packing | `src/limiter/access.rs` | Write `users.accesos_computed` as little-endian `u16` grants. |
-| 4 | The browser session token | `src/bridge/token.rs`, `src/bridge/auth.rs` | Issue a colbin-encoded `core.UsuarioToken`, its 16-byte `Hash` a keyed BLAKE2s-128 tag over `usrToken:v3`. **The only Go-shaped contract** — see below. |
+| 2 | The grants push | `src/store/grants.rs`, `src/limiter/access.rs` | Push every user's status and grant blobs (little-endian `u16` grants) with opcode `0x0A`: at start, and on every change. |
+| 3 | The browser session token | `src/bridge/token.rs`, `src/bridge/auth.rs` | Issue a colbin-encoded `core.UsuarioToken`, its 16-byte `Hash` a keyed BLAKE2s-128 tag over `usrToken:v3`. **The only Go-shaped contract** — see below. |
 
-Contracts 1–3 belong to the raw-TCP half. Contract 4 belongs to the SSE bridge alone, and the bridge
+Contracts 1–2 belong to the raw-TCP half. Contract 3 belongs to the SSE bridge alone, and the bridge
 shares nothing with the rest but the config load and the tokio runtime — so a deployment that does
-not run the bridge never meets contract 4 at all.
+not run the bridge never meets contract 3 at all.
 
-### The tables it expects to already exist
+### Its own store
 
-The daemon **never creates schema**. Ownership of these tables sits with whoever runs the
-migrations; in the Genix deployment that is the Go ORM (`fn-homologate`), in the database `db.name`
-reached through the `[mariadb]` keys the backend also reads. Every write is
-`INSERT … ON DUPLICATE KEY UPDATE` of the columns it names, so two writers of different columns of
-one row (the budget's entitlement and usage halves) never overwrite each other.
+Usage, budgets and server metrics live in **Fareward's own store**, an embedded
+[fjall](https://github.com/fjall-rs/fjall) database in `[store].path` (default
+`/var/lib/fareward/store`). Fareward is their source of truth: the backend reads them through the
+report opcode (below) and no longer has tables for them. Pure binary, company-first keys:
 
-| Table | Access | Used for |
+| Keyspace | Key | Value |
 |---|---|---|
-| `users` | read | `accesos_computed`, `status` — the grant cache behind `CHARGE_CREDITS` |
-| `credit_usage_company`, `credit_usage_user` | read + write | the quota windows, loaded at cold start. `credit_usage_company` also carries three refusal counters, `rejected_10s`, `rejected_1h` and `rejected_no_funds` (nullable integers, **added to** by each flush rather than replaced) |
-| `company_credit_budget` | read + write | the extra-credit pool, its ceiling and the activated month |
-| `user_logs`, `request_errors` | write | the request log |
-| `server_metrics` | write | the metrics collector |
+| `usage_company` | company, time_frame | version, `rejected_short`, `rejected_long`, `rejected_no_funds` (u32 each), the credits blob |
+| `usage_user` | company, user, time_frame | version, the credits blob |
+| `budget` | company | version, the entitlement and the usage counters, fixed 111 bytes |
+| `server_metrics` | date, slot | version, eleven i16 columns |
+| `grants` | company, user | version, status, the grants blob, the sub-grants blob — as last pushed |
+| `meta` | one byte | the store's layout version; a store of another layout refuses to open |
 
-The split matters at startup. The limiter loads usage before admitting anything and **exits** if it
-cannot, so its four tables are a hard precondition. The remaining three are written by the two
-services that fail open: a missing table or column drops rows with a warning, and the process stays
-up. `user_logs.error_ids` is the colbin encoding of a Go `[]int32`, as the ORM stores slices.
+Keys are big-endian with the sign bit flipped, so byte order is numeric order and one company is one
+contiguous range. The layouts are in `src/store/codec.rs`. Each flush ends with one fsync, so a crash
+loses at most one flush interval of usage, as before. **Backups are Fareward's job now**: the
+directory is the whole state of the credit system.
 
-MariaDB has no TTL. `user_logs` and `server_metrics` start their key with the UnixDay `date`, so each
-writer deletes the days older than its `ttl_days` once an hour, in batches of 10,000 rows.
+### Reports
+
+Opcode `0x09` reads the store; the Go client is [`go/reports.go`](go/reports.go)
+(`QueryCompanyUsage`, `QueryEveryCompanyUsage`, `QueryUserUsage`, `QueryCompanyBudgets`,
+`QueryServerMetrics`). The reply is shape `0x0B`, `[length:u32][body]`, the only reply that may be
+large (at most 32 MiB). Reports read what was flushed, so they lag the limiter by at most one flush
+interval. Over TCP, so a Lambda backend reads them as a VPS one does.
+
+### Grants
+
+Fareward does not read the backend's `users` table: the backend pushes what the gate needs — per
+user, the status and the two grant blobs (`accesos_computed`, `accesos_sub_computed`) — with opcode
+`0x0A` ([`go/grants.go`](go/grants.go), `PutUserGrants`). Each frame (at most 8 KiB; the client
+splits a larger push) is validated whole, stored atomically, drops those users' cached grants, and
+only then is acknowledged. A user sent as deleted is removed, so it is denied like an unknown one.
+
+A user Fareward was never sent is denied, so the backend pushes **everyone at start** (Genix:
+`security.SyncAllFarewardGrants` in the background on a VPS start, `fn-sync-fareward-grants` on
+demand) and **each user on every save**. Re-sending is harmless; a lost push is repaired by the next
+save or the next full sync.
 
 Sequences are not here: MariaDB owns them (the ORM's `_sequences` table), so the
 `RESERVE_SEQUENCE`/`SET_SEQUENCE` opcodes `0x07`/`0x08` and reply shapes `0x09`/`0x0A` are retired.
@@ -88,21 +109,21 @@ Sequences are not here: MariaDB owns them (the ORM's `_sequences` table), so the
 ### Could a Rust or Node backend drive this?
 
 **Go: nothing to do.** [`go/`](go/) is a module in this repository — `github.com/ivanjoz/fareward/go`
-— that implements contracts 1 and 3 and depends on the standard library and `colbin`, which has no
+— that implements contracts 1 and 2 and depends on the standard library and `colbin`, which has no
 dependencies of its own. Configure it and call it; see [The Go client](#the-go-client).
 
-**Rust: yes, with nothing missing.** All four contracts are available to it. The frame protocol is
+**Rust: yes, with nothing missing.** All three contracts are available to it. The frame protocol is
 already in this crate, and `colbin` is the same crate the bridge decodes with, so a Rust backend can
 issue session tokens directly.
 
-**Node: yes.** Contracts 1–3 are byte layouts and SQL — nothing about them is Go — and they are now
+**Node: yes.** Contracts 1–2 are byte layouts — nothing about them is Go — and they are now
 colbin messages, for which the format's repository carries a browser module alongside the Go and
-Rust ones. Contract 4 is the same story: a Node backend encodes `UsuarioToken` with that module
+Rust ones. Contract 3 is the same story: a Node backend encodes `UsuarioToken` with that module
 rather than transcribing the format. The *channel* token is not a barrier either — a small varint
 format already mirrored in TypeScript in `frontend/core/agent/channel.ts`.
 
 **Any other language: the same shape, and one dependency.** A port needs colbin, which is a format
-with a written specification and three implementations rather than a library with an API. Contract 4
+with a written specification and three implementations rather than a library with an API. Contract 3
 is the only place one specific Go type's wire encoding is assumed, and it is confined to one function
 behind one trait-free entry point. For contract 1, read `go/connection.go` rather than `src/service/`
 — it is the same protocol seen from the caller's side, which is the side a port has to reproduce.
@@ -125,7 +146,7 @@ if err := fareward.ConfigureFareward(addr, secret); err != nil { return err }
 
 err := fareward.ChargeAPIUsage(ctx, companyID, userID, routeID, method, payloadBytes, required)
 lock, err := fareward.AcquireLock(ctx, action, identifier, maxWaiters)
-err := fareward.SendRequestLog(ctx, record)
+err := fareward.PutUserGrants(ctx, users)
 err := fareward.InvalidateUserAccess(ctx, companyID, userID)
 err := fareward.MutateCompanyCreditBudget(ctx, companyID, op, amount)
 ```
@@ -136,7 +157,7 @@ policy above that: route-to-access mapping, charging exemptions and HTTP status 
 caller, which is why the Genix backend keeps a 156-line adapter (`core/fareward_api.go`) on its side
 of the seam and nothing more.
 
-The module has **exactly one dependency**, `github.com/ivanjoz/colbin`, which carries the six request
+The module has **exactly one dependency**, `github.com/ivanjoz/colbin`, which carries the request
 frames that are records rather than fixed layouts (`PROTOCOL_SHAPES.md` §4) and which the daemon
 decodes with the same format's Rust crate. colbin has no dependencies of its own, so the module still
 pulls nothing else in — and that restraint is worth keeping, because this is the one piece of the
@@ -155,7 +176,7 @@ Most of what reads like backend coupling is caller-side policy this daemon has n
 - **Which route needs which access.** `src/limiter/access.rs` answers "does this user hold any of
   these grants" and deliberately does not know access *names*, that `access_list.yml` exists, or
   which route maps to which grant.
-- **Route ids.** The request log stores whatever number the client puts in bits 39..24.
+- **Route ids.** The daemon meters whatever route number the client puts in a frame.
 - **Who is exempt.** The user-1 bypass, unmapped GETs being free, `POST.user-self` needing no
   access — all resolved before a frame is ever built.
 
@@ -179,14 +200,14 @@ src/
 │                # mutation and grant-cache invalidation,
 │                # quota, protocol, aggregation, credits_blob, time_frame, storage
 ├── lock/        # opcodes 0x02/0x03: registry.rs (sharded key mutexes), protocol
-├── reqlog/      # opcode 0x04: protocol (the one variable-length payload), errors
-│                # (ten-minute write suppression), writer (batching, fails open)
 ├── routes/      # the route table the backend generates: table (parse, lookup, tariff,
 │                # admission), watch (hot reload on change, keeps the old table on error)
 ├── spoe/        # the HAProxy agent: codec (SPOP 2.0 frames), agent (the gate, replayed)
+├── store/       # opcodes 0x09/0x0A: the fjall store, reports and grants. codec (keys and values), limiter (the
+│                # LimiterStore over it), metrics (the MetricsSink), query (reports)
 ├── sysmetrics/  # no opcode: samples the machine once a second and writes the peak
-│                # of each five-second window to server_metrics. collector (/proc +
-│                # cgroup v2), writer (the tick loop and the insert)
+│                # of each five-second window to the store. collector (/proc +
+│                # cgroup v2), writer (the tick loop and the write)
 └── bridge/      # token.rs (colbin + channel token), auth (the browser's session
                  # token and the backend's service header), channel, http (axum)
 
@@ -240,7 +261,7 @@ the reference material it ties together.
 - Answers **two** questions per frame: whether the caller holds the access the route requires, and
   whether the tenant can afford the request. Authorization is resolved first and a refusal charges
   nothing.
-- Atomically checks company/user burst and hourly limits plus company-configured daily/monthly budgets.
+- Atomically checks company/user short- and long-window limits plus company-configured daily/monthly budgets.
 - Derives each user's daily allowance as `rate_limit.user_daily_share_pct` of its company's CPU and
   inference allowances. Below 100 a single-user company cannot reach the rest of what it bought,
   which is the trade the key exists to let you make.
@@ -253,8 +274,8 @@ the reference material it ties together.
   its requests without taking the limiter's lock, so an abuser cannot slow the other companies. A
   request that charges nothing is never blocked, and a marked read still reaches the extra pool while
   the pool has credit. Never by IP: an IP can be shared by many customers.
-- Counts every company refusal by cause, in the five-minute frame and in the day: `rejected_10s` and
-  `rejected_1h` (abuse) and `rejected_no_funds` (day, month or an extra pool that could not pay).
+- Counts every company refusal by cause, in the five-minute frame and in the day: `rejected_short` and
+  `rejected_long` (abuse) and `rejected_no_funds` (day, month or an extra pool that could not pay).
   Counts only, not a request log.
 - Requires an explicitly activated current month; a new one stays blocked until `SET_CURRENT`. The
   month is the **local business month** (UTC-5), the same boundary the daily frames use — not the UTC
@@ -262,7 +283,7 @@ the reference material it ties together.
 - Optionally serves reads from a company's extra daily pool once its entitlement has refused, without
   ever relaxing a burst gate.
 - Aggregates every accepted charge into user/company and five-minute/daily in-memory records.
-- Flushes only changed absolute records to `credit_usage` every 15 seconds.
+- Flushes only changed absolute records to its store every 15 seconds, then fsyncs once.
 - Leaves the fail-closed decision to the caller. The Go client fails closed on quota
   exhaustion and on daemon/storage unavailability; the daemon only reports which it was.
 
@@ -353,22 +374,30 @@ shards                = 0 # 0 uses the logical CPU count
 max_inflight_per_connection = 64
 access_cache_seconds  = 600 # TTL of the cached user grants; INVALIDATE_USER_ACCESS is the fast path
 
-company_cpu_10s       = 2000
-company_inference_10s = 1000
-company_cpu_1h        = 40000
-company_inference_1h  = 10000
+# Two rate-limit windows, always two. Optional; absent means 10 seconds and 60 minutes.
+# The short window is a token bucket: its credits refill continuously over this many seconds.
+short_window_seconds  = 10
+# The long window is a fixed clock window (with 10: :00, :10, :20…). In steps of 5 minutes, because
+# a restart rebuilds it from the five-minute usage rows; at most 1440 and longer than the short one.
+long_window_minutes   = 10
 
-user_cpu_10s          = 1000
-user_inference_10s    = 500
-user_cpu_1h           = 20000
-user_inference_1h     = 5000
+# Credits per window. The old names (_10s, _1h) are still read, with a warning in the log.
+company_cpu_short       = 2000
+company_inference_short = 1000
+company_cpu_long        = 40000
+company_inference_long  = 10000
+
+user_cpu_short          = 1000
+user_inference_short    = 500
+user_cpu_long           = 20000
+user_inference_long     = 5000
 
 # Optional. true limits by company only: the user_* ceilings and user_daily_share_pct stop
 # applying (they are still required and validated). Default false.
 disable_user_limit    = false
 ```
 
-The eight burst/hour ceilings are the only settings here with no built-in default: a guessed quota
+The eight short/long ceilings are the only settings here with no built-in default: a guessed quota
 is worse than none, so the process refuses to start without them. Since that refusal is a
 three-second crash loop under `Restart=always`, the nested Fareward installer writes these
 defaults into `config.toml` when they are absent, rather than leaving the daemon to discover it.
@@ -383,23 +412,16 @@ max_total_waiters = 4096
 max_lease_ms      = 60000
 ```
 
-The database is the backend's: `db.name` and the `[mariadb]` section (`host`, `port` default 3306,
-`user`, `password`), the same keys the Go backend connects with.
-
-The request log adds a section where every key has a default, so omitting it entirely means "on,
-with these" rather than a refusal to start:
+The store is local and Fareward's own:
 
 ```toml
-# Purpose: One row per finished request; a month of history, then the day is purged.
-[request_log]
-enabled             = true
-ttl_days            = 30
-flush_ms            = 1000
-max_batch           = 128
-error_cache_seconds = 600
-error_cache_entries = 20000
-queue_capacity      = 8192
+# Purpose: Where usage, budgets and server metrics live. Back this directory up.
+[store]
+path = "/var/lib/fareward/store"
 ```
+
+Fareward reads no database settings: `[mariadb]`, `db.name` and `[request_log]` in a shared config
+file are ignored.
 
 The SSE bridge adds one small section:
 
@@ -411,14 +433,13 @@ port    = 14012
 verbose = false
 ```
 
-The process also reads root `secret_phrase`, root `internal_apikey`, and `[db].host`, `port`,
-`name`, `user`, and `password`. Set `GENIX_CONFIG_FILE` to select a non-default TOML file. Every
+The process also reads root `secret_phrase` and root `internal_apikey`. Set `GENIX_CONFIG_FILE` to select a non-default TOML file. Every
 setting can be overridden by its uppercase environment equivalent, such as
-`RATE_LIMIT_USER_CPU_10S`, `SSE_BRIDGE_PORT`, or `DB_HOST`.
+`RATE_LIMIT_USER_CPU_SHORT`, `RATE_LIMIT_LONG_WINDOW_MINUTES`, `SSE_BRIDGE_PORT`, or `DB_HOST`.
 
-All quota values must be positive and nondecreasing from ten seconds to one hour. Daily and monthly
-entitlements are stored per company in `company_credit_budget`, not in this file. Every usage flush
-writes the counters those entitlements are compared against back into the same row
+All quota values must be positive and nondecreasing from the short to the long window. Daily and monthly
+entitlements are stored per company in the store's `budget` keyspace, not in this file. Every usage
+flush writes the counters those entitlements are compared against back into the same value
 (`usage_day_period`, `day_*_used`, `usage_month_start_day`, `month_*_used`, `usage_updated`), so the
 SaaS panel can show remaining credits without re-summing the usage rows. Both windows are counted on
 the Lima business day, the same day `time_frame::daily` buckets by.
@@ -479,16 +500,6 @@ curl --fail --location --output SHA256SUMS "${release_base_url}/SHA256SUMS"
 # Verify exact release bytes before making the daemon executable.
 grep " ${release_asset}$" SHA256SUMS | sha256sum --check --strict
 chmod 0755 "$release_asset"
-```
-
-Before starting the daemon, deploy the backend tables so the generated Genix controller creates
-`credit_usage`:
-
-```bash
-# Purpose: Regenerate/validate controllers and deploy tables through the normal Genix workflow.
-cd scripts
-go run . generate_controllers
-go run . check_tables
 ```
 
 Run locally from `fareward/` (it finds `../config.toml`):
@@ -558,31 +569,32 @@ shape, with ids 1..16 so both sides use four-bit keys. `PROTOCOL_SHAPES.md` is t
 | `0x01` | `CHARGE_CREDITS` | colbin | company `i32` · user `i32` · route `u16` · CPU `u16` · inference `u16` · extra_allowed `bool` · access `4×u16` | 48 |
 | `0x02` | `LOCK_ACQUIRE` | colbin | action `u16` · identifier `i64` · max_waiters `u8` · wait_ms `u32` · lease_ms `u32` | 40 |
 | `0x03` | `LOCK_RELEASE` | colbin | action `u16` · identifier `i64` · generation `u16` | 24 |
-| `0x04` | `LOG_REQUEST` | colbin | date `i16` · request `i64` · route `i16` · frame `u8` · company `i32` · user `i32` · elapsed `i16` · errors `[]{id i32, line ≤64 B, text ≤200 B}`, ≤ 4 | 1 264 |
 | `0x05` | `MUTATE_COMPANY_BUDGET` | colbin | company `i32` · operation `u8` · CPU `u64` · inference `u64` | 32 |
 | `0x06` | `INVALIDATE_USER_ACCESS` | colbin | company `i32` · user `i32` (`0` = every user of the company) | 16 |
+| `0x09` | `REPORT` | colbin | kind `u8` · company `i32` · user `i32` · first `i64` · last `i64` | 48 |
+| `0x0A` | `PUT_GRANTS` | hand-rolled | count `u16`, then per user: company `i32` · user `i32` · flags `u8` · status `i8` · grants `u16`-prefixed · sub-grants `u16`-prefixed | 8 192 |
 
 A colbin field holding its zero value is not written at all, so a payload is as small as the record
 is sparse: an ungated charge is 10 bytes against the 20 the old fixed layout always spent, and the
 wildcard invalidation is 3.
 
-`0x00` stays unassigned so an all-zero frame cannot route. `0x07` and `0x08` were the retired
-sequence opcodes and stay unassigned too. New *use cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
+`0x00` stays unassigned so an all-zero frame cannot route. `0x04` (the retired request log) and
+`0x07`/`0x08` (the retired sequence opcodes) stay unassigned too, so a stale client's frame closes
+the connection. New *use cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
 
-Two properties vary by opcode, and both variations are deliberate:
+A malformed payload closes the connection, whatever the opcode. Whether it is answered varies, on
+purpose:
 
-| Op | Answered | Malformed payload |
-|---|---|---|
-| `0x01` `0x02` `0x03` `0x05` | yes | closes the connection |
-| `0x04` `LOG_REQUEST` | **never** | warning, connection survives |
-| `0x06` `INVALIDATE_USER_ACCESS` | **never** | closes the connection |
+| Op | Answered |
+|---|---|
+| `0x01` `0x02` `0x03` `0x05` `0x09` `0x0A` | yes |
+| `0x06` `INVALIDATE_USER_ACCESS` | **never** |
 
 Every opcode is length-prefixed. There used to be a second, fixed-width framing for the payloads
 whose width the opcode alone implied; nothing is left that a fixed width could describe, so one
 reader path replaced two. The length is inside the signed bytes, and one declaring more than its
 opcode's ceiling closes the connection before a byte of payload is buffered.
 
-Neither `0x04` nor `0x06` is answered — waiting on "the log row was stored" would put this daemon on
-the critical path of every request in the system, and the grant cache's TTL already bounds a lost
-invalidation — but both still advance the sequence, which is what the tag is bound to.
+`0x06` is not answered — the grant cache's TTL already bounds a lost invalidation, so a user save
+must not wait on it — but it still advances the sequence, which is what the tag is bound to.
 

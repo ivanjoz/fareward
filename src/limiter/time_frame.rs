@@ -67,13 +67,21 @@ pub fn month_start_day(unix_seconds: i64) -> Result<i16, TimeFrameError> {
     i16::try_from(unix_day - day_of_month + 1).map_err(|_| TimeFrameError::OutOfRange(unix_day))
 }
 
-pub fn hour_five_minute_range(unix_seconds: i64) -> Result<(i32, i32), TimeFrameError> {
+/// The five-minute frames that exactly cover the fixed window of `window_seconds` holding
+/// `unix_seconds`. Exact only for a multiple of five minutes, which the configuration enforces
+/// (`rate_limit.long_window_minutes`): the window then starts and ends on frame boundaries.
+pub fn window_five_minute_range(
+    unix_seconds: i64,
+    window_seconds: i64,
+) -> Result<(i32, i32), TimeFrameError> {
     if unix_seconds < 0 {
         return Err(TimeFrameError::NegativeUnixTime);
     }
-    // Twelve five-minute records exactly cover the fixed UTC hour.
-    let hour_start = unix_seconds / 3_600 * 3_600;
-    Ok((five_minute(hour_start)?, five_minute(hour_start + 3_599)?))
+    let window_start = unix_seconds / window_seconds * window_seconds;
+    Ok((
+        five_minute(window_start)?,
+        five_minute(window_start + window_seconds - 1)?,
+    ))
 }
 
 pub fn is_five_minute(value: i32) -> bool {
@@ -123,10 +131,15 @@ mod tests {
     }
 
     #[test]
-    fn hour_range_has_twelve_buckets() {
+    fn a_window_range_covers_its_five_minute_frames() {
         let unix_seconds = 1_800_123_456;
-        let (start, end) = hour_five_minute_range(unix_seconds).unwrap();
-        assert_eq!(end - start, 11);
+        let (start, end) = window_five_minute_range(unix_seconds, 3_600).unwrap();
+        assert_eq!(end - start, 11, "an hour is twelve frames");
+        let (start, end) = window_five_minute_range(unix_seconds, 600).unwrap();
+        assert_eq!(end - start, 1, "ten minutes are two frames");
+        // The window holding the instant, starting on a ten-minute boundary.
+        assert_eq!(start, five_minute(unix_seconds / 600 * 600).unwrap());
+        assert!(start <= five_minute(unix_seconds).unwrap());
     }
 
     #[test]

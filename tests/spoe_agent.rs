@@ -14,7 +14,7 @@ use fareward::{
         aggregation::UsageKey,
         block::Rejections,
         credits_blob::Credits,
-        quota::{CreditLimits, LimitPolicy, RateLimiter, ScopeLimits},
+        quota::{CreditLimits, LimitPolicy, RateLimiter, ScopeLimits, Windows},
         storage::{
             LimiterStore, StoredBudget, StoredBudgetRow, StoredBudgetUsage, StoredUsage,
             StoredUserAccess,
@@ -160,12 +160,12 @@ async fn start_agent_in(dir: PathBuf, burst: u64) -> TestAgent {
 
     let limits = ScopeLimits {
         cpu: CreditLimits {
-            ten_seconds: burst,
-            hour: 100_000,
+            short: burst,
+            long: 100_000,
         },
         inference: CreditLimits {
-            ten_seconds: burst,
-            hour: 100_000,
+            short: burst,
+            long: 100_000,
         },
     };
     let limiter = Arc::new(RateLimiter::new(
@@ -176,6 +176,7 @@ async fn start_agent_in(dir: PathBuf, burst: u64) -> TestAgent {
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 100,
             disable_user_limit: true,
+            windows: Windows::default(),
         },
         Arc::new(GrantStore),
         600,
@@ -395,6 +396,141 @@ async fn a_company_over_its_burst_is_refused_with_429() {
     .await;
     assert_eq!(var(&vars, "status"), &TypedData::Int32(429));
     assert_eq!(var(&vars, "reason"), &TypedData::String("credit".into()));
+}
+
+/// The `usage` variable's fields, split on `;`.
+fn usage(vars: &[(String, TypedData)]) -> Vec<String> {
+    let TypedData::String(header) = var(vars, "usage") else {
+        panic!("usage is not a string");
+    };
+    header.split(';').map(str::to_owned).collect()
+}
+
+/// The burst part of `{short}.{long}`: the bucket refills while the test runs, so only the long-window
+/// figure is exact.
+fn long_spent(field: &str) -> &str {
+    field.split_once('.').unwrap().1
+}
+
+#[tokio::test]
+async fn the_usage_header_reports_the_figures_and_the_reason() {
+    let agent = start_agent("usage", 1_000).await;
+    let mut stream = connect(&agent).await;
+    let bearer = format!("Bearer {SESSION_TOKEN}");
+    let unlimited = i64::MAX as u64;
+
+    // A read charges two credits. Users are not limited apart here, so the user's figure is empty.
+    let allowed = usage(
+        &ask(
+            &mut stream,
+            check(3, "GET", "/api/productos", Some(&bearer), None),
+            3,
+        )
+        .await,
+    );
+    assert_eq!(allowed[0], "42.");
+    assert_eq!(allowed[1], format!("7.{}", unlimited - 2));
+    assert_eq!(long_spent(&allowed[2]), "2");
+    assert_eq!(allowed[3], "0");
+    assert_eq!(allowed.len(), 4);
+
+    // No identity, no limiter: only the reason.
+    let bad_token = check(
+        5,
+        "GET",
+        "/api/productos",
+        Some("Bearer AAAAAAAAAAAA"),
+        None,
+    );
+    assert_eq!(
+        var(&ask(&mut stream, bad_token, 5).await, "usage"),
+        &TypedData::String("0.;0.;.;1".into())
+    );
+    let unknown = check(7, "GET", "/api/nope", Some(&bearer), None);
+    assert_eq!(
+        var(&ask(&mut stream, unknown, 7).await, "usage"),
+        &TypedData::String("0.;0.;.;4".into())
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_company_sees_how_many_requests_the_block_refused() {
+    // Ten credits of burst and two per read: the sixth read is refused by the limiter, which blocks
+    // the company, and the seventh by the block cache.
+    let agent = start_agent("usage-blocked", 10).await;
+    let mut stream = connect(&agent).await;
+    let bearer = format!("Bearer {SESSION_TOKEN}");
+    for stream_id in 1..=5 {
+        ask(
+            &mut stream,
+            check(stream_id, "GET", "/api/productos", Some(&bearer), None),
+            stream_id,
+        )
+        .await;
+    }
+    let refused = usage(
+        &ask(
+            &mut stream,
+            check(6, "GET", "/api/productos", Some(&bearer), None),
+            6,
+        )
+        .await,
+    );
+    assert_eq!(long_spent(&refused[2]), "10");
+    assert_eq!(refused[3], "5", "company over its short-window credits");
+    assert_eq!(refused.len(), 4, "the limiter answered, not the block");
+
+    for (stream_id, blocked) in [(7, "2"), (8, "3")] {
+        let fields = usage(
+            &ask(
+                &mut stream,
+                check(stream_id, "GET", "/api/productos", Some(&bearer), None),
+                stream_id,
+            )
+            .await,
+        );
+        assert_eq!(fields[0], "42.", "the block knows only the company");
+        assert_eq!(long_spent(&fields[2]), "10");
+        assert_eq!(fields[3], "5");
+        assert_eq!(fields[4], blocked);
+    }
+}
+
+#[tokio::test]
+async fn a_credit_refusal_carries_what_the_429_page_says() {
+    let agent = start_agent("refusal-vars", 10).await;
+    let mut stream = connect(&agent).await;
+    let bearer = format!("Bearer {SESSION_TOKEN}");
+    for stream_id in 1..=5 {
+        let vars = ask(
+            &mut stream,
+            check(stream_id, "GET", "/api/productos", Some(&bearer), None),
+            stream_id,
+        )
+        .await;
+        // Admitted: nothing to say about a refusal.
+        assert!(vars.iter().all(|(name, _)| name != "retry"));
+    }
+    for (stream_id, refused) in [(6, 1), (7, 2)] {
+        let vars = ask(
+            &mut stream,
+            check(stream_id, "GET", "/api/productos", Some(&bearer), None),
+            stream_id,
+        )
+        .await;
+        assert_eq!(
+            var(&vars, "window"),
+            &TypedData::String("en los últimos 10 segundos".into())
+        );
+        assert_eq!(var(&vars, "spent"), &TypedData::Int64(10));
+        assert_eq!(var(&vars, "refused"), &TypedData::Int32(refused));
+        // Two credits take about two seconds to refill; the margin makes it at least two, and the
+        // bucket never needs more than its ten-second period.
+        let TypedData::Int32(retry) = var(&vars, "retry") else {
+            panic!("retry is not an int32");
+        };
+        assert!((2..=11).contains(retry), "retry {retry}");
+    }
 }
 
 /// Serves the agent on `$FAREWARD_SPOE_E2E_DIR/spoe.sock` for `$FAREWARD_SPOE_E2E_SECONDS`, so a

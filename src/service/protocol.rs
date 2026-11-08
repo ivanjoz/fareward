@@ -14,7 +14,8 @@ use crate::{
     limiter::budget::MUTATE_BUDGET_MAX_PAYLOAD_SIZE,
     limiter::protocol::CHARGE_MAX_PAYLOAD_SIZE,
     lock::protocol::{ACQUIRE_MAX_PAYLOAD_SIZE, RELEASE_MAX_PAYLOAD_SIZE},
-    reqlog::protocol::REQUEST_LOG_MAX_PAYLOAD_SIZE,
+    store::grants::GRANTS_MAX_PAYLOAD_SIZE,
+    store::query::QUERY_MAX_PAYLOAD_SIZE,
 };
 
 pub const OPCODE_SIZE: usize = 1;
@@ -63,6 +64,9 @@ pub enum ReplyShape {
     /// The budget was not mutated. The body is `BudgetMutationReply`, minus its success value.
     BudgetRefused = 0x08,
     // 0x09 and 0x0A were the sequence service's replies, removed with it: MariaDB owns sequences.
+    /// A report (opcode `0x09`). The one reply that may be large, so its body is
+    /// `[length:u32][body]` rather than a width the shape implies.
+    Report = 0x0B,
     /// "I could not answer." Every operation's policy for it stays on the client: credits fail
     /// closed, lock call sites decide individually.
     Unavailable = 0x7F,
@@ -81,6 +85,7 @@ impl ReplyShape {
             0x06 => Some(Self::LockRefused),
             0x07 => Some(Self::Ack),
             0x08 => Some(Self::BudgetRefused),
+            0x0B => Some(Self::Report),
             0x7F => Some(Self::Unavailable),
             0x80 => Some(Self::LockLost),
             _ => None,
@@ -109,6 +114,8 @@ impl ReplyShape {
             Self::LockGranted => Some(2),
             // Two masks, a sub-byte count, and that many sub bytes.
             Self::ChargeGranted => None,
+            // A u32 length, and that many bytes.
+            Self::Report => None,
             // A push states its own length, so an unknown one is skippable.
             Self::LockLost => None,
         }
@@ -142,6 +149,8 @@ pub enum Reply {
     LockRefused(u8),
     Ack,
     BudgetRefused(u8),
+    /// A report body (`store::query`), sent behind its u32 length.
+    Report(Vec<u8>),
     Unavailable,
     LockLost {
         action: u16,
@@ -160,6 +169,7 @@ impl Reply {
             Self::LockRefused(_) => ReplyShape::LockRefused,
             Self::Ack => ReplyShape::Ack,
             Self::BudgetRefused(_) => ReplyShape::BudgetRefused,
+            Self::Report(_) => ReplyShape::Report,
             Self::Unavailable => ReplyShape::Unavailable,
             Self::LockLost { .. } => ReplyShape::LockLost,
         }
@@ -198,6 +208,10 @@ impl Reply {
             Self::LockGranted { generation } => {
                 frame.extend_from_slice(&generation.to_be_bytes())
             }
+            Self::Report(body) => {
+                frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                frame.extend_from_slice(body);
+            }
             Self::LockLost { action, identifier } => {
                 // Length first: every push carries one so a client that predates the shape can
                 // step over it instead of losing the connection.
@@ -210,8 +224,8 @@ impl Reply {
     }
 }
 
-/// Widest payload across every opcode, so one stack buffer serves them all. The request log is the
-/// widest by far — it carries strings — but still small enough to keep the buffer on the stack.
+/// Widest payload across every opcode, so one stack buffer serves them all. The grants push is the
+/// widest — it carries blobs — but still small enough to keep the buffer on the stack.
 ///
 /// `const fn` rather than a chain of `if` expressions, which is what this was while the widths
 /// came from two different families: one rule, one place to add the next opcode.
@@ -224,7 +238,10 @@ const LARGEST_PAYLOAD_SIZE: usize = larger(
         larger(CHARGE_MAX_PAYLOAD_SIZE, ACQUIRE_MAX_PAYLOAD_SIZE),
         larger(RELEASE_MAX_PAYLOAD_SIZE, MUTATE_BUDGET_MAX_PAYLOAD_SIZE),
     ),
-    larger(INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE, REQUEST_LOG_MAX_PAYLOAD_SIZE),
+    larger(
+        INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE,
+        larger(QUERY_MAX_PAYLOAD_SIZE, GRANTS_MAX_PAYLOAD_SIZE),
+    ),
 );
 pub const MAX_FRAME_SIZE: usize =
     OPCODE_SIZE + LENGTH_PREFIX_SIZE + LARGEST_PAYLOAD_SIZE + AUTH_TAG_SIZE;
@@ -235,10 +252,16 @@ pub enum Opcode {
     ChargeCredits = 0x01,
     LockAcquire = 0x02,
     LockRelease = 0x03,
-    LogRequest = 0x04,
+    // 0x04 was LogRequest: the backend writes its request log itself now, so the opcode is retired
+    // and stays unassigned like 0x07 and 0x08.
     MutateCompanyBudget = 0x05,
     InvalidateUserAccess = 0x06,
-    // 0x07 and 0x08 were ReserveSequence and SetSequence, removed with the sequence service.
+    // 0x07 and 0x08 were ReserveSequence and SetSequence, removed with the sequence service, and
+    // stay unassigned so a stale client cannot reach a new operation with them.
+    /// Reads usage, budgets or server metrics out of the store (`store::query`).
+    Report = 0x09,
+    /// Stores the grants the backend pushes and drops those users' cached ones (`store::grants`).
+    PutGrants = 0x0A,
 }
 
 impl Opcode {
@@ -249,9 +272,10 @@ impl Opcode {
             0x01 => Some(Self::ChargeCredits),
             0x02 => Some(Self::LockAcquire),
             0x03 => Some(Self::LockRelease),
-            0x04 => Some(Self::LogRequest),
             0x05 => Some(Self::MutateCompanyBudget),
             0x06 => Some(Self::InvalidateUserAccess),
+            0x09 => Some(Self::Report),
+            0x0A => Some(Self::PutGrants),
             _ => None,
         }
     }
@@ -264,21 +288,20 @@ impl Opcode {
             Self::ChargeCredits => CHARGE_MAX_PAYLOAD_SIZE,
             Self::LockAcquire => ACQUIRE_MAX_PAYLOAD_SIZE,
             Self::LockRelease => RELEASE_MAX_PAYLOAD_SIZE,
-            Self::LogRequest => REQUEST_LOG_MAX_PAYLOAD_SIZE,
             Self::MutateCompanyBudget => MUTATE_BUDGET_MAX_PAYLOAD_SIZE,
             Self::InvalidateUserAccess => INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE,
+            Self::Report => QUERY_MAX_PAYLOAD_SIZE,
+            Self::PutGrants => GRANTS_MAX_PAYLOAD_SIZE,
         }
     }
 
     /// Whether the daemon answers this opcode at all.
     ///
-    /// Two operations have nothing to say back. The request log is best effort, and making the
-    /// caller wait for an acknowledgement would put the daemon's latency on the response path of
-    /// every request in the system. An access invalidation is the same shape of promise: the TTL
-    /// bounds the damage if it is lost, so a user save must not wait on it. Both write the frame
-    /// and move on.
+    /// One operation has nothing to say back: an access invalidation is a best-effort promise, the
+    /// TTL bounds the damage if it is lost, so a user save must not wait on it. The client writes
+    /// the frame and moves on.
     pub fn expects_reply(self) -> bool {
-        !matches!(self, Self::LogRequest | Self::InvalidateUserAccess)
+        !matches!(self, Self::InvalidateUserAccess)
     }
 }
 
@@ -292,9 +315,10 @@ mod tests {
             Opcode::ChargeCredits,
             Opcode::LockAcquire,
             Opcode::LockRelease,
-            Opcode::LogRequest,
             Opcode::MutateCompanyBudget,
             Opcode::InvalidateUserAccess,
+            Opcode::Report,
+            Opcode::PutGrants,
         ] {
             let widest =
                 OPCODE_SIZE + LENGTH_PREFIX_SIZE + opcode.max_payload_size() + AUTH_TAG_SIZE;
@@ -303,11 +327,13 @@ mod tests {
     }
 
     #[test]
-    fn two_opcodes_are_unanswered_and_the_rest_are_answered() {
-        assert_eq!(Opcode::from_byte(0x04), Some(Opcode::LogRequest));
+    fn one_opcode_is_unanswered_and_the_rest_are_answered() {
+        // The retired opcodes stay unassigned: a stale client's frame closes the connection.
+        for retired in [0x00, 0x04, 0x07, 0x08] {
+            assert_eq!(Opcode::from_byte(retired), None);
+        }
 
-        // Nothing is sent back for either of these, so a client must not park a caller waiting.
-        assert!(!Opcode::LogRequest.expects_reply());
+        // Nothing is sent back for this one, so a client must not park a caller waiting.
         assert_eq!(Opcode::from_byte(0x06), Some(Opcode::InvalidateUserAccess));
         assert!(!Opcode::InvalidateUserAccess.expects_reply());
         for opcode in [
@@ -315,6 +341,8 @@ mod tests {
             Opcode::LockAcquire,
             Opcode::LockRelease,
             Opcode::MutateCompanyBudget,
+            Opcode::Report,
+            Opcode::PutGrants,
         ] {
             assert!(opcode.expects_reply());
         }
@@ -397,6 +425,15 @@ mod tests {
 
     /// A granted charge is the only reply whose body varies, so it is the only one that states its
     /// own length — the sub-access runs of the slots the user turned out to hold.
+    /// A report states its length in four bytes: it is the one reply that may outgrow a u8.
+    #[test]
+    fn a_report_is_length_prefixed() {
+        let frame = Reply::Report(vec![4, 0, 0, 0, 0]).encode(9);
+        assert_eq!(frame, [0x0B, 0x00, 0x09, 0, 0, 0, 5, 4, 0, 0, 0, 0]);
+        assert_eq!(ReplyShape::from_byte(0x0B), Some(ReplyShape::Report));
+        assert_eq!(ReplyShape::Report.body_size(), None);
+    }
+
     #[test]
     fn a_granted_charge_states_its_sub_byte_count() {
         let frame = Reply::ChargeGranted {
@@ -444,13 +481,14 @@ mod tests {
 
         // A ceiling is what an unauthenticated peer can make the daemon hold before the tag at the
         // end of the frame says whether to believe any of it, so every opcode needs one and none
-        // of them may be large. The request log is the only one that carries strings.
+        // of them may be large. The grants push is the only one that carries blobs.
         for opcode in [
             Opcode::ChargeCredits,
             Opcode::LockAcquire,
             Opcode::LockRelease,
             Opcode::MutateCompanyBudget,
             Opcode::InvalidateUserAccess,
+            Opcode::Report,
         ] {
             let ceiling = opcode.max_payload_size();
             assert!(
@@ -458,6 +496,7 @@ mod tests {
                 "{opcode:?} declares a {ceiling}-byte ceiling"
             );
         }
-        assert!(Opcode::LogRequest.max_payload_size() <= 4096);
+        // The grants push carries blobs, so it gets the widest ceiling: still a few KiB.
+        assert!(Opcode::PutGrants.max_payload_size() <= 8192);
     }
 }

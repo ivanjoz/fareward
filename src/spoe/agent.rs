@@ -17,6 +17,19 @@
 //! | `user`    | int32  | The verified user, 0 when there is none |
 //! | `route`   | int32  | The route number |
 //! | `grant`   | binary | Granted slots and sub-accesses, the TCP reply's tail: `[mask][subs][len][bytes]` |
+//! | `usage`   | string | The client's `x-fareward-usage` header (plan D10); not set in shadow mode |
+//!
+//! `usage` is `{user}.{user_day_left};{company}.{company_day_left};{short}.{long};{code}[;{blocked}]`:
+//! CPU credits the user and the company may still spend today, CPU credits the company spent in the
+//! short-window bucket and in the long window, the reason code (`reason_code`), and, only on a refusal
+//! answered by the block cache, how many requests that block has refused. A figure that is not known
+//! is left empty: no limiter state was read, users are not limited apart, or the block cache answered
+//! (it knows only the company).
+//!
+//! On a credit refusal (and outside shadow mode) four more variables feed the 429 page and its
+//! `Retry-After`: `window` (string, the refusing window worded for the sentence), `spent` (int64,
+//! credits spent in that window), `refused` (int32, requests refused since the block began) and
+//! `retry` (int32, seconds to wait, with a one-second margin).
 
 use std::{
     sync::{
@@ -39,7 +52,8 @@ use crate::{
     limiter::{
         access::{AccessDenial, AccessVerdict},
         credits_blob::Credits,
-        quota::{Decision, RateLimiter},
+        protocol::{LimitViolation, Scope, Window},
+        quota::{Decision, RateLimiter, UsageReport, Windows},
     },
     routes::{Admission, RouteMatch, RouteTableHandle},
     spoe::codec::{
@@ -89,6 +103,10 @@ pub struct Verdict {
     pub user_id: i32,
     pub route_id: u16,
     pub grant: Option<AccessVerdict>,
+    /// The gate that refused, on a credit refusal: it picks the reason code.
+    pub violation: Option<LimitViolation>,
+    /// The limiter's figures for the usage header, when the limiter read any.
+    pub usage: Option<UsageReport>,
 }
 
 impl Verdict {
@@ -100,10 +118,94 @@ impl Verdict {
             user_id: 0,
             route_id: 0,
             grant: None,
+            violation: None,
+            usage: None,
         }
     }
 
-    fn vars(&self) -> Vec<(VarScope, &'static str, TypedData)> {
+    /// The numeric reason the client sees, stable across releases: 0 let through, 1 bad or missing
+    /// token, 2 unknown or inactive user, 3 no access, 4 route or route policy, 5/6 company over its
+    /// short/long-window credits, 7/8 user over its short/long-window credits, 9/10 company/user out of
+    /// daily credits, 11 company over its monthly ceiling, 12 limiter unavailable.
+    pub fn reason_code(&self) -> u8 {
+        if self.status == 0 {
+            return 0;
+        }
+        if let Some(violation) = self.violation {
+            return match (violation.scope, violation.window) {
+                (Scope::Company, Window::Short) => 5,
+                (Scope::Company, Window::Long) => 6,
+                (Scope::User, Window::Short) => 7,
+                (Scope::User, Window::Long) => 8,
+                (Scope::Company, Window::Day) => 9,
+                (Scope::User, Window::Day) => 10,
+                (_, Window::Month) => 11,
+            };
+        }
+        match self.reason {
+            "token" => 1,
+            "identity" => 2,
+            "no-access" => 3,
+            "route" | "policy" => 4,
+            _ => 12,
+        }
+    }
+
+    /// The `x-fareward-usage` header's value; see the module documentation.
+    pub fn usage_header(&self) -> String {
+        let figure = |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
+        let usage = self.usage.unwrap_or_default();
+        let known = self.usage.is_some();
+        let mut header = format!(
+            "{}.{};{}.{};{}.{};{}",
+            self.user_id,
+            figure(usage.user_day_left),
+            self.company_id,
+            figure(known.then_some(usage.company_day_left)),
+            figure(known.then_some(usage.company_short_used)),
+            figure(known.then_some(usage.company_long_used)),
+            self.reason_code(),
+        );
+        if let Some(blocked) = usage.blocked {
+            header.push_str(&format!(";{blocked}"));
+        }
+        header
+    }
+
+    /// What the 429 page says, set only on a credit refusal: the window that refused (`window`,
+    /// already worded for the sentence), the credits it had spent (`spent`), the requests refused
+    /// since the block began (`refused`, this one counting) and the seconds to wait (`retry`).
+    fn refusal_vars(&self, windows: Windows) -> Vec<(VarScope, &'static str, TypedData)> {
+        let (Some(violation), Some(usage)) = (self.violation, self.usage) else {
+            return Vec::new();
+        };
+        let Some(retry_after) = usage.retry_after else {
+            return Vec::new();
+        };
+        let int32 = |value: u64| TypedData::Int32(i32::try_from(value).unwrap_or(i32::MAX));
+        vec![
+            (
+                VarScope::Transaction,
+                "window",
+                TypedData::String(windows.describe(violation.window)),
+            ),
+            (
+                VarScope::Transaction,
+                "spent",
+                TypedData::Int64(i64::try_from(usage.window_used).unwrap_or(i64::MAX)),
+            ),
+            (
+                VarScope::Transaction,
+                "refused",
+                int32(u64::from(usage.blocked.unwrap_or(1))),
+            ),
+            (VarScope::Transaction, "retry", int32(retry_after)),
+        ]
+    }
+
+    /// The variables for HAProxy. `usage` is left out in shadow mode: there the backend still
+    /// decides and charges, so the agent's figures and reason would describe a verdict nobody gave.
+    fn vars(&self, shadow: bool, windows: Windows) -> Vec<(VarScope, &'static str, TypedData)> {
         let mut vars = vec![
             (
                 VarScope::Transaction,
@@ -139,6 +241,14 @@ impl Verdict {
             ];
             tail.extend_from_slice(&grant.sub_bytes);
             vars.push((VarScope::Transaction, "grant", TypedData::Binary(tail)));
+        }
+        if !shadow {
+            vars.push((
+                VarScope::Transaction,
+                "usage",
+                TypedData::String(self.usage_header()),
+            ));
+            vars.extend(self.refusal_vars(windows));
         }
         vars
     }
@@ -196,6 +306,8 @@ impl Agent {
             user_id: user.id,
             route_id: entry.route_id,
             grant: None,
+            violation: None,
+            usage: None,
         };
 
         let request = match table.admission(entry, user.company_id, user.id, content_length) {
@@ -206,7 +318,13 @@ impl Agent {
             Admission::Ask(request) => request,
         };
 
-        let mut verdict = match self.ask(request).await {
+        // The figures come from this first call, the one that judged the credits: the operator's
+        // access-only retry below charges nothing and would only repeat them.
+        let (decision, usage) = match self.ask(request).await {
+            Ok((decision, usage)) => (Ok(decision), usage),
+            Err(limiter_error) => (Err(limiter_error), None),
+        };
+        let mut verdict = match decision {
             Ok(Decision::Allowed(grant)) => Verdict {
                 grant: request.requests_authorization().then_some(grant),
                 ..identified(0, "granted")
@@ -214,7 +332,7 @@ impl Agent {
             Ok(Decision::AccessDenied(AccessDenial::NoAccess)) => identified(403, "no-access"),
             // A missing or inactive user is about the session: re-authenticating is the fix.
             Ok(Decision::AccessDenied(_)) => identified(401, "identity"),
-            Ok(Decision::CreditViolation(_))
+            Ok(Decision::CreditViolation(violation))
                 if table.policy().tolerates_credit_refusal(user.company_id) =>
             {
                 // The operator is never locked out by its own budget, but still needs the
@@ -227,7 +345,7 @@ impl Agent {
                 if !access_only.requests_authorization() {
                     identified(0, "operator")
                 } else {
-                    match self.ask(access_only).await {
+                    match self.ask(access_only).await.map(|(decision, _)| decision) {
                         Ok(Decision::Allowed(grant)) => Verdict {
                             grant: Some(grant),
                             ..identified(0, "operator")
@@ -236,12 +354,18 @@ impl Agent {
                             identified(403, "no-access")
                         }
                         Ok(Decision::AccessDenied(_)) => identified(401, "identity"),
-                        Ok(Decision::CreditViolation(_)) => identified(429, "credit"),
+                        Ok(Decision::CreditViolation(_)) => Verdict {
+                            violation: Some(violation),
+                            ..identified(429, "credit")
+                        },
                         Err(_) => identified(503, "unavailable"),
                     }
                 }
             }
-            Ok(Decision::CreditViolation(_)) => identified(429, "credit"),
+            Ok(Decision::CreditViolation(violation)) => Verdict {
+                violation: Some(violation),
+                ..identified(429, "credit")
+            },
             Err(limiter_error) => {
                 warn!(error = %limiter_error, "spoe: limiter unavailable, failing closed");
                 identified(503, "unavailable")
@@ -250,14 +374,19 @@ impl Agent {
         if verdict.status == 0 && verdict.grant.is_none() && request.requests_authorization() {
             verdict.grant = Some(AccessVerdict::default());
         }
+        verdict.usage = usage;
         verdict
     }
 
-    async fn ask(&self, request: crate::limiter::protocol::Request) -> Result<Decision> {
+    /// The limiter's verdict and, outside shadow mode, the figures for the usage header.
+    async fn ask(
+        &self,
+        request: crate::limiter::protocol::Request,
+    ) -> Result<(Decision, Option<UsageReport>)> {
         if self.limits.shadow {
-            self.limiter.evaluate(request).await
+            Ok((self.limiter.evaluate(request).await?, None))
         } else {
-            self.limiter.admit(request).await
+            self.limiter.admit_reported(request).await
         }
     }
 
@@ -303,7 +432,11 @@ impl Agent {
                 self.metrics.protocol_errors.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %parse_error, "spoe: malformed NOTIFY, answering 503");
                 let refusal = Verdict::refuse(503, "malformed");
-                return codec::ack(frame.stream_id, frame.frame_id, &refusal.vars());
+                return codec::ack(
+                    frame.stream_id,
+                    frame.frame_id,
+                    &refusal.vars(self.limits.shadow, self.limiter.windows()),
+                );
             }
         };
         let mut vars = Vec::new();
@@ -311,7 +444,11 @@ impl Agent {
             .iter()
             .filter(|message| message.name == CHECK_MESSAGE)
         {
-            vars.extend(self.verdict_for(message).await.vars());
+            vars.extend(
+                self.verdict_for(message)
+                    .await
+                    .vars(self.limits.shadow, self.limiter.windows()),
+            );
         }
         codec::ack(frame.stream_id, frame.frame_id, &vars)
     }

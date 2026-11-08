@@ -1,12 +1,13 @@
-//! Loads rate-limiter and MariaDB settings with environment-over-TOML precedence.
+//! Loads the daemon settings with environment-over-TOML precedence.
 
 use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use toml::{Table, Value};
+use tracing::warn;
 
 use crate::{
-    limiter::quota::{CreditLimits, LimitPolicy, ScopeLimits},
+    limiter::quota::{CreditLimits, LimitPolicy, ScopeLimits, Windows},
     lock::registry::LockLimits,
 };
 
@@ -25,27 +26,9 @@ const DEFAULT_LOCK_MAX_TOTAL_WAITERS: u64 = 4_096;
 /// The wire carries the lease as a `u16` of milliseconds, so no ceiling above 65_535 is
 /// reachable in the first place.
 const DEFAULT_LOCK_MAX_LEASE_MS: u64 = 60_000;
-/// The backend's own default for [mariadb].port.
-const DEFAULT_MARIADB_PORT: u16 = 3306;
 
 /// Keeps the bridge next to the other Genix services on the same hosts (14010 backend, 14013 this process's rate limiter).
 const DEFAULT_BRIDGE_PORT: u16 = 14012;
-
-/// A month of request history is what a "what broke last week" question needs. The first key column
-/// is the date, so the retention purge deletes whole days.
-const DEFAULT_REQUEST_LOG_TTL_DAYS: u64 = 30;
-/// Long enough to batch a busy second, short enough that a row is queryable while the person who
-/// caused it is still looking at the screen.
-const DEFAULT_REQUEST_LOG_FLUSH_MS: u64 = 1_000;
-const DEFAULT_REQUEST_LOG_MAX_BATCH: usize = 128;
-/// How long a written `request_errors` row is considered fresh enough to leave alone.
-const DEFAULT_REQUEST_LOG_ERROR_CACHE_SECONDS: u64 = 600;
-/// Bounds the suppression map. Distinct failing code lines are bounded by the codebase, so this is
-/// a backstop against pathology rather than a working limit.
-const DEFAULT_REQUEST_LOG_ERROR_CACHE_ENTRIES: usize = 20_000;
-/// Records waiting to be written. Past this the writer drops them: a log row must never be the
-/// reason a request, or this daemon, slows down.
-const DEFAULT_REQUEST_LOG_QUEUE_CAPACITY: usize = 8_192;
 
 /// One sub-sample a second, and the peak of five of them per row. Both mirror the Go side:
 /// `ServerMetricSlotSeconds` in backend/core/types/server_metrics.go is 5, and the clustering key
@@ -53,7 +36,7 @@ const DEFAULT_REQUEST_LOG_QUEUE_CAPACITY: usize = 8_192;
 /// disagreeing about what slot 4 covers.
 const DEFAULT_SERVER_METRICS_SAMPLE_SECONDS: u64 = 1;
 const DEFAULT_SERVER_METRICS_ROW_SECONDS: u64 = 5;
-/// A month of history, matching the request log. The first key column is the day, so it is purged whole.
+/// A month of history. The first key column is the day, so it is purged whole.
 const DEFAULT_SERVER_METRICS_TTL_DAYS: u64 = 30;
 /// A row is 17280 slots a day of int16s, so the useful floor is set by the int16 key rather than by
 /// storage: fewer than three seconds a slot overflows it.
@@ -62,18 +45,6 @@ const DEFAULT_SERVER_METRICS_BACKEND_UNIT: &str = "genix.service";
 const DEFAULT_SERVER_METRICS_FAREWARD_UNIT: &str = "fareward.service";
 /// The database's unit. Its samples land in the scylla_* columns, which the Go schema still names.
 const DEFAULT_SERVER_METRICS_DATABASE_UNIT: &str = "mariadb.service";
-
-#[derive(Clone, Debug)]
-pub struct DatabaseConfig {
-    pub host: String,
-    pub port: u16,
-    /// db.name: the database the backend's ORM created the tables in.
-    pub database: String,
-    pub user: String,
-    pub password: String,
-    /// [mariadb].socket: the server's Unix socket, dialed instead of host:port when it is set.
-    pub socket: Option<String>,
-}
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -95,17 +66,21 @@ pub struct AppConfig {
     /// `X-Bridge-Auth` header. Distinct from `secret_phrase` so token signing and
     /// inter-service authentication can be rotated independently.
     pub internal_apikey: Vec<u8>,
-    pub database: DatabaseConfig,
     pub policy: LimitPolicy,
     /// Process-wide ceilings for the lock service. Per-action policy is deliberately absent:
     /// that belongs to the Go call sites, which is what keeps this service generic.
     pub locks: LockLimits,
     pub bridge: BridgeConfig,
-    pub request_log: RequestLogConfig,
     pub server_metrics: ServerMetricsConfig,
     /// The HAProxy SPOE agent; `None` unless `[spoe].socket` is set.
     pub spoe: Option<SpoeConfig>,
+    /// `[store].path`: the directory of Fareward's own store (usage, budgets, server metrics).
+    /// Local disk; it is the source of truth for those, so it is what a backup copies.
+    pub store_path: PathBuf,
 }
+
+/// Where the store lives when `[store].path` is not set: the systemd StateDirectory convention.
+pub const DEFAULT_STORE_PATH: &str = "/var/lib/fareward/store";
 
 /// `[spoe]`: the agent HAProxy asks before reading a request body (plan phase 4).
 #[derive(Clone, Debug)]
@@ -128,8 +103,7 @@ pub struct SpoeConfig {
 
 #[derive(Clone, Debug)]
 pub struct ServerMetricsConfig {
-    /// Off means no sampling loop at all. Unlike the request log there is no client to keep from
-    /// breaking here — nothing calls into this, it only ticks.
+    /// Off means no sampling loop at all: nothing calls into this, it only ticks.
     pub enabled: bool,
     pub sample_interval: Duration,
     /// Seconds per stored row, which is also what the clustering key counts. Kept as a number
@@ -145,21 +119,6 @@ pub struct ServerMetricsConfig {
     pub backend_unit: String,
     pub fareward_unit: String,
     pub scylla_unit: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct RequestLogConfig {
-    /// Off means opcode 0x04 is accepted and discarded rather than refused. Refusing would close
-    /// the connection of a backend that is only trying to log, taking its charges and locks with
-    /// it — the switch is for not writing rows, not for breaking clients.
-    pub enabled: bool,
-    /// Days of user_logs kept; older days are deleted by the writer's purge.
-    pub retention_days: i16,
-    pub flush_interval: Duration,
-    pub max_batch: usize,
-    pub error_freshness: Duration,
-    pub error_cache_entries: usize,
-    pub queue_capacity: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -187,8 +146,7 @@ impl AppConfig {
             .ok()
             .filter(|port| *port > 0)
             .context("fareward.port must be a port number between 1 and 65535")?;
-        let listen_octets = if optional_bool(&config, "FAREWARD_PUBLIC", "fareward.public")
-        {
+        let listen_octets = if optional_bool(&config, "FAREWARD_PUBLIC", "fareward.public") {
             [0, 0, 0, 0]
         } else {
             [127, 0, 0, 1]
@@ -271,6 +229,7 @@ impl AppConfig {
             .unwrap_or(100),
             // Off by default: turning it on drops every per-user gate, which is a policy decision
             // and not something a missing key should make.
+            windows: load_windows(&config)?,
             disable_user_limit: optional_bool(
                 &config,
                 "RATE_LIMIT_DISABLE_USER_LIMIT",
@@ -296,58 +255,6 @@ impl AppConfig {
             max_lease: Duration::from_millis(lock_max_lease_ms),
         };
 
-        // Every value here has a default, unlike the eight credit ceilings: a guessed quota is
-        // worse than none, but a guessed flush interval for a log table is simply a flush interval.
-        // An absent [request_log] section therefore means "on, with these", not a refusal to start.
-        let request_log_ttl_days =
-            optional_u64(&config, "REQUEST_LOG_TTL_DAYS", "request_log.ttl_days")?
-                .unwrap_or(DEFAULT_REQUEST_LOG_TTL_DAYS);
-        let request_log_flush_ms =
-            optional_u64(&config, "REQUEST_LOG_FLUSH_MS", "request_log.flush_ms")?
-                .unwrap_or(DEFAULT_REQUEST_LOG_FLUSH_MS);
-        let request_log_max_batch =
-            optional_usize(&config, "REQUEST_LOG_MAX_BATCH", "request_log.max_batch")?
-                .unwrap_or(DEFAULT_REQUEST_LOG_MAX_BATCH);
-        let request_log_error_cache_seconds = optional_u64(
-            &config,
-            "REQUEST_LOG_ERROR_CACHE_SECONDS",
-            "request_log.error_cache_seconds",
-        )?
-        .unwrap_or(DEFAULT_REQUEST_LOG_ERROR_CACHE_SECONDS);
-        let request_log_error_cache_entries = optional_usize(
-            &config,
-            "REQUEST_LOG_ERROR_CACHE_ENTRIES",
-            "request_log.error_cache_entries",
-        )?
-        .unwrap_or(DEFAULT_REQUEST_LOG_ERROR_CACHE_ENTRIES);
-        let request_log_queue_capacity = optional_usize(
-            &config,
-            "REQUEST_LOG_QUEUE_CAPACITY",
-            "request_log.queue_capacity",
-        )?
-        .unwrap_or(DEFAULT_REQUEST_LOG_QUEUE_CAPACITY);
-        if request_log_ttl_days == 0
-            || request_log_flush_ms == 0
-            || request_log_max_batch == 0
-            || request_log_error_cache_entries == 0
-            || request_log_queue_capacity == 0
-        {
-            bail!("request_log intervals, batch sizes and capacities must be positive");
-        }
-        // The purge compares against the int16 UnixDay key, so the retention must fit it too.
-        let request_log_retention_days = i16::try_from(request_log_ttl_days)
-            .context("request_log.ttl_days must fit in int16")?;
-        let request_log = RequestLogConfig {
-            enabled: optional_string(&config, "REQUEST_LOG_ENABLED", "request_log.enabled")
-                .is_none_or(|value| value == "1" || value.eq_ignore_ascii_case("true")),
-            retention_days: request_log_retention_days,
-            flush_interval: Duration::from_millis(request_log_flush_ms),
-            max_batch: request_log_max_batch,
-            error_freshness: Duration::from_secs(request_log_error_cache_seconds),
-            error_cache_entries: request_log_error_cache_entries,
-            queue_capacity: request_log_queue_capacity,
-        };
-
         let server_metrics = load_server_metrics(&config)?;
         let spoe = load_spoe(&config)?;
 
@@ -360,6 +267,11 @@ impl AppConfig {
         }
 
         Ok(Self {
+            store_path: PathBuf::from(
+                optional_string(&config, "FAREWARD_STORE_PATH", "store.path")
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or_else(|| DEFAULT_STORE_PATH.to_owned()),
+            ),
             listen_address,
             unix_socket_path,
             flush_interval: Duration::from_secs(flush_seconds),
@@ -376,29 +288,15 @@ impl AppConfig {
                 verbose_logs: optional_string(&config, "SSE_BRIDGE_VERBOSE", "sse_bridge.verbose")
                     .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             },
-            // The same keys the backend reads: [mariadb] for the connection, db.name for the database.
-            database: DatabaseConfig {
-                host: required_string(&config, "MARIADB_HOST", "mariadb.host")?,
-                port: optional_u64(&config, "MARIADB_PORT", "mariadb.port")?
-                    .map(|port| u16::try_from(port).context("mariadb.port must be a valid TCP port"))
-                    .transpose()?
-                    .unwrap_or(DEFAULT_MARIADB_PORT),
-                database: required_string(&config, "DB_NAME", "db.name")?,
-                user: required_string(&config, "MARIADB_USER", "mariadb.user")?,
-                password: required_string(&config, "MARIADB_PASSWORD", "mariadb.password")?,
-                socket: optional_string(&config, "MARIADB_SOCKET", "mariadb.socket")
-                    .filter(|socket| !socket.is_empty()),
-            },
             policy,
             locks,
-            request_log,
             server_metrics,
             spoe,
         })
     }
 }
 
-/// Every value defaults, like the request log's: a guessed sampling interval is a sampling
+/// Every value defaults: a guessed sampling interval is a sampling
 /// interval, not a guessed quota. An absent `[server_metrics]` section means "on, with these".
 fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
     let sample_seconds = optional_u64(
@@ -474,68 +372,141 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
     })
 }
 
+/// `rate_limit.short_window_seconds` and `rate_limit.long_window_minutes`. Absent means the windows
+/// the daemon had before they were configurable, ten seconds and one hour, so a configuration that
+/// predates them keeps its behaviour.
+fn load_windows(config: &Table) -> Result<Windows> {
+    let defaults = Windows::default();
+    let windows = Windows {
+        short_seconds: optional_u64(
+            config,
+            "RATE_LIMIT_SHORT_WINDOW_SECONDS",
+            "rate_limit.short_window_seconds",
+        )?
+        .unwrap_or(defaults.short_seconds),
+        long_minutes: optional_u64(
+            config,
+            "RATE_LIMIT_LONG_WINDOW_MINUTES",
+            "rate_limit.long_window_minutes",
+        )?
+        .unwrap_or(defaults.long_minutes),
+    };
+    validate_windows(windows)?;
+    Ok(windows)
+}
+
+fn validate_windows(windows: Windows) -> Result<()> {
+    if windows.short_seconds == 0 {
+        bail!("rate_limit.short_window_seconds must be greater than zero");
+    }
+    // Five-minute steps because a restart rebuilds the long window from the five-minute usage
+    // rows; any other length would start or end in the middle of one.
+    if windows.long_minutes == 0 || windows.long_minutes % 5 != 0 {
+        bail!("rate_limit.long_window_minutes must be a positive multiple of 5");
+    }
+    // A long window past a day would outlive the daily entitlement it sits under; that is what
+    // the daily gate is for.
+    if windows.long_minutes > 24 * 60 {
+        bail!("rate_limit.long_window_minutes must be at most 1440 (one day)");
+    }
+    if windows.short_seconds >= windows.long_minutes * 60 {
+        bail!("rate_limit.short_window_seconds must be shorter than the long window");
+    }
+    Ok(())
+}
+
 fn load_scope_limits(config: &Table, env_scope: &str, toml_scope: &str) -> Result<ScopeLimits> {
     // Environment names stay flat while TOML values live in the grouped rate_limit section.
+    let value = |env_credit, toml_credit, window: &LimitName| {
+        rate_limit_value(
+            config,
+            env_scope,
+            toml_scope,
+            env_credit,
+            toml_credit,
+            window,
+        )
+    };
     Ok(ScopeLimits {
         cpu: CreditLimits {
-            ten_seconds: rate_limit_value(
-                config, env_scope, toml_scope, "CPU", "cpu", "10S", "10s",
-            )?,
-            hour: rate_limit_value(config, env_scope, toml_scope, "CPU", "cpu", "1H", "1h")?,
+            short: value("CPU", "cpu", &SHORT_LIMIT)?,
+            long: value("CPU", "cpu", &LONG_LIMIT)?,
         },
         inference: CreditLimits {
-            ten_seconds: rate_limit_value(
-                config,
-                env_scope,
-                toml_scope,
-                "INFERENCE",
-                "inference",
-                "10S",
-                "10s",
-            )?,
-            hour: rate_limit_value(
-                config,
-                env_scope,
-                toml_scope,
-                "INFERENCE",
-                "inference",
-                "1H",
-                "1h",
-            )?,
+            short: value("INFERENCE", "inference", &SHORT_LIMIT)?,
+            long: value("INFERENCE", "inference", &LONG_LIMIT)?,
         },
     })
 }
 
+/// The suffix of one window's credit limit, now and before the windows were configurable.
+struct LimitName {
+    env: &'static str,
+    toml: &'static str,
+    legacy_env: &'static str,
+    legacy_toml: &'static str,
+}
+
+const SHORT_LIMIT: LimitName = LimitName {
+    env: "SHORT",
+    toml: "short",
+    legacy_env: "10S",
+    legacy_toml: "10s",
+};
+
+const LONG_LIMIT: LimitName = LimitName {
+    env: "LONG",
+    toml: "long",
+    legacy_env: "1H",
+    legacy_toml: "1h",
+};
+
+/// The credits per window, from `company_cpu_short` and the like. The names before the windows were
+/// configurable (`_10s`, `_1h`) are still read, with a warning, so an existing deployment keeps
+/// starting; the new name wins when both are set.
 fn rate_limit_value(
     config: &Table,
     env_scope: &str,
     toml_scope: &str,
     env_credit: &str,
     toml_credit: &str,
-    env_window: &str,
-    toml_window: &str,
+    window: &LimitName,
 ) -> Result<u64> {
-    required_u64(
-        config,
-        &format!("RATE_LIMIT_{env_scope}_{env_credit}_{env_window}"),
-        &format!("rate_limit.{toml_scope}_{toml_credit}_{toml_window}"),
-    )
+    let env_key = format!("RATE_LIMIT_{env_scope}_{env_credit}_{}", window.env);
+    let toml_path = format!("rate_limit.{toml_scope}_{toml_credit}_{}", window.toml);
+    if value_text(config, &env_key, &toml_path).is_some() {
+        return required_u64(config, &env_key, &toml_path);
+    }
+    let legacy_env = format!("RATE_LIMIT_{env_scope}_{env_credit}_{}", window.legacy_env);
+    let legacy_toml = format!(
+        "rate_limit.{toml_scope}_{toml_credit}_{}",
+        window.legacy_toml
+    );
+    if value_text(config, &legacy_env, &legacy_toml).is_some() {
+        warn!(
+            old = %legacy_toml,
+            new = %toml_path,
+            "deprecated rate-limit name: it now means credits per configured window, rename it"
+        );
+        return required_u64(config, &legacy_env, &legacy_toml);
+    }
+    required_u64(config, &env_key, &toml_path)
 }
 
 fn validate_policy(policy: LimitPolicy) -> Result<()> {
     for (scope_name, scope) in [("company", policy.company), ("user", policy.user)] {
         for (credit_name, limits) in [("cpu", scope.cpu), ("inference", scope.inference)] {
-            if limits.ten_seconds == 0 {
+            if limits.short == 0 {
                 bail!("rate_limit.{scope_name}_{credit_name} limits must be positive");
             }
-            if limits.ten_seconds > limits.hour {
+            if limits.short > limits.long {
                 bail!(
-                    "rate_limit.{scope_name}_{credit_name} limits must be nondecreasing from 10s to 1h"
+                    "rate_limit.{scope_name}_{credit_name} limits must be nondecreasing from the short to the long window"
                 );
             }
         }
     }
-    // No ordering rule against the hourly ceilings: this is a different axis, not a longer window.
+    // No ordering rule against the long-window ceilings: this is a different axis, not a longer window.
     // The only bound is the int64 column the counter is flushed to.
     if policy.company_extra_daily_cpu > i64::MAX as u64 {
         bail!("rate_limit.company_extra_credits_24h must fit a signed 64-bit database column");
@@ -636,8 +607,8 @@ fn optional_string(config: &Table, env_key: &str, toml_path: &str) -> Option<Str
 }
 
 fn load_spoe(config: &Table) -> Result<Option<SpoeConfig>> {
-    let Some(socket) =
-        optional_string(config, "FAREWARD_SPOE_SOCKET", "spoe.socket").filter(|path| !path.is_empty())
+    let Some(socket) = optional_string(config, "FAREWARD_SPOE_SOCKET", "spoe.socket")
+        .filter(|path| !path.is_empty())
     else {
         return Ok(None);
     };
@@ -656,8 +627,12 @@ fn load_spoe(config: &Table) -> Result<Option<SpoeConfig>> {
         }
         Ok(value)
     };
-    let max_frame_size = optional_u64(config, "FAREWARD_SPOE_MAX_FRAME_SIZE", "spoe.max_frame_size")?
-        .unwrap_or(16_384);
+    let max_frame_size = optional_u64(
+        config,
+        "FAREWARD_SPOE_MAX_FRAME_SIZE",
+        "spoe.max_frame_size",
+    )?
+    .unwrap_or(16_384);
     // HAProxy's own floor and its tune.bufsize ceiling; outside them the handshake cannot agree.
     if !(256..=1_048_576).contains(&max_frame_size) {
         bail!("spoe.max_frame_size must be between 256 and 1048576");
@@ -666,13 +641,21 @@ fn load_spoe(config: &Table) -> Result<Option<SpoeConfig>> {
         socket_path: PathBuf::from(socket),
         routes_file: PathBuf::from(routes_file),
         routes_poll: Duration::from_millis(
-            optional_u64(config, "FAREWARD_SPOE_ROUTES_POLL_MS", "spoe.routes_poll_ms")?
-                .unwrap_or(2_000)
-                .max(100),
+            optional_u64(
+                config,
+                "FAREWARD_SPOE_ROUTES_POLL_MS",
+                "spoe.routes_poll_ms",
+            )?
+            .unwrap_or(2_000)
+            .max(100),
         ),
         shadow,
         max_connections: positive(
-            optional_usize(config, "FAREWARD_SPOE_MAX_CONNECTIONS", "spoe.max_connections")?,
+            optional_usize(
+                config,
+                "FAREWARD_SPOE_MAX_CONNECTIONS",
+                "spoe.max_connections",
+            )?,
             64,
             "spoe.max_connections",
         )?,
@@ -739,10 +722,14 @@ mod tests {
             "[fareward]\nport = 14013\npublic = true\n[[models]]\nid = 'a'\n[[models]]\nid = 'b'",
         )
         .unwrap();
-        let local: Table = toml::from_str("[fareward]\npublic = false\n[[models]]\nid = 'c'").unwrap();
+        let local: Table =
+            toml::from_str("[fareward]\npublic = false\n[[models]]\nid = 'c'").unwrap();
         merge_config_override(&mut config, local);
 
-        assert_eq!(optional_u64(&config, "IGNORED_PORT", "fareward.port").unwrap(), Some(14013));
+        assert_eq!(
+            optional_u64(&config, "IGNORED_PORT", "fareward.port").unwrap(),
+            Some(14013)
+        );
         assert_eq!(config["fareward"]["public"].as_bool(), Some(false));
         let models = config["models"].as_array().unwrap();
         assert_eq!(models.len(), 1);
@@ -811,14 +798,11 @@ mod tests {
 
     #[test]
     fn zero_credit_limits_are_rejected() {
-        let positive = CreditLimits {
-            ten_seconds: 1,
-            hour: 1,
-        };
+        let positive = CreditLimits { short: 1, long: 1 };
         let policy = LimitPolicy {
             company: ScopeLimits {
                 cpu: CreditLimits {
-                    ten_seconds: 0,
+                    short: 0,
                     ..positive
                 },
                 inference: positive,
@@ -830,6 +814,7 @@ mod tests {
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 100,
             disable_user_limit: false,
+            windows: Windows::default(),
         };
 
         assert!(validate_policy(policy).is_err());
@@ -837,10 +822,7 @@ mod tests {
 
     #[test]
     fn an_extra_daily_pool_beyond_int64_is_rejected() {
-        let positive = CreditLimits {
-            ten_seconds: 1,
-            hour: 1,
-        };
+        let positive = CreditLimits { short: 1, long: 1 };
         let scope = ScopeLimits {
             cpu: positive,
             inference: positive,
@@ -853,6 +835,7 @@ mod tests {
             company_extra_daily_cpu: i64::MAX as u64 + 1,
             user_daily_share_pct: 100,
             disable_user_limit: false,
+            windows: Windows::default(),
         };
         assert!(validate_policy(policy).is_err());
 
@@ -864,11 +847,61 @@ mod tests {
     }
 
     #[test]
+    fn absent_windows_keep_ten_seconds_and_one_hour() {
+        assert_eq!(load_windows(&Table::new()).unwrap(), Windows::default());
+        let configured: Table =
+            toml::from_str("[rate_limit]\nshort_window_seconds = 10\nlong_window_minutes = 10")
+                .unwrap();
+        assert_eq!(
+            load_windows(&configured).unwrap(),
+            Windows {
+                short_seconds: 10,
+                long_minutes: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn the_long_window_steps_by_five_minutes_and_outlasts_the_short_one() {
+        let windows = |toml: &str| load_windows(&toml::from_str(toml).unwrap());
+        assert!(windows("[rate_limit]\nlong_window_minutes = 7").is_err());
+        assert!(windows("[rate_limit]\nlong_window_minutes = 0").is_err());
+        assert!(windows("[rate_limit]\nlong_window_minutes = 1445").is_err());
+        assert!(windows("[rate_limit]\nshort_window_seconds = 0").is_err());
+        assert!(
+            windows("[rate_limit]\nshort_window_seconds = 300\nlong_window_minutes = 5").is_err()
+        );
+        assert!(windows("[rate_limit]\nlong_window_minutes = 15").is_ok());
+    }
+
+    /// `_short`/`_long` are the names; `_10s`/`_1h` still start an older deployment, and the new
+    /// name wins when both are there.
+    #[test]
+    fn window_limits_are_read_under_the_new_and_the_old_names() {
+        let new: Table = toml::from_str(
+            "[rate_limit]\ncompany_cpu_short = 5\ncompany_cpu_long = 50\n\
+             company_inference_short = 6\ncompany_inference_long = 60",
+        )
+        .unwrap();
+        let limits = load_scope_limits(&new, "COMPANY", "company").unwrap();
+        assert_eq!((limits.cpu.short, limits.cpu.long), (5, 50));
+        assert_eq!((limits.inference.short, limits.inference.long), (6, 60));
+
+        let old: Table = toml::from_str(
+            "[rate_limit]\ncompany_cpu_10s = 5\ncompany_cpu_1h = 50\n\
+             company_inference_10s = 6\ncompany_inference_1h = 60\ncompany_cpu_short = 7",
+        )
+        .unwrap();
+        let limits = load_scope_limits(&old, "COMPANY", "company").unwrap();
+        assert_eq!((limits.cpu.short, limits.cpu.long), (7, 50));
+        assert_eq!(limits.inference.long, 60);
+
+        assert!(load_scope_limits(&Table::new(), "COMPANY", "company").is_err());
+    }
+
+    #[test]
     fn the_user_daily_share_must_stay_inside_one_to_a_hundred() {
-        let positive = CreditLimits {
-            ten_seconds: 1,
-            hour: 1,
-        };
+        let positive = CreditLimits { short: 1, long: 1 };
         let scope = ScopeLimits {
             cpu: positive,
             inference: positive,
@@ -879,6 +912,7 @@ mod tests {
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 80,
             disable_user_limit: false,
+            windows: Windows::default(),
         };
         assert!(validate_policy(policy).is_ok());
         // Zero refuses every user of a company that still has credit; past 100 the gate can never be

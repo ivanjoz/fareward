@@ -1,5 +1,5 @@
 // Package fareward is the Go client for the fareward daemon: the access gate and credit limiter,
-// the lock service, and the request log, all reached over one multiplexed raw-TCP connection.
+// the lock service, the reports and the grants push, all reached over one multiplexed raw-TCP connection.
 //
 // It is also the reference implementation of that wire protocol. The daemon's README calls the
 // frame format "contract 1"; this package is what that contract looks like written out, so a
@@ -19,7 +19,6 @@
 //
 //	err := fareward.ChargeAPIUsage(ctx, companyID, userID, routeID, method, payloadBytes, required)
 //	lock, err := fareward.AcquireLock(ctx, action, identifier, maxWaiters)
-//	err := fareward.SendRequestLog(ctx, record)
 //
 // Every call is safe for concurrent use and dials lazily, so ConfigureFareward does not fail
 // because the daemon has not started yet, and a dropped connection redials on the next call. A

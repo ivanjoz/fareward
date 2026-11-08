@@ -55,12 +55,9 @@ const (
 	opcodeChargeCredits = byte(0x01)
 	opcodeLockAcquire   = byte(0x02)
 	opcodeLockRelease   = byte(0x03)
-	// opcodeLogRequest is one of the two opcodes the daemon does not answer: it carries a log
-	// record, and making a response wait for an acknowledgement that a log was stored would put the
-	// daemon's latency on the critical path of every request in the system.
-	opcodeLogRequest          = byte(0x04)
+	// 0x04 was the request log, retired: the backend writes its request log itself.
 	opcodeMutateCompanyBudget = byte(0x05)
-	// opcodeInvalidateUserAccess is the second unanswered opcode: the TTL on the daemon's grant
+	// opcodeInvalidateUserAccess is the only unanswered opcode: the TTL on the daemon's grant
 	// cache is the backstop if it is lost, so a user save does not wait for an acknowledgement.
 	opcodeInvalidateUserAccess = byte(0x06)
 	// The two sequence opcodes are the only request payloads that are not colbin messages. They are
@@ -68,6 +65,8 @@ const (
 	// reserve path is the ORM's insert path, and the shape has no room to grow.
 	opcodeReserveSequence = byte(0x07)
 	opcodeSetSequence     = byte(0x08)
+	// opcodeReport reads usage, budgets and server metrics out of the daemon's store (reports.go).
+	opcodeReport = byte(0x09)
 
 	// Frames are tiny and the daemon is on loopback or a private network, so a write that cannot
 	// complete in this long means the connection is gone.
@@ -105,6 +104,8 @@ const (
 	replyBudgetRefused         = byte(0x08)
 	replySequenceValue         = byte(0x09)
 	replySequenceInvalid       = byte(0x0A)
+	// replyReport is the one reply that may be large: [length:u32][body].
+	replyReport = byte(0x0B)
 	// replyUnavailable is "I could not answer". Every operation applies its own policy to it:
 	// credits fail closed, a sequence fails the write, lock call sites decide individually.
 	replyUnavailable = byte(0x7F)
@@ -131,6 +132,9 @@ func replyBodySize(shape byte) (int, bool) {
 	case replyChargeGranted:
 		// Two masks, a sub-byte count, and that many sub bytes.
 		return -1, true
+	case replyReport:
+		// A u32 length, and that many bytes.
+		return reportBodySize, true
 	default:
 		return 0, false
 	}
@@ -533,8 +537,15 @@ func (connection *muxConnection) readLoop(client *FarewardClient) {
 				"fareward sent reply shape 0x%02X, which this client does not know", answer.shape))
 			return
 		}
-		if size < 0 {
-			// The one variable body: two masks and the sub-byte count that follows them.
+		if size == reportBodySize {
+			body, err := readReportBody(connection.conn)
+			if err != nil {
+				connection.fail(err)
+				return
+			}
+			answer.body = body
+		} else if size < 0 {
+			// The granted charge: two masks and the sub-byte count that follows them.
 			answer.body = make([]byte, 3)
 			if _, err := io.ReadFull(connection.conn, answer.body); err != nil {
 				connection.fail(err)
