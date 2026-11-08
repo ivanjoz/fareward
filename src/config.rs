@@ -1,4 +1,4 @@
-//! Loads rate-limiter and Scylla settings with environment-over-TOML precedence.
+//! Loads rate-limiter and MariaDB settings with environment-over-TOML precedence.
 
 use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -8,7 +8,6 @@ use toml::{Table, Value};
 use crate::{
     limiter::quota::{CreditLimits, LimitPolicy, ScopeLimits},
     lock::registry::LockLimits,
-    sequence::allocator::SequenceLimits,
 };
 
 const DEFAULT_LISTEN_PORT: u16 = 14013;
@@ -26,22 +25,14 @@ const DEFAULT_LOCK_MAX_TOTAL_WAITERS: u64 = 4_096;
 /// The wire carries the lease as a `u16` of milliseconds, so no ceiling above 65_535 is
 /// reachable in the first place.
 const DEFAULT_LOCK_MAX_LEASE_MS: u64 = 60_000;
-/// Values reserved per durable counter bump. The trade is restart burn against round trips: a
-/// daemon that stops mid-block loses the block's unused tail, so this stays small enough that the
-/// loss is invisible against the `updated_version` delta-view ceiling (10^8 writes per partition at
-/// its narrowest) and large enough that a busy counter is not writing to ScyllaDB on every insert.
-const DEFAULT_SEQUENCE_BLOCK_SIZE: u32 = 64;
-/// Counter names held in memory at once. Real cardinality is companies × tables × parts, and each
-/// entry is a short string and two integers, so this is a backstop against pathology rather than a
-/// working limit.
-const DEFAULT_SEQUENCE_MAX_TRACKED_NAMES: usize = 200_000;
+/// The backend's own default for [mariadb].port.
+const DEFAULT_MARIADB_PORT: u16 = 3306;
 
-/// Keeps the bridge next to the other Genix services on the same hosts (14008 ScyllaDB,
-/// 14010 backend, 14013 this process's rate limiter).
+/// Keeps the bridge next to the other Genix services on the same hosts (14010 backend, 14013 this process's rate limiter).
 const DEFAULT_BRIDGE_PORT: u16 = 14012;
 
-/// A month of request history is what a "what broke last week" question needs; the partition is
-/// the date, so a whole day expires together and Scylla drops it wholesale.
+/// A month of request history is what a "what broke last week" question needs. The first key column
+/// is the date, so the retention purge deletes whole days.
 const DEFAULT_REQUEST_LOG_TTL_DAYS: u64 = 30;
 /// Long enough to batch a busy second, short enough that a row is queryable while the person who
 /// caused it is still looking at the screen.
@@ -62,20 +53,22 @@ const DEFAULT_REQUEST_LOG_QUEUE_CAPACITY: usize = 8_192;
 /// disagreeing about what slot 4 covers.
 const DEFAULT_SERVER_METRICS_SAMPLE_SECONDS: u64 = 1;
 const DEFAULT_SERVER_METRICS_ROW_SECONDS: u64 = 5;
-/// A month of history, matching the request log. The partition is the day, so it expires whole.
+/// A month of history, matching the request log. The first key column is the day, so it is purged whole.
 const DEFAULT_SERVER_METRICS_TTL_DAYS: u64 = 30;
 /// A row is 17280 slots a day of int16s, so the useful floor is set by the int16 key rather than by
 /// storage: fewer than three seconds a slot overflows it.
 const MINIMUM_SERVER_METRICS_ROW_SECONDS: u64 = 3;
 const DEFAULT_SERVER_METRICS_BACKEND_UNIT: &str = "genix.service";
 const DEFAULT_SERVER_METRICS_FAREWARD_UNIT: &str = "fareward.service";
-const DEFAULT_SERVER_METRICS_SCYLLA_UNIT: &str = "scylla-server.service";
+/// The database's unit. Its samples land in the scylla_* columns, which the Go schema still names.
+const DEFAULT_SERVER_METRICS_DATABASE_UNIT: &str = "mariadb.service";
 
 #[derive(Clone, Debug)]
 pub struct DatabaseConfig {
     pub host: String,
     pub port: u16,
-    pub keyspace: String,
+    /// db.name: the database the backend's ORM created the tables in.
+    pub database: String,
     pub user: String,
     pub password: String,
 }
@@ -105,9 +98,6 @@ pub struct AppConfig {
     /// Process-wide ceilings for the lock service. Per-action policy is deliberately absent:
     /// that belongs to the Go call sites, which is what keeps this service generic.
     pub locks: LockLimits,
-    /// Block sizing for the autoincrement reservation service. Nothing here says which counters
-    /// exist: the daemon learns a name when a client first asks for it.
-    pub sequences: SequenceLimits,
     pub bridge: BridgeConfig,
     pub request_log: RequestLogConfig,
     pub server_metrics: ServerMetricsConfig,
@@ -122,7 +112,8 @@ pub struct ServerMetricsConfig {
     /// Seconds per stored row, which is also what the clustering key counts. Kept as a number
     /// rather than a Duration because it is arithmetic on the key, not a delay.
     pub row_seconds: i64,
-    pub row_ttl: Duration,
+    /// Days of rows kept; older days are deleted by the writer's purge.
+    pub retention_days: i16,
     pub disk_mount: String,
     /// Empty means the first interface that is not `lo`.
     pub network_interface: String,
@@ -139,7 +130,8 @@ pub struct RequestLogConfig {
     /// the connection of a backend that is only trying to log, taking its charges and locks with
     /// it — the switch is for not writing rows, not for breaking clients.
     pub enabled: bool,
-    pub row_ttl: Duration,
+    /// Days of user_logs kept; older days are deleted by the writer's purge.
+    pub retention_days: i16,
     pub flush_interval: Duration,
     pub max_batch: usize,
     pub error_freshness: Duration,
@@ -274,24 +266,6 @@ impl AppConfig {
             max_lease: Duration::from_millis(lock_max_lease_ms),
         };
 
-        let sequence_block_size =
-            optional_u64(&config, "SEQUENCE_BLOCK_SIZE", "sequence.block_size")?
-                .unwrap_or(u64::from(DEFAULT_SEQUENCE_BLOCK_SIZE));
-        let sequence_max_tracked_names = optional_usize(
-            &config,
-            "SEQUENCE_MAX_TRACKED_NAMES",
-            "sequence.max_tracked_names",
-        )?
-        .unwrap_or(DEFAULT_SEQUENCE_MAX_TRACKED_NAMES);
-        if sequence_block_size == 0 || sequence_max_tracked_names == 0 {
-            bail!("sequence.block_size and sequence.max_tracked_names must be positive");
-        }
-        let sequences = SequenceLimits {
-            block_size: u32::try_from(sequence_block_size)
-                .context("sequence.block_size must fit in uint32")?,
-            max_tracked_names: sequence_max_tracked_names,
-        };
-
         // Every value here has a default, unlike the eight credit ceilings: a guessed quota is
         // worse than none, but a guessed flush interval for a log table is simply a flush interval.
         // An absent [request_log] section therefore means "on, with these", not a refusal to start.
@@ -330,16 +304,13 @@ impl AppConfig {
         {
             bail!("request_log intervals, batch sizes and capacities must be positive");
         }
-        // Scylla's TTL is seconds in an i32, so a ttl_days that overflows it would be silently
-        // truncated into a retention nobody asked for.
-        let request_log_ttl_seconds = request_log_ttl_days
-            .checked_mul(86_400)
-            .filter(|seconds| *seconds <= i32::MAX as u64)
-            .context("request_log.ttl_days is too large for a ScyllaDB TTL")?;
+        // The purge compares against the int16 UnixDay key, so the retention must fit it too.
+        let request_log_retention_days = i16::try_from(request_log_ttl_days)
+            .context("request_log.ttl_days must fit in int16")?;
         let request_log = RequestLogConfig {
             enabled: optional_string(&config, "REQUEST_LOG_ENABLED", "request_log.enabled")
                 .is_none_or(|value| value == "1" || value.eq_ignore_ascii_case("true")),
-            row_ttl: Duration::from_secs(request_log_ttl_seconds),
+            retention_days: request_log_retention_days,
             flush_interval: Duration::from_millis(request_log_flush_ms),
             max_batch: request_log_max_batch,
             error_freshness: Duration::from_secs(request_log_error_cache_seconds),
@@ -374,16 +345,19 @@ impl AppConfig {
                 verbose_logs: optional_string(&config, "SSE_BRIDGE_VERBOSE", "sse_bridge.verbose")
                     .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             },
+            // The same keys the backend reads: [mariadb] for the connection, db.name for the database.
             database: DatabaseConfig {
-                host: required_string(&config, "DB_HOST", "db.host")?,
-                port: required_u16(&config, "DB_PORT", "db.port")?,
-                keyspace: required_string(&config, "DB_NAME", "db.name")?,
-                user: required_string(&config, "DB_USER", "db.user")?,
-                password: required_string(&config, "DB_PASSWORD", "db.password")?,
+                host: required_string(&config, "MARIADB_HOST", "mariadb.host")?,
+                port: optional_u64(&config, "MARIADB_PORT", "mariadb.port")?
+                    .map(|port| u16::try_from(port).context("mariadb.port must be a valid TCP port"))
+                    .transpose()?
+                    .unwrap_or(DEFAULT_MARIADB_PORT),
+                database: required_string(&config, "DB_NAME", "db.name")?,
+                user: required_string(&config, "MARIADB_USER", "mariadb.user")?,
+                password: required_string(&config, "MARIADB_PASSWORD", "mariadb.password")?,
             },
             policy,
             locks,
-            sequences,
             request_log,
             server_metrics,
         })
@@ -422,12 +396,9 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
     if row_seconds % sample_seconds != 0 || sample_seconds > row_seconds {
         bail!("server_metrics.sample_seconds must divide server_metrics.row_seconds evenly");
     }
-    // Scylla's TTL is seconds in an i32, so a ttl_days that overflows it would be silently
-    // truncated into a retention nobody asked for.
-    let ttl_seconds = ttl_days
-        .checked_mul(86_400)
-        .filter(|seconds| *seconds <= i32::MAX as u64)
-        .context("server_metrics.ttl_days is too large for a ScyllaDB TTL")?;
+    // The purge compares against the int16 UnixDay key, so the retention must fit it too.
+    let retention_days =
+        i16::try_from(ttl_days).context("server_metrics.ttl_days must fit in int16")?;
 
     let unit_name = |env_key: &str, toml_path: &str, default: &str| {
         optional_string(config, env_key, toml_path).unwrap_or_else(|| default.to_owned())
@@ -438,7 +409,7 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
             .is_none_or(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         sample_interval: Duration::from_secs(sample_seconds),
         row_seconds: row_seconds as i64,
-        row_ttl: Duration::from_secs(ttl_seconds),
+        retention_days,
         disk_mount: optional_string(
             config,
             "SERVER_METRICS_DISK_MOUNT",
@@ -464,7 +435,7 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
         scylla_unit: unit_name(
             "SERVER_METRICS_SCYLLA_UNIT",
             "server_metrics.scylla_unit",
-            DEFAULT_SERVER_METRICS_SCYLLA_UNIT,
+            DEFAULT_SERVER_METRICS_DATABASE_UNIT,
         ),
     })
 }
@@ -662,11 +633,6 @@ fn required_u64(config: &Table, env_key: &str, toml_path: &str) -> Result<u64> {
     Ok(value)
 }
 
-fn required_u16(config: &Table, env_key: &str, toml_path: &str) -> Result<u16> {
-    let value = required_u64(config, env_key, toml_path)?;
-    u16::try_from(value).with_context(|| format!("{toml_path}/{env_key} must fit in uint16"))
-}
-
 fn optional_usize(config: &Table, env_key: &str, toml_path: &str) -> Result<Option<usize>> {
     optional_u64(config, env_key, toml_path)?
         .map(|value| {
@@ -729,7 +695,8 @@ mod tests {
         assert_eq!(metrics.row_seconds, 5);
         assert_eq!(metrics.sample_interval, Duration::from_secs(1));
         assert_eq!(metrics.backend_unit, "genix.service");
-        assert_eq!(metrics.scylla_unit, "scylla-server.service");
+        assert_eq!(metrics.scylla_unit, "mariadb.service");
+        assert_eq!(metrics.retention_days, 30);
         assert!(metrics.network_interface.is_empty());
     }
 

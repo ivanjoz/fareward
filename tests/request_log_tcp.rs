@@ -31,11 +31,6 @@ use fareward::{
         protocol::{ErrorEntry, REQUEST_LOG_MAX_PAYLOAD_SIZE, RequestLogRecord},
         writer::RequestLogSink,
     },
-    sequence::{
-        allocator::{SequenceAllocator, SequenceLimits},
-        protocol::SEQUENCE_NAME_MAX,
-        store::SequenceStore,
-    },
     service::{
         auth::DOMAIN,
         protocol::ReplyShape,
@@ -53,25 +48,9 @@ use tokio::{
 const SECRET: &[u8] = b"request-log-test-secret";
 const OPCODE_CHARGE: u8 = 0x01;
 const OPCODE_LOG_REQUEST: u8 = 0x04;
-const OPCODE_RESERVE_SEQUENCE: u8 = 0x07;
-const OPCODE_SET_SEQUENCE: u8 = 0x08;
 
 struct EmptyStore;
 
-/// The counters live in memory: what is under test here is the framing, not the durability.
-#[derive(Default)]
-struct MemorySequenceStore(std::sync::Mutex<std::collections::HashMap<String, i64>>);
-
-#[async_trait]
-impl SequenceStore for MemorySequenceStore {
-    async fn bump(&self, name: &str, by: i64) -> Result<()> {
-        *self.0.lock().unwrap().entry(name.to_owned()).or_insert(0) += by;
-        Ok(())
-    }
-    async fn read(&self, name: &str) -> Result<i64> {
-        Ok(*self.0.lock().unwrap().get(name).unwrap_or(&0))
-    }
-}
 
 #[async_trait]
 impl LimiterStore for EmptyStore {
@@ -166,14 +145,6 @@ async fn start_server() -> TestServer {
         // No database in this harness: the sink accepts and discards, which is exactly what the
         // disabled configuration does in production. What is under test is the framing.
         RequestLogSink::disabled(),
-        Arc::new(SequenceAllocator::new(
-            Arc::new(MemorySequenceStore::default()),
-            2,
-            SequenceLimits {
-                block_size: 8,
-                max_tracked_names: 64,
-            },
-        )),
         Arc::new(SECRET.to_vec()),
         Duration::from_secs(5),
         64,
@@ -230,22 +201,6 @@ impl Client {
         let mut body = declared.to_be_bytes().to_vec();
         body.extend_from_slice(payload);
         self.write_frame(OPCODE_LOG_REQUEST, &body).await;
-    }
-
-    /// A reservation frame: the same length header, then the increment and the counter name.
-    async fn write_reserve_sequence(&mut self, name: &str, increment: u32) {
-        let mut payload = increment.to_be_bytes().to_vec();
-        payload.extend_from_slice(name.as_bytes());
-        self.write_length_prefixed(OPCODE_RESERVE_SEQUENCE, &payload)
-            .await;
-    }
-
-    /// A set frame: the same shape, with an absolute i64 where the increment was.
-    async fn write_set_sequence(&mut self, name: &str, value: i64) {
-        let mut payload = value.to_be_bytes().to_vec();
-        payload.extend_from_slice(name.as_bytes());
-        self.write_length_prefixed(OPCODE_SET_SEQUENCE, &payload)
-            .await;
     }
 
     async fn write_length_prefixed(&mut self, opcode: u8, payload: &[u8]) {
@@ -402,128 +357,4 @@ async fn consecutive_request_logs_stay_in_frame() {
         .expect("the stream desynchronized across consecutive request logs");
     assert_eq!(correlation, 4);
     assert_eq!(shape, ReplyShape::ChargeAllowed);
-}
-
-/// The reservation opcode is the first that is both length-prefixed and answered, so it is the only
-/// place where a variable-width request and an eight-byte reply tail meet on the same connection.
-#[tokio::test]
-async fn a_reservation_answers_with_the_first_value_in_the_tail() {
-    let server = start_server().await;
-    let mut client = Client::connect(&server).await;
-
-    client.write_reserve_sequence("x1_ventas_0", 3).await;
-    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("the daemon did not answer a reservation");
-    assert_eq!(correlation, 0);
-    assert_eq!(shape, ReplyShape::SequenceValue);
-    assert_eq!(body.len(), 8, "the reserved value is the whole body");
-    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 1);
-
-    // The three values just reserved are gone, so the next caller starts past them.
-    client.write_reserve_sequence("x1_ventas_0", 1).await;
-    let (_, _, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("the stream desynchronized after a reply with a body");
-    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 4);
-}
-
-/// A reservation that cannot be parsed is answered rather than discarded: unlike a request log,
-/// somebody is parked waiting for a value, and silence would hang them until their own timeout.
-#[tokio::test]
-async fn a_malformed_reservation_is_refused_without_closing_the_connection() {
-    let server = start_server().await;
-    let mut client = Client::connect(&server).await;
-
-    // A zero increment reserves nothing and still would have to answer with some value.
-    client.write_reserve_sequence("x1_ventas_0", 0).await;
-    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("the daemon did not answer a malformed reservation");
-    assert_eq!(correlation, 0);
-    assert_eq!(
-        shape,
-        ReplyShape::SequenceInvalid,
-        "a malformed reservation must not report a value"
-    );
-    assert!(body.is_empty());
-
-    // The connection is still usable, so a bad frame costs one request and not the socket.
-    client.write_reserve_sequence("x1_ventas_0", 1).await;
-    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("a refused reservation took the connection with it");
-    assert_eq!(correlation, 1);
-    assert_eq!(shape, ReplyShape::SequenceValue);
-    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 1);
-}
-
-/// The reason `0x08` exists rather than the caller writing the row itself: over a live connection
-/// the daemon is holding a block derived from the old value, and moving the counter under it has to
-/// drop that block or the next reservation hands out values this one already issued.
-#[tokio::test]
-async fn a_set_moves_the_counter_and_abandons_the_live_block() {
-    let server = start_server().await;
-    let mut client = Client::connect(&server).await;
-
-    // block_size is 8 in this harness, so one reservation leaves a live block with room to spare.
-    client.write_reserve_sequence("x1_ventas_0", 2).await;
-    let (_, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("the daemon did not answer a reservation");
-    assert_eq!(shape, ReplyShape::SequenceValue);
-    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 1);
-
-    // A restore finds the partition really only holds rows up to id 4.
-    client.write_set_sequence("x1_ventas_0", 4).await;
-    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("the daemon did not answer a set");
-    assert_eq!(correlation, 1);
-    assert_eq!(shape, ReplyShape::SequenceValue);
-    // The reply reports what was replaced — the whole block, not the two values handed out.
-    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 8);
-
-    // Re-derived from 4 instead of continuing the abandoned block at 3.
-    client.write_reserve_sequence("x1_ventas_0", 1).await;
-    let (_, _, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("the daemon did not answer the reservation after a set");
-    assert_eq!(i64::from_be_bytes(body.try_into().unwrap()), 5);
-}
-
-/// A negative counter would hand out non-positive primary keys, so it is refused like any other
-/// malformed payload — with a shape of its own, not by dropping the connection.
-#[tokio::test]
-async fn a_set_to_a_negative_value_is_refused() {
-    let server = start_server().await;
-    let mut client = Client::connect(&server).await;
-
-    client.write_set_sequence("x1_ventas_0", -5).await;
-    let (correlation, shape, body) = timeout(Duration::from_secs(2), client.read_reply())
-        .await
-        .expect("the daemon did not answer a negative set");
-    assert_eq!(correlation, 0);
-    assert_eq!(shape, ReplyShape::SequenceInvalid);
-    assert!(body.is_empty());
-}
-
-/// The name ceiling bounds what an unauthenticated peer can make the daemon buffer, exactly as the
-/// request log's does.
-#[tokio::test]
-async fn an_oversized_counter_name_closes_the_connection() {
-    let server = start_server().await;
-    let mut client = Client::connect(&server).await;
-
-    client
-        .write_reserve_sequence(&"n".repeat(SEQUENCE_NAME_MAX + 1), 1)
-        .await;
-
-    let mut reply = [0_u8; 6];
-    let outcome = timeout(Duration::from_secs(2), client.socket.read_exact(&mut reply)).await;
-    let read = outcome.expect("the daemon neither answered nor closed the connection");
-    assert!(
-        read.is_err(),
-        "an oversized counter name was tolerated instead of ending the connection"
-    );
 }

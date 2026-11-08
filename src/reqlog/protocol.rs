@@ -94,9 +94,21 @@ impl RequestLogRecord {
         self.errors.len() as i8
     }
 
-    pub fn error_ids(&self) -> Vec<i32> {
-        self.errors.iter().map(|entry| entry.id).collect()
+    /// The error_ids column: the ORM stores a Go `[]int32` as `colbin.Marshal(ids)` in a LONGBLOB.
+    /// A root slice encodes exactly like a struct holding it at id 1, which is what this writes.
+    pub fn error_ids_blob(&self) -> Vec<u8> {
+        ErrorIdsColumn {
+            ids: self.errors.iter().map(|entry| entry.id).collect(),
+        }
+        .encode()
     }
+}
+
+/// The colbin shape of a root `[]int32`: see `error_ids_blob`.
+#[derive(Colbin, Default)]
+struct ErrorIdsColumn {
+    #[cb(1)]
+    ids: Vec<i32>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -196,7 +208,28 @@ mod tests {
         assert_eq!(record.user_id, 42);
         assert_eq!(record.elapsed_ms, 318);
         assert_eq!(record.error_count(), 2);
-        assert_eq!(record.error_ids(), vec![1_234_567, 7_654_321]);
+    }
+
+    /// Bytes of Go's `colbin.Marshal([]int32{...})` (colbin v0.9.2), which is how the ORM stores
+    /// the column on MariaDB. If these drift, the dashboard cannot decode the error ids.
+    #[test]
+    fn the_error_ids_blob_matches_go_colbin() {
+        let with_ids = |ids: &[i32]| RequestLogRecord {
+            errors: ids
+                .iter()
+                .map(|id| ErrorEntry {
+                    id: *id,
+                    ..ErrorEntry::default()
+                })
+                .collect(),
+            ..RequestLogRecord::default()
+        };
+        assert_eq!(with_ids(&[]).error_ids_blob(), Vec::<u8>::new());
+        assert_eq!(with_ids(&[5]).error_ids_blob(), [0x0c, 0x01, 0x05]);
+        assert_eq!(
+            with_ids(&[-7, 300, 70_000]).error_ids_blob(),
+            [0x0e, 0x0c, 0xf9, 0xff, 0xff, 0xff, 0x2c, 0x01, 0x00, 0x00, 0x70, 0x11, 0x01, 0x00]
+        );
     }
 
     /// These are the same vectors as TestMakeFrameRouteCompanyAgg in

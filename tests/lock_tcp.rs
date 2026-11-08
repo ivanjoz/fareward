@@ -30,10 +30,6 @@ use fareward::{
         registry::{LockLimits, LockRegistry},
     },
     reqlog::writer::RequestLogSink,
-    sequence::{
-        allocator::{SequenceAllocator, SequenceLimits},
-        store::SequenceStore,
-    },
     service::{auth::DOMAIN, protocol::ReplyShape, server},
     siphash::{SipHasher24, derive_key},
 };
@@ -47,24 +43,10 @@ use tokio::{
 const SECRET: &[u8] = b"lock-test-secret";
 const ACTION: u16 = 7;
 
-/// Neither the limiter nor the sequence allocator is under test here, but `server::run` needs
-/// both, and neither may touch a database.
+/// The limiter is not under test here, but `server::run` needs one, and it may not touch a
+/// database.
 #[derive(Default)]
 struct EmptyStore;
-
-#[derive(Default)]
-struct MemorySequenceStore(std::sync::Mutex<std::collections::HashMap<String, i64>>);
-
-#[async_trait]
-impl SequenceStore for MemorySequenceStore {
-    async fn bump(&self, name: &str, by: i64) -> Result<()> {
-        *self.0.lock().unwrap().entry(name.to_owned()).or_insert(0) += by;
-        Ok(())
-    }
-    async fn read(&self, name: &str) -> Result<i64> {
-        Ok(*self.0.lock().unwrap().get(name).unwrap_or(&0))
-    }
-}
 
 #[async_trait]
 impl LimiterStore for EmptyStore {
@@ -153,14 +135,6 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
         // These tests drive locks and charges; request logs would be written to a database this
         // harness does not have, so the sink accepts and discards.
         RequestLogSink::disabled(),
-        Arc::new(SequenceAllocator::new(
-            Arc::new(MemorySequenceStore::default()),
-            2,
-            SequenceLimits {
-                block_size: 64,
-                max_tracked_names: 64,
-            },
-        )),
         Arc::new(SECRET.to_vec()),
         frame_timeout,
         64,
@@ -380,13 +354,11 @@ fn outcome_code(shape: ReplyShape, body: &[u8]) -> u8 {
         // Success, whatever the operation was.
         ReplyShape::Ack | ReplyShape::ChargeAllowed | ReplyShape::ChargeGranted => 0,
         ReplyShape::LockGranted => 0,
-        ReplyShape::SequenceValue => 0,
         // A refusal carries its reason as its whole body.
         ReplyShape::LockRefused
         | ReplyShape::BudgetRefused
         | ReplyShape::ChargeCreditViolation
         | ReplyShape::ChargeAccessDenied => body[0],
-        ReplyShape::SequenceInvalid => 1,
         // What 0xFF used to mean when it was a status rather than a shape.
         ReplyShape::Unavailable => 0xFF,
         ReplyShape::LockLost => panic!("a push is not an outcome"),
@@ -491,22 +463,6 @@ async fn every_reply_names_its_own_shape() {
     let (_, shape, body) = client.read_reply().await;
     assert_eq!(shape, ReplyShape::LockRefused);
     assert_eq!(body, vec![4], "misuse");
-
-    // A reserved counter value, in a body of its own rather than a tail.
-    let mut reserve = 7_u32.to_be_bytes().to_vec();
-    reserve.extend_from_slice(b"x1_tests_0");
-    client.write_frame(0x07, &reserve).await;
-    let (_, shape, body) = client.read_reply().await;
-    assert_eq!(shape, ReplyShape::SequenceValue);
-    assert_eq!(body.len(), 8);
-
-    // And a malformed one, which no retry fixes.
-    client
-        .write_frame(0x07, &0_u32.to_be_bytes())
-        .await;
-    let (_, shape, body) = client.read_reply().await;
-    assert_eq!(shape, ReplyShape::SequenceInvalid);
-    assert!(body.is_empty());
 }
 
 #[tokio::test]

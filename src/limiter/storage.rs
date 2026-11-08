@@ -1,16 +1,11 @@
-//! ScyllaDB adapter for loading and replacing absolute compact usage rows.
-
-use std::sync::Arc;
+//! MariaDB adapter for loading and replacing absolute compact usage rows.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use scylla::{client::session::Session, statement::prepared::PreparedStatement};
+use mysql_async::{Pool, prelude::Queryable};
 
+use crate::limiter::aggregation::{COMPANY_AGGREGATE_USER_ID, UsageKey};
 use crate::limiter::credits_blob::Credits;
-use crate::{
-    config::DatabaseConfig,
-    limiter::aggregation::{COMPANY_AGGREGATE_USER_ID, UsageKey},
-};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredUsage {
@@ -91,7 +86,7 @@ pub struct StoredBudgetUsage {
 
 /// Every durable read and write the limiter needs. Named for the limiter rather than for usage
 /// because it also answers the authorization question the charge frame now carries: one store
-/// handle, one ScyllaDB session, one test double.
+/// handle, one database pool, one test double.
 #[async_trait]
 pub trait LimiterStore: Send + Sync {
     async fn load_exact(&self, key: UsageKey) -> Result<Option<StoredUsage>>;
@@ -116,131 +111,65 @@ pub trait LimiterStore: Send + Sync {
     ) -> Result<Option<StoredUserAccess>>;
 }
 
-pub struct ScyllaLimiterStore {
-    session: Arc<Session>,
-    // Company totals and per-user totals live in separate tables: the company table carries the
-    // per-route split and is read across every tenant by the SaaS panel, while the user table stays
-    // narrow and is only ever read one user at a time. One table with a sentinel user id would make
-    // the platform-wide read drag every user row through the same partition.
-    select_company_range: PreparedStatement,
-    upsert_company: PreparedStatement,
-    select_user_range: PreparedStatement,
-    upsert_user: PreparedStatement,
-    select_budget: PreparedStatement,
-    upsert_budget: PreparedStatement,
-    upsert_budget_usage: PreparedStatement,
-    // Authorization, not usage: a single-partition point read of the row the route gate needs.
-    select_user_access: PreparedStatement,
+// Company totals and per-user totals live in separate tables: the company table carries the
+// per-route split and is read across every tenant by the SaaS panel, while the user table stays
+// narrow and is only ever read one user at a time.
+const SELECT_COMPANY_RANGE: &str = "SELECT time_frame, used_credits FROM credit_usage_company \
+     WHERE company_id = ? AND time_frame >= ? AND time_frame <= ?";
+const SELECT_USER_RANGE: &str = "SELECT time_frame, used_credits FROM credit_usage_user \
+     WHERE company_id = ? AND user_id = ? AND time_frame >= ? AND time_frame <= ?";
+
+// Every write is an absolute replacement of the named columns, as a ScyllaDB INSERT was: ON
+// DUPLICATE KEY UPDATE touches only those, so the entitlement and the usage halves of
+// company_credit_budget never overwrite each other.
+const UPSERT_COMPANY: &str = "INSERT INTO credit_usage_company (company_id, time_frame, used_credits) \
+     VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE used_credits = VALUES(used_credits)";
+const UPSERT_USER: &str = "INSERT INTO credit_usage_user (company_id, user_id, time_frame, used_credits) \
+     VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE used_credits = VALUES(used_credits)";
+
+const SELECT_BUDGET: &str = "SELECT daily_cpu, daily_inference, budget_month_start_day, \
+     monthly_cpu_ceiling, monthly_inference_ceiling, last_set_cpu, last_set_inference, updated, \
+     usage_day_period, day_extra_cpu_used, usage_month_start_day, month_extra_cpu_used \
+     FROM company_credit_budget WHERE company_id = ?";
+const UPSERT_BUDGET: &str = "INSERT INTO company_credit_budget \
+     (company_id, daily_cpu, daily_inference, budget_month_start_day, monthly_cpu_ceiling, \
+      monthly_inference_ceiling, last_set_cpu, last_set_inference, updated) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
+     daily_cpu = VALUES(daily_cpu), daily_inference = VALUES(daily_inference), \
+     budget_month_start_day = VALUES(budget_month_start_day), \
+     monthly_cpu_ceiling = VALUES(monthly_cpu_ceiling), \
+     monthly_inference_ceiling = VALUES(monthly_inference_ceiling), \
+     last_set_cpu = VALUES(last_set_cpu), last_set_inference = VALUES(last_set_inference), \
+     updated = VALUES(updated)";
+const UPSERT_BUDGET_USAGE: &str = "INSERT INTO company_credit_budget \
+     (company_id, usage_day_period, day_cpu_used, day_inference_used, usage_month_start_day, \
+      month_cpu_used, month_inference_used, day_extra_cpu_used, month_extra_cpu_used, usage_updated) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
+     usage_day_period = VALUES(usage_day_period), day_cpu_used = VALUES(day_cpu_used), \
+     day_inference_used = VALUES(day_inference_used), \
+     usage_month_start_day = VALUES(usage_month_start_day), \
+     month_cpu_used = VALUES(month_cpu_used), month_inference_used = VALUES(month_inference_used), \
+     day_extra_cpu_used = VALUES(day_extra_cpu_used), \
+     month_extra_cpu_used = VALUES(month_extra_cpu_used), usage_updated = VALUES(usage_updated)";
+
+// Authorization, not usage: a primary-key point read of the row the route gate needs.
+const SELECT_USER_ACCESS: &str = "SELECT accesos_computed, accesos_sub_computed, status \
+     FROM users WHERE company_id = ? AND id = ?";
+
+/// The pool caches each connection's prepared statements, so the SQL above is prepared once per
+/// connection rather than per call.
+pub struct MariaLimiterStore {
+    pool: Pool,
 }
 
-impl ScyllaLimiterStore {
-    /// Opens its own session. Kept for callers that have no session to hand over — the daemon uses
-    /// `with_session`, so both services share one pool.
-    pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
-        Self::with_session(crate::reqlog::writer::connect_session(config).await?).await
-    }
-
-    pub async fn with_session(session: Arc<Session>) -> Result<Self> {
-        let mut select_company_range = session
-            .prepare(
-                "SELECT time_frame, used_credits FROM credit_usage_company \
-                 WHERE company_id = ? AND time_frame >= ? AND time_frame <= ?",
-            )
-            .await
-            .context("failed to prepare credit_usage_company range read")?;
-        select_company_range.set_is_idempotent(true);
-
-        let mut upsert_company = session
-            .prepare(
-                "INSERT INTO credit_usage_company (company_id, time_frame, used_credits) \
-                 VALUES (?, ?, ?)",
-            )
-            .await
-            .context("failed to prepare credit_usage_company upsert")?;
-        // Absolute replacement is safe for driver retries; no database counters are involved.
-        upsert_company.set_is_idempotent(true);
-
-        let mut select_user_range = session
-            .prepare(
-                "SELECT time_frame, used_credits FROM credit_usage_user \
-                 WHERE company_id = ? AND user_id = ? AND time_frame >= ? AND time_frame <= ?",
-            )
-            .await
-            .context("failed to prepare credit_usage_user range read")?;
-        select_user_range.set_is_idempotent(true);
-
-        let mut upsert_user = session
-            .prepare(
-                "INSERT INTO credit_usage_user (company_id, user_id, time_frame, used_credits) \
-                 VALUES (?, ?, ?, ?)",
-            )
-            .await
-            .context("failed to prepare credit_usage_user upsert")?;
-        upsert_user.set_is_idempotent(true);
-
-        let mut select_budget = session
-            .prepare(
-                "SELECT daily_cpu, daily_inference, budget_month_start_day, \
-                 monthly_cpu_ceiling, monthly_inference_ceiling, last_set_cpu, \
-                 last_set_inference, updated, usage_day_period, day_extra_cpu_used, \
-                 usage_month_start_day, month_extra_cpu_used \
-                 FROM company_credit_budget WHERE company_id = ?",
-            )
-            .await
-            .context("failed to prepare company_credit_budget read")?;
-        select_budget.set_is_idempotent(true);
-
-        let mut upsert_budget = session
-            .prepare(
-                "INSERT INTO company_credit_budget \
-                 (company_id, daily_cpu, daily_inference, budget_month_start_day, \
-                  monthly_cpu_ceiling, monthly_inference_ceiling, last_set_cpu, \
-                  last_set_inference, updated) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .await
-            .context("failed to prepare company_credit_budget upsert")?;
-        upsert_budget.set_is_idempotent(true);
-
-        let mut upsert_budget_usage = session
-            .prepare(
-                "INSERT INTO company_credit_budget \
-                 (company_id, usage_day_period, day_cpu_used, day_inference_used, \
-                  usage_month_start_day, month_cpu_used, month_inference_used, \
-                  day_extra_cpu_used, month_extra_cpu_used, usage_updated) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .await
-            .context("failed to prepare company_credit_budget usage upsert")?;
-        upsert_budget_usage.set_is_idempotent(true);
-
-        // `users` is partitioned by company_id and clustered by id, so this is a point read of one
-        // row in one partition — the cheapest question ScyllaDB can be asked.
-        let mut select_user_access = session
-            .prepare(
-                "SELECT accesos_computed, accesos_sub_computed, status \
-                 FROM users WHERE company_id = ? AND id = ?",
-            )
-            .await
-            .context("failed to prepare users access read")?;
-        select_user_access.set_is_idempotent(true);
-
-        Ok(Self {
-            session,
-            select_company_range,
-            upsert_company,
-            select_user_range,
-            upsert_user,
-            select_budget,
-            upsert_budget,
-            upsert_budget_usage,
-            select_user_access,
-        })
+impl MariaLimiterStore {
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
     }
 }
 
 #[async_trait]
-impl LimiterStore for ScyllaLimiterStore {
+impl LimiterStore for MariaLimiterStore {
     async fn load_exact(&self, key: UsageKey) -> Result<Option<StoredUsage>> {
         let rows = self
             .load_range(key.company_id, key.user_id, key.time_frame, key.time_frame)
@@ -255,54 +184,56 @@ impl LimiterStore for ScyllaLimiterStore {
         start_time_frame: i32,
         end_time_frame: i32,
     ) -> Result<Vec<StoredUsage>> {
+        let mut connection = self
+            .pool
+            .get_conn()
+            .await
+            .context("no MariaDB connection")?;
         // The company table has no user_id column at all, so the aggregate read binds three values
         // and the per-user read binds four.
-        let query_result = if user_id == COMPANY_AGGREGATE_USER_ID {
-            self.session
-                .execute_unpaged(
-                    &self.select_company_range,
+        let rows: Vec<(i32, Option<Vec<u8>>)> = if user_id == COMPANY_AGGREGATE_USER_ID {
+            connection
+                .exec(
+                    SELECT_COMPANY_RANGE,
                     (company_id, start_time_frame, end_time_frame),
                 )
                 .await
         } else {
-            self.session
-                .execute_unpaged(
-                    &self.select_user_range,
+            connection
+                .exec(
+                    SELECT_USER_RANGE,
                     (company_id, user_id, start_time_frame, end_time_frame),
                 )
                 .await
         }
         .context("credit usage range read failed")?;
-        let rows_result = query_result
-            .into_rows_result()
-            .context("credit usage read did not return rows")?;
-        let mut usages = Vec::new();
-        for row in rows_result
-            .rows::<(i32, Vec<u8>)>()
-            .context("credit usage row shape is invalid")?
-        {
-            let (time_frame, used_credits) = row.context("credit usage row decode failed")?;
-            usages.push(StoredUsage {
+        Ok(rows
+            .into_iter()
+            .map(|(time_frame, used_credits)| StoredUsage {
                 time_frame,
-                used_credits,
-            });
-        }
-        Ok(usages)
+                used_credits: used_credits.unwrap_or_default(),
+            })
+            .collect())
     }
 
     async fn upsert(&self, key: UsageKey, used_credits: Vec<u8>) -> Result<()> {
+        let mut connection = self
+            .pool
+            .get_conn()
+            .await
+            .context("no MariaDB connection")?;
         if key.is_company_aggregate() {
-            self.session
-                .execute_unpaged(
-                    &self.upsert_company,
+            connection
+                .exec_drop(
+                    UPSERT_COMPANY,
                     (key.company_id, key.time_frame, used_credits),
                 )
                 .await
                 .context("credit_usage_company absolute upsert failed")?;
         } else {
-            self.session
-                .execute_unpaged(
-                    &self.upsert_user,
+            connection
+                .exec_drop(
+                    UPSERT_USER,
                     (key.company_id, key.user_id, key.time_frame, used_credits),
                 )
                 .await
@@ -312,38 +243,32 @@ impl LimiterStore for ScyllaLimiterStore {
     }
 
     async fn load_budget(&self, company_id: i32) -> Result<Option<StoredBudgetRow>> {
-        let query_result = self
-            .session
-            .execute_unpaged(&self.select_budget, (company_id,))
+        let mut connection = self
+            .pool
+            .get_conn()
+            .await
+            .context("no MariaDB connection")?;
+        // Every non-key ORM column is nullable: a company the daemon has never flushed for has no
+        // usage cells, and one whose budget was never set has no entitlement cells.
+        type BudgetRow = (
+            Option<i64>,
+            Option<i64>,
+            Option<i16>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i32>,
+            Option<i16>,
+            Option<i64>,
+            Option<i16>,
+            Option<i64>,
+        );
+        let row: Option<BudgetRow> = connection
+            .exec_first(SELECT_BUDGET, (company_id,))
             .await
             .context("company_credit_budget read failed")?;
-        let rows_result = query_result
-            .into_rows_result()
-            .context("company_credit_budget read did not return rows")?;
-        let mut rows = rows_result
-            // last_set_* and the two extra-pool columns arrived through an ALTER, so rows written
-            // before them exist with those cells empty: decoding them as non-nullable would fail
-            // every pre-existing company. usage_day_period is nullable for the same reason — a
-            // company the daemon has never flushed for has no usage cells at all.
-            .rows::<(
-                i64,
-                i64,
-                i16,
-                i64,
-                i64,
-                Option<i64>,
-                Option<i64>,
-                i32,
-                Option<i16>,
-                Option<i64>,
-                Option<i16>,
-                Option<i64>,
-            )>()
-            .context("company_credit_budget row shape is invalid")?;
-        let Some(row) = rows.next() else {
-            return Ok(None);
-        };
-        let (
+        let Some((
             daily_cpu,
             daily_inference,
             month_start,
@@ -356,12 +281,11 @@ impl LimiterStore for ScyllaLimiterStore {
             extra_day_cpu,
             extra_month_start_day,
             extra_month_cpu,
-        ) = row.context("company_credit_budget row decode failed")?;
-        let (last_set_cpu, last_set_inference) =
-            (last_set_cpu.unwrap_or(0), last_set_inference.unwrap_or(0));
-        let (extra_day_cpu, extra_month_cpu) =
-            (extra_day_cpu.unwrap_or(0), extra_month_cpu.unwrap_or(0));
-        if [
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let credits = [
             daily_cpu,
             daily_inference,
             monthly_cpu,
@@ -371,35 +295,44 @@ impl LimiterStore for ScyllaLimiterStore {
             extra_day_cpu,
             extra_month_cpu,
         ]
-        .into_iter()
-        .any(|value| value < 0)
-        {
+        .map(|value| value.unwrap_or(0));
+        if credits.iter().any(|value| *value < 0) {
             anyhow::bail!("company_credit_budget contains negative credits");
         }
+        let [
+            daily_cpu,
+            daily_inference,
+            monthly_cpu,
+            monthly_inference,
+            last_set_cpu,
+            last_set_inference,
+            extra_day_cpu,
+            extra_month_cpu,
+        ] = credits.map(|value| value as u64);
         let budget = StoredBudget {
             company_id,
             daily: Credits {
-                cpu: daily_cpu as u64,
-                inference: daily_inference as u64,
+                cpu: daily_cpu,
+                inference: daily_inference,
             },
-            budget_month_start_day: month_start,
+            budget_month_start_day: month_start.unwrap_or(0),
             monthly_ceiling: Credits {
-                cpu: monthly_cpu as u64,
-                inference: monthly_inference as u64,
+                cpu: monthly_cpu,
+                inference: monthly_inference,
             },
             last_set: Credits {
-                cpu: last_set_cpu as u64,
-                inference: last_set_inference as u64,
+                cpu: last_set_cpu,
+                inference: last_set_inference,
             },
-            updated,
+            updated: updated.unwrap_or(0),
         };
         Ok(Some(StoredBudgetRow {
             budget,
             extra: StoredExtraUsage {
                 day_period: extra_day_period.unwrap_or(0),
-                day_cpu: extra_day_cpu as u64,
+                day_cpu: extra_day_cpu,
                 month_start_day: extra_month_start_day.unwrap_or(0),
-                month_cpu: extra_month_cpu as u64,
+                month_cpu: extra_month_cpu,
             },
         }))
     }
@@ -417,9 +350,14 @@ impl LimiterStore for ScyllaLimiterStore {
             i64::try_from(budget.last_set.cpu).context("last set CPU credits exceed int64")?;
         let last_set_inference = i64::try_from(budget.last_set.inference)
             .context("last set inference credits exceed int64")?;
-        self.session
-            .execute_unpaged(
-                &self.upsert_budget,
+        let mut connection = self
+            .pool
+            .get_conn()
+            .await
+            .context("no MariaDB connection")?;
+        connection
+            .exec_drop(
+                UPSERT_BUDGET,
                 (
                     budget.company_id,
                     daily_cpu,
@@ -449,9 +387,14 @@ impl LimiterStore for ScyllaLimiterStore {
             i64::try_from(usage.day_extra_cpu).context("daily extra CPU usage exceeds int64")?;
         let month_extra_cpu = i64::try_from(usage.month_extra_cpu)
             .context("monthly extra CPU usage exceeds int64")?;
-        self.session
-            .execute_unpaged(
-                &self.upsert_budget_usage,
+        let mut connection = self
+            .pool
+            .get_conn()
+            .await
+            .context("no MariaDB connection")?;
+        connection
+            .exec_drop(
+                UPSERT_BUDGET_USAGE,
                 (
                     usage.company_id,
                     usage.day_period,
@@ -475,29 +418,24 @@ impl LimiterStore for ScyllaLimiterStore {
         company_id: i32,
         user_id: i32,
     ) -> Result<Option<StoredUserAccess>> {
-        let query_result = self
-            .session
-            .execute_unpaged(&self.select_user_access, (company_id, user_id))
+        let mut connection = self
+            .pool
+            .get_conn()
+            .await
+            .context("no MariaDB connection")?;
+        // A user saved before ever being given a profile has no accesos_computed, and status is
+        // nullable like every ORM column: decoding either as non-nullable would turn a legitimately
+        // empty user into a read failure, which fails closed as a 503 rather than as a denial.
+        let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i8>)> = connection
+            .exec_first(SELECT_USER_ACCESS, (company_id, user_id))
             .await
             .context("users access read failed")?;
-        let rows_result = query_result
-            .into_rows_result()
-            .context("users access read did not return rows")?;
-        let mut rows = rows_result
-            // A user saved before ever being given a profile has no cell in accesos_computed, and
-            // status is nullable for the same reason every ORM column is: decoding either as
-            // non-nullable would turn a legitimately empty user into a read failure, which fails
-            // closed as a 503 rather than as the denial it actually is.
-            .rows::<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i8>)>()
-            .context("users access row shape is invalid")?;
-        let Some(row) = rows.next() else {
-            return Ok(None);
-        };
-        let (grants_blob, sub_grants_blob, status) = row.context("users access row decode failed")?;
-        Ok(Some(StoredUserAccess {
-            grants_blob: grants_blob.unwrap_or_default(),
-            sub_grants_blob: sub_grants_blob.unwrap_or_default(),
-            status: status.unwrap_or(0),
-        }))
+        Ok(
+            row.map(|(grants_blob, sub_grants_blob, status)| StoredUserAccess {
+                grants_blob: grants_blob.unwrap_or_default(),
+                sub_grants_blob: sub_grants_blob.unwrap_or_default(),
+                status: status.unwrap_or(0),
+            }),
+        )
     }
 }

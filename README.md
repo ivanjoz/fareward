@@ -32,7 +32,7 @@ formats), [PLAN_LOCK_SERVICE.md](PLAN_LOCK_SERVICE.md) and
 [PLAN_SSE_BRIDGE.md](PLAN_SSE_BRIDGE.md) (bridge). Deployment:
 [`../scripts/configure/CONFIGURE_FAREWARD.md`](../scripts/configure/CONFIGURE_FAREWARD.md).
 
-> **One process, shared fate.** The rate limiter loads existing usage from ScyllaDB before
+> **One process, shared fate.** The rate limiter loads existing usage from MariaDB before
 > admitting anything and exits when it cannot — which also stops the bridge. Deploy the tables
 > [it expects](#the-tables-it-expects-to-already-exist) before starting the daemon. The request log
 > and the metrics collector are the two halves that do *not* share that fate: they drop rows rather
@@ -48,8 +48,8 @@ but the coupling is **four contracts, not a language**.
 
 | # | Contract | Defined by | What a different backend has to do |
 |---|---|---|---|
-| 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` and `go/siphash/` — eight-byte nonce at accept, then every frame tagged `SipHash-2-4(SHA-256(internal_apikey)[..16], fareward:v12 ‖ nonce ‖ sequence ‖ opcode ‖ length ‖ payload)`, big-endian. Six of the eight payloads are colbin messages, which has a Rust crate and a browser module as well as the Go one. |
-| 2 | The ScyllaDB schema | nobody here — the daemon issues no `CREATE TABLE` | Create the tables and columns below before first start. |
+| 1 | Raw-TCP frame protocol | `src/service/`, with a working client in [`go/`](go/) | Go: import it. Anything else: port `go/connection.go` and `go/siphash/` — eight-byte nonce at accept, then every frame tagged `SipHash-2-4(SHA-256(internal_apikey)[..16], fareward:v12 ‖ nonce ‖ sequence ‖ opcode ‖ length ‖ payload)`, big-endian. Every payload is a colbin message, which has a Rust crate and a browser module as well as the Go one. |
+| 2 | The MariaDB schema | nobody here — the daemon issues no `CREATE TABLE` | Create the tables and columns below before first start. |
 | 3 | The `accesos_computed` packing | `src/limiter/access.rs` | Write `users.accesos_computed` as little-endian `u16` grants. |
 | 4 | The browser session token | `src/bridge/token.rs`, `src/bridge/auth.rs` | Issue a colbin-encoded `core.UsuarioToken`, its 16-byte `Hash` a keyed BLAKE2s-128 tag over `usrToken:v3`. **The only Go-shaped contract** — see below. |
 
@@ -59,8 +59,11 @@ not run the bridge never meets contract 4 at all.
 
 ### The tables it expects to already exist
 
-The daemon prepares its statements at startup and **never creates schema**. Ownership of these
-tables sits with whoever runs the migrations; in the Genix deployment that is the Go ORM.
+The daemon **never creates schema**. Ownership of these tables sits with whoever runs the
+migrations; in the Genix deployment that is the Go ORM (`fn-homologate`), in the database `db.name`
+reached through the `[mariadb]` keys the backend also reads. Every write is
+`INSERT … ON DUPLICATE KEY UPDATE` of the columns it names, so two writers of different columns of
+one row (the budget's entitlement and usage halves) never overwrite each other.
 
 | Table | Access | Used for |
 |---|---|---|
@@ -69,14 +72,17 @@ tables sits with whoever runs the migrations; in the Genix deployment that is th
 | `company_credit_budget` | read + write | the extra-credit pool, its ceiling and the activated month |
 | `user_logs`, `request_errors` | write | the request log |
 | `server_metrics` | write | the metrics collector |
-| `sequences` | read + write | the autoincrement counters behind `RESERVE_SEQUENCE` and `SET_SEQUENCE` |
 
 The split matters at startup. The limiter loads usage before admitting anything and **exits** if it
-cannot, so its four tables are a hard precondition. `sequences` joins them: its statements are
-prepared at startup and a failure there **exits**, because a backend configured to reserve its ids
-here has no second way to get one. The remaining three are written by the two services that fail
-open: a missing column leaves `ensure_prepared` retrying once a minute and dropping rows, and the
-process stays up.
+cannot, so its four tables are a hard precondition. The remaining three are written by the two
+services that fail open: a missing table or column drops rows with a warning, and the process stays
+up. `user_logs.error_ids` is the colbin encoding of a Go `[]int32`, as the ORM stores slices.
+
+MariaDB has no TTL. `user_logs` and `server_metrics` start their key with the UnixDay `date`, so each
+writer deletes the days older than its `ttl_days` once an hour, in batches of 10,000 rows.
+
+Sequences are not here: MariaDB owns them (the ORM's `_sequences` table), so the
+`RESERVE_SEQUENCE`/`SET_SEQUENCE` opcodes `0x07`/`0x08` and reply shapes `0x09`/`0x0A` are retired.
 
 ### Could a Rust or Node backend drive this?
 
@@ -88,7 +94,7 @@ dependencies of its own. Configure it and call it; see [The Go client](#the-go-c
 already in this crate, and `colbin` is the same crate the bridge decodes with, so a Rust backend can
 issue session tokens directly.
 
-**Node: yes.** Contracts 1–3 are byte layouts and CQL — nothing about them is Go — and they are now
+**Node: yes.** Contracts 1–3 are byte layouts and SQL — nothing about them is Go — and they are now
 colbin messages, for which the format's repository carries a browser module alongside the Go and
 Rust ones. Contract 4 is the same story: a Node backend encodes `UsuarioToken` with that module
 rather than transcribing the format. The *channel* token is not a barrier either — a small varint
@@ -210,7 +216,7 @@ service header has none of that, because the caller is a Lambda with no connecti
 carries a five-minute skew window instead — the price of holding no per-caller state.
 
 **The browser is verified from the token alone.** The session token is self-contained, so `GET /sse`
-is answered without ScyllaDB. What the bridge does *not* do is decide permissions: it establishes
+is answered without the database. What the bridge does *not* do is decide permissions: it establishes
 identity and stops there, because the backend already evaluated what this user may do when it
 accepted the turn. A `created` timestamp is signed into the token, but this crate enforces no expiry
 on it — ending a session is the backend's to do.
@@ -275,9 +281,7 @@ frame_timeout_seconds = 30
 max_connections       = 1024
 shards                = 0 # 0 uses the logical CPU count
 # Requests one connection may have in flight at once. Multiplexing removed the backpressure that
-# one-request-per-socket used to give for free, so it has to be stated. Sequence reservations and
-# assignments have a ceiling of this size of their own, so reservations waiting on ScyllaDB cannot
-# refuse the charges and locks sharing the connection.
+# one-request-per-socket used to give for free, so it has to be stated.
 max_inflight_per_connection = 64
 access_cache_seconds  = 600 # TTL of the cached user grants; INVALIDATE_USER_ACCESS is the fast path
 
@@ -307,21 +311,14 @@ max_total_waiters = 4096
 max_lease_ms      = 60000
 ```
 
-The sequence allocator adds two knobs, both defaulted. Neither says which counters exist: the
-daemon learns a name the first time a client asks for it.
-
-```toml
-# Purpose: Size the id blocks reserved per durable bump, and bound the map that tracks them.
-[sequence]
-block_size        = 64
-max_tracked_names = 200000
-```
+The database is the backend's: `db.name` and the `[mariadb]` section (`host`, `port` default 3306,
+`user`, `password`), the same keys the Go backend connects with.
 
 The request log adds a section where every key has a default, so omitting it entirely means "on,
 with these" rather than a refusal to start:
 
 ```toml
-# Purpose: One row per finished request; a month of history, then the partition expires.
+# Purpose: One row per finished request; a month of history, then the day is purged.
 [request_log]
 enabled             = true
 ttl_days            = 30
@@ -452,7 +449,7 @@ navegador                     bridge                        backend (Lambda)
 | `GET` | `/health` | — | `{Ok,Channels,UptimeSeconds}`. |
 
 Messages are opaque JSON and **nothing is buffered**: a message for a disconnected tab is
-dropped (`Delivered:false`). The bridge holds no business logic and never touches ScyllaDB.
+dropped (`Delivered:false`). The bridge holds no business logic and never touches the database.
 
 ### Channel token
 
@@ -481,10 +478,8 @@ After accepting a connection, the server writes an eight-byte random nonce. Ever
 request is `[opcode:1][length:u16][payload][tag:8]`, big-endian. The opcode routes the payload; it
 is not a shared frame shape, and the operations have no field in common.
 
-Six of the eight payloads are [colbin](https://github.com/ivanjoz/colbin) messages — one numbered
-struct per shape, with ids 1..16 so both sides use four-bit keys — and the other two are
-hand-rolled, because they are a scalar followed by a counter name and the reserve path is the ORM's
-insert path. `PROTOCOL_SHAPES.md` is the full map and the reasoning; the `cb` ids are §1.2.
+Every payload is a [colbin](https://github.com/ivanjoz/colbin) message — one numbered struct per
+shape, with ids 1..16 so both sides use four-bit keys. `PROTOCOL_SHAPES.md` is the full map and the reasoning; the `cb` ids are §1.2.
 
 | Op | Name | Codec | Fields | Payload ceiling |
 |---|---|---|---|---|
@@ -494,15 +489,13 @@ insert path. `PROTOCOL_SHAPES.md` is the full map and the reasoning; the `cb` id
 | `0x04` | `LOG_REQUEST` | colbin | date `i16` · request `i64` · route `i16` · frame `u8` · company `i32` · user `i32` · elapsed `i16` · errors `[]{id i32, line ≤64 B, text ≤200 B}`, ≤ 4 | 1 264 |
 | `0x05` | `MUTATE_COMPANY_BUDGET` | colbin | company `i32` · operation `u8` · CPU `u64` · inference `u64` | 32 |
 | `0x06` | `INVALIDATE_USER_ACCESS` | colbin | company `i32` · user `i32` (`0` = every user of the company) | 16 |
-| `0x07` | `RESERVE_SEQUENCE` | hand-rolled | increment `u32` · counter name (UTF-8, ≤ 128 B) | 132 |
-| `0x08` | `SET_SEQUENCE` | hand-rolled | value `i64` · counter name (UTF-8, ≤ 128 B) | 136 |
 
 A colbin field holding its zero value is not written at all, so a payload is as small as the record
 is sparse: an ungated charge is 10 bytes against the 20 the old fixed layout always spent, and the
 wildcard invalidation is 3.
 
-`0x00` stays unassigned so an all-zero frame cannot route. 247 opcodes remain free; new *use
-cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
+`0x00` stays unassigned so an all-zero frame cannot route. `0x07` and `0x08` were the retired
+sequence opcodes and stay unassigned too. New *use cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
 
 Two properties vary by opcode, and both variations are deliberate:
 
@@ -511,7 +504,6 @@ Two properties vary by opcode, and both variations are deliberate:
 | `0x01` `0x02` `0x03` `0x05` | yes | closes the connection |
 | `0x04` `LOG_REQUEST` | **never** | warning, connection survives |
 | `0x06` `INVALIDATE_USER_ACCESS` | **never** | closes the connection |
-| `0x07` `RESERVE_SEQUENCE` `0x08` `SET_SEQUENCE` | yes | refused with a status, connection survives |
 
 Every opcode is length-prefixed. There used to be a second, fixed-width framing for the payloads
 whose width the opcode alone implied; nothing is left that a fixed width could describe, so one
@@ -520,6 +512,5 @@ opcode's ceiling closes the connection before a byte of payload is buffered.
 
 Neither `0x04` nor `0x06` is answered — waiting on "the log row was stored" would put this daemon on
 the critical path of every request in the system, and the grant cache's TTL already bounds a lost
-invalidation — but both still advance the sequence, which is what the tag is bound to. The two
-sequence opcodes are *answered*, because the value each returns is the whole point of the call.
+invalidation — but both still advance the sequence, which is what the tag is bound to.
 

@@ -2,12 +2,12 @@
 //! `request_errors`.
 //!
 //! **This half fails open, and that is the difference from the limiter.** The limiter exits when
-//! ScyllaDB is unreachable because admitting traffic it cannot account for is worse than not
+//! MariaDB is unreachable because admitting traffic it cannot account for is worse than not
 //! serving it. A log row has no such stake: dropping one costs a line in a table, while taking the
 //! process down would stop the limiter and the SSE bridge with it. So every failure here is a
 //! warning and a counter, never a propagated error.
 //!
-//! The channel is bounded for the same reason. A backend that logs faster than Scylla accepts must
+//! The channel is bounded for the same reason. A backend that logs faster than MariaDB accepts must
 //! see its records dropped, not slow down: the whole point of the fire-and-forget opcode is that
 //! logging never appears on a request's critical path.
 
@@ -16,22 +16,35 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
-use scylla::{
-    client::session::Session, statement::batch::Batch, statement::prepared::PreparedStatement,
-};
+use mysql_async::{Pool, prelude::Queryable};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::{
     config::RequestLogConfig,
+    database::purge_days_before,
     reqlog::{errors::ErrorWriteGate, protocol::RequestLogRecord},
 };
 
-/// What the writer could not do, kept as counters rather than logged per event: a Scylla outage
+/// Whole-row writes: a retried flush rewrites the same rows instead of failing on the key.
+const INSERT_USER_LOG: &str = "INSERT INTO user_logs (date, request_id, company_id, user_id, \
+     route_id, frame_route_company_agg, elapsed_ms, error_count, error_ids) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE company_id = VALUES(company_id), \
+     user_id = VALUES(user_id), route_id = VALUES(route_id), \
+     frame_route_company_agg = VALUES(frame_route_company_agg), elapsed_ms = VALUES(elapsed_ms), \
+     error_count = VALUES(error_count), error_ids = VALUES(error_ids)";
+
+/// Kept until it is rewritten: the table is bounded by the codebase, not by traffic.
+const UPSERT_REQUEST_ERROR: &str = "INSERT INTO request_errors (id, code_line, text, updated) \
+     VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE text = VALUES(text), updated = VALUES(updated)";
+
+/// How often days past the retention are deleted. The key is a day, so hourly is plenty.
+const PURGE_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// What the writer could not do, kept as counters rather than logged per event: a database outage
 /// would otherwise produce one warning per request.
 #[derive(Debug, Default)]
 pub struct RequestLogMetrics {
@@ -83,46 +96,13 @@ impl RequestLogSink {
 }
 
 pub struct RequestLogWriter {
-    session: Arc<Session>,
-    insert_user_log: PreparedStatement,
-    insert_request_error: PreparedStatement,
+    pool: Pool,
     config: RequestLogConfig,
 }
 
 impl RequestLogWriter {
-    pub async fn prepare(session: Arc<Session>, config: RequestLogConfig) -> Result<Self> {
-        let ttl_seconds = config.row_ttl.as_secs() as i32;
-
-        // TTL is interpolated rather than bound because Scylla will not take a bind marker in a
-        // USING TTL clause. It is an i32 derived from config and validated at load, never from a
-        // request, so nothing untrusted reaches this string.
-        let mut insert_user_log = session
-            .prepare(format!(
-                "INSERT INTO user_logs (date, request_id, company_id, user_id, route_id, \
-                 frame_route_company_agg, elapsed_ms, error_count, error_ids) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl_seconds}"
-            ))
-            .await
-            .context("failed to prepare the user_logs insert")?;
-        // Whole-row writes with no counters: a driver retry rewrites the same row.
-        insert_user_log.set_is_idempotent(true);
-
-        // No TTL: a code line that failed once is worth keeping until it is rewritten. The table is
-        // bounded by the codebase, not by traffic, so it does not grow the way user_logs does.
-        let mut insert_request_error = session
-            .prepare(
-                "INSERT INTO request_errors (id, code_line, text, updated) VALUES (?, ?, ?, ?)",
-            )
-            .await
-            .context("failed to prepare the request_errors insert")?;
-        insert_request_error.set_is_idempotent(true);
-
-        Ok(Self {
-            session,
-            insert_user_log,
-            insert_request_error,
-            config,
-        })
+    pub fn new(pool: Pool, config: RequestLogConfig) -> Self {
+        Self { pool, config }
     }
 
     /// Spawns the flush loop and returns the sink the connection readers submit through.
@@ -143,6 +123,8 @@ impl RequestLogWriter {
             let mut pending: Vec<RequestLogRecord> = Vec::with_capacity(max_batch);
             let mut ticker = tokio::time::interval(flush_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut purge_ticker = tokio::time::interval(PURGE_INTERVAL);
+            purge_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
@@ -165,6 +147,12 @@ impl RequestLogWriter {
                     }
                     _ = ticker.tick() => {
                         self.flush(&mut pending, &mut gate, &metrics).await;
+                    }
+                    _ = purge_ticker.tick() => {
+                        match purge_days_before(&self.pool, "user_logs", self.config.retention_days).await {
+                            Ok(removed_rows) => debug!(removed_rows, "user_logs retention purge finished"),
+                            Err(purge_error) => warn!(error = %purge_error, "user_logs retention purge failed"),
+                        }
                     }
                 }
             }
@@ -200,13 +188,9 @@ impl RequestLogWriter {
 
         let now = Instant::now();
         let updated = unix_seconds();
-        // Unlogged, not logged: these rows share no partition and need no atomicity between them.
-        // A logged batch would buy a guarantee nobody wants and pay for it on every write.
-        let mut batch = Batch::new(scylla::statement::batch::BatchType::Unlogged);
         let mut row_values = Vec::with_capacity(pending.len());
         let mut error_values = Vec::new();
         for record in pending.iter() {
-            batch.append_statement(self.insert_user_log.clone());
             row_values.push((
                 record.date,
                 record.request_id,
@@ -216,7 +200,7 @@ impl RequestLogWriter {
                 record.frame_route_company_agg(),
                 record.elapsed_ms,
                 record.error_count(),
-                record.error_ids(),
+                record.error_ids_blob(),
             ));
 
             for entry in &record.errors {
@@ -232,8 +216,19 @@ impl RequestLogWriter {
         }
 
         let row_count = row_values.len();
-        match self.session.batch(&batch, row_values).await {
-            Ok(_) => {
+        let mut connection = match self.pool.get_conn().await {
+            Ok(connection) => connection,
+            Err(connection_error) => {
+                metrics.write_failures.fetch_add(1, Ordering::Relaxed);
+                warn!(error = %connection_error, rows = row_count, "no MariaDB connection, dropping the request log batch");
+                pending.clear();
+                return;
+            }
+        };
+        // One prepared statement executed per row on the same connection: no atomicity is needed
+        // between these rows, and a failure drops the batch rather than retrying it.
+        match connection.exec_batch(INSERT_USER_LOG, row_values).await {
+            Ok(()) => {
                 metrics
                     .rows_written
                     .fetch_add(row_count as u64, Ordering::Relaxed);
@@ -246,12 +241,8 @@ impl RequestLogWriter {
 
         for values in error_values {
             let code_line = values.1.clone();
-            match self
-                .session
-                .execute_unpaged(&self.insert_request_error, values)
-                .await
-            {
-                Ok(_) => {
+            match connection.exec_drop(UPSERT_REQUEST_ERROR, values).await {
+                Ok(()) => {
                     metrics.errors_written.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(write_error) => {
@@ -273,25 +264,6 @@ fn unix_seconds() -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i32)
         .unwrap_or(0)
-}
-
-/// Opens the session both the limiter and this writer use. One pool to the same cluster is enough;
-/// two would double the connections for no gain.
-pub async fn connect_session(config: &crate::config::DatabaseConfig) -> Result<Arc<Session>> {
-    use scylla::client::session_builder::SessionBuilder;
-
-    let endpoint = format!("{}:{}", config.host, config.port);
-    let session = SessionBuilder::new()
-        .known_node(endpoint)
-        .user(&config.user, &config.password)
-        .build()
-        .await
-        .context("failed to connect to ScyllaDB")?;
-    session
-        .use_keyspace(&config.keyspace, false)
-        .await
-        .with_context(|| format!("failed to use ScyllaDB keyspace {}", config.keyspace))?;
-    Ok(Arc::new(session))
 }
 
 #[cfg(test)]

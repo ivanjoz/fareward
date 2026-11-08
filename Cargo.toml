@@ -25,7 +25,9 @@ colbin = { git = "https://github.com/ivanjoz/colbin", tag = "v0.9.2", features =
 getrandom = "0.4"
 # Only for statvfs, which is how the disk column is read: nothing under /proc reports free space.
 libc = "0.2"
-scylla = "1.7"
+# MariaDB, the database the backend's ORM owns these tables in. No TLS: the daemon reaches the
+# server on loopback (or a private network). `minimal` drops the derive macros nothing here uses.
+mysql_async = { version = "0.37", default-features = false, features = ["minimal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Only to compress a configuration secret into the 128-bit key SipHash takes: see src/siphash.rs.

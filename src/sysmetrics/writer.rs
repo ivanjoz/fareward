@@ -7,12 +7,9 @@
 //!
 //! Fails open throughout: a write that does not land is a warning and a counter.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use scylla::{client::session::Session, statement::prepared::PreparedStatement};
+use mysql_async::{Pool, prelude::Queryable};
 use tokio::{
     sync::watch,
     task::JoinHandle,
@@ -22,6 +19,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::ServerMetricsConfig,
+    database::purge_days_before,
     sysmetrics::{
         MetricsSample, WindowPeaks,
         collector::{ServiceUnits, SystemMetricsCollector},
@@ -30,83 +28,38 @@ use crate::{
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
-/// How long to wait before trying the prepare again after it failed.
-///
-/// The statement is prepared lazily and retried rather than once at startup, because the original
-/// arrangement lost a real deployment: the daemon came up before `fn-homologate` had created the
-/// table, the prepare failed, and the collector stayed off for the life of the process while every
-/// other part of it ran normally. A table arriving minutes after the daemon is the ordinary shape
-/// of a deploy, not an exceptional one, so it heals itself now.
-const PREPARE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+/// Every column is named: the Go side owns these names, and a rename there fails the write instead
+/// of putting values into the wrong columns. A whole-row upsert, so a retried window rewrites its
+/// row. The scylla_* pair holds the database unit's sample (server_metrics.scylla_unit), whatever
+/// that database is: the Go schema has not renamed it.
+const UPSERT_SERVER_METRICS: &str = "INSERT INTO server_metrics (date, slot, cpu_percent, \
+     mem_percent, disk_percent, net_rx_rate, net_tx_rate, backend_mem_mb, backend_cpu_percent, \
+     fareward_mem_mb, fareward_cpu_percent, scylla_mem_mb, scylla_cpu_percent) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
+     cpu_percent = VALUES(cpu_percent), mem_percent = VALUES(mem_percent), \
+     disk_percent = VALUES(disk_percent), net_rx_rate = VALUES(net_rx_rate), \
+     net_tx_rate = VALUES(net_tx_rate), backend_mem_mb = VALUES(backend_mem_mb), \
+     backend_cpu_percent = VALUES(backend_cpu_percent), fareward_mem_mb = VALUES(fareward_mem_mb), \
+     fareward_cpu_percent = VALUES(fareward_cpu_percent), scylla_mem_mb = VALUES(scylla_mem_mb), \
+     scylla_cpu_percent = VALUES(scylla_cpu_percent)";
 
+/// How often days past the retention are deleted. The key is a day, so hourly is plenty.
+const PURGE_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// No startup step can fail: a daemon that starts before `fn-homologate` has created the table
+/// only loses the rows written until it exists, and recovers by itself.
 pub struct ServerMetricsWriter {
-    session: Arc<Session>,
-    insert_row: Option<PreparedStatement>,
-    last_prepare_attempt: Option<Instant>,
-    insert_statement: String,
+    pool: Pool,
+    retention_days: i16,
+    last_purge: Option<Instant>,
 }
 
 impl ServerMetricsWriter {
-    pub fn new(session: Arc<Session>, config: &ServerMetricsConfig) -> Self {
-        let ttl_seconds = config.row_ttl.as_secs() as i32;
-
-        // The TTL is interpolated because Scylla takes no bind marker in a USING TTL clause. It is
-        // an i32 derived from config and validated at load, never from a request, so nothing
-        // untrusted reaches this string.
-        //
-        // Every column is named: the Go side owns these names, and a rename there fails the
-        // prepare instead of writing values into the wrong columns. fareward_* replaced
-        // server_utils_* in the rename; the ORM adds columns but never drops them, so the old pair
-        // survives on deployed tables holding pre-rename rows until their TTL expires it. That is
-        // also why `ensure_prepared` retries rather than giving up: on a host where the backend has
-        // not yet run its schema deploy, this prepare fails until the new columns exist.
-        let insert_statement = format!(
-            "INSERT INTO server_metrics (date, slot, cpu_percent, mem_percent, disk_percent, \
-             net_rx_rate, net_tx_rate, backend_mem_mb, backend_cpu_percent, \
-             fareward_mem_mb, fareward_cpu_percent, scylla_mem_mb, scylla_cpu_percent) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl_seconds}"
-        );
-
+    pub fn new(pool: Pool, config: &ServerMetricsConfig) -> Self {
         Self {
-            session,
-            insert_row: None,
-            last_prepare_attempt: None,
-            insert_statement,
-        }
-    }
-
-    /// The prepared insert, preparing it on first use and re-attempting on a slow interval while it
-    /// keeps failing. Returns `false` when there is still no statement, so the caller drops the row.
-    async fn ensure_prepared(&mut self) -> bool {
-        if self.insert_row.is_some() {
-            return true;
-        }
-        // Rate-limited so an absent table costs one query a minute rather than one every five
-        // seconds, while still recovering on its own once the table appears.
-        if self
-            .last_prepare_attempt
-            .is_some_and(|attempted| attempted.elapsed() < PREPARE_RETRY_INTERVAL)
-        {
-            return false;
-        }
-        self.last_prepare_attempt = Some(Instant::now());
-
-        match self.session.prepare(self.insert_statement.clone()).await {
-            Ok(mut statement) => {
-                // A whole-row write with no counters: a driver retry rewrites the same row.
-                statement.set_is_idempotent(true);
-                self.insert_row = Some(statement);
-                info!("server_metrics insert prepared, writing rows");
-                true
-            }
-            Err(prepare_error) => {
-                warn!(
-                    error = %prepare_error,
-                    retry_seconds = PREPARE_RETRY_INTERVAL.as_secs(),
-                    "server_metrics insert could not be prepared; does the table exist?"
-                );
-                false
-            }
+            pool,
+            retention_days: config.retention_days,
+            last_purge: None,
         }
     }
 
@@ -140,7 +93,7 @@ impl ServerMetricsWriter {
             info!(
                 sample_ms = config.sample_interval.as_millis(),
                 row_seconds = config.row_seconds,
-                ttl_days = config.row_ttl.as_secs() / SECONDS_PER_DAY as u64,
+                retention_days = config.retention_days,
                 mount = %config.disk_mount,
                 "server metrics collector started"
             );
@@ -210,27 +163,46 @@ impl ServerMetricsWriter {
         if peaks.is_empty() {
             return;
         }
-        let sample = peaks.take();
-        // Taken before the prepare check on purpose: an unwritable window still has to clear the
+        // Taken before the write on purpose: an unwritable window still has to clear the
         // accumulator, or its peak would leak into every later row until the table appears.
-        if !self.ensure_prepared().await {
-            *write_failures += 1;
-            return;
-        }
+        let sample = peaks.take();
+        self.purge_when_due().await;
         let window_start = row_index * row_seconds;
         let date = (window_start / SECONDS_PER_DAY) as i16;
         let slot = ((window_start % SECONDS_PER_DAY) / row_seconds) as i16;
 
         let values = row_values(date, slot, &sample);
-        let Some(insert_row) = &self.insert_row else {
-            return;
+        let write_result = match self.pool.get_conn().await {
+            Ok(mut connection) => {
+                connection
+                    .exec_drop(UPSERT_SERVER_METRICS, values.to_vec())
+                    .await
+            }
+            Err(connection_error) => Err(connection_error),
         };
-        match self.session.execute_unpaged(insert_row, &values[..]).await {
-            Ok(_) => *rows_written += 1,
+        match write_result {
+            Ok(()) => *rows_written += 1,
             Err(write_error) => {
                 *write_failures += 1;
                 warn!(error = %write_error, date, slot, "server_metrics write failed, dropping the row");
             }
+        }
+    }
+
+    /// Deletes days past the retention, at most once per PURGE_INTERVAL. Runs inside the write
+    /// path because this loop is the writer's only task; a failure is a warning like a lost row.
+    async fn purge_when_due(&mut self) {
+        if self
+            .last_purge
+            .is_some_and(|purged| purged.elapsed() < PURGE_INTERVAL)
+        {
+            return;
+        }
+        self.last_purge = Some(Instant::now());
+        if let Err(purge_error) =
+            purge_days_before(&self.pool, "server_metrics", self.retention_days).await
+        {
+            warn!(error = %purge_error, "server_metrics retention purge failed");
         }
     }
 }

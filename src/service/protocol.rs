@@ -5,10 +5,8 @@
 //! codec in its own module. What the operations share is only the socket, the handshake nonce, and
 //! the frame sequence that binds each tag to that connection.
 //!
-//! The length header is on every frame because every payload is now variable. Six of the eight are
-//! colbin messages, which write the bytes a value needs and omit a zero-valued field entirely, and
-//! the other two carry a counter name. Nothing is left that a fixed width could describe, so the
-//! two framings that used to exist collapsed into the one that could carry both.
+//! The length header is on every frame because every payload is variable: colbin messages write the
+//! bytes a value needs and omit a zero-valued field entirely.
 
 use crate::{
     limiter::access::INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE,
@@ -17,24 +15,17 @@ use crate::{
     limiter::protocol::CHARGE_MAX_PAYLOAD_SIZE,
     lock::protocol::{ACQUIRE_MAX_PAYLOAD_SIZE, RELEASE_MAX_PAYLOAD_SIZE},
     reqlog::protocol::REQUEST_LOG_MAX_PAYLOAD_SIZE,
-    sequence::protocol::{
-        SEQUENCE_REPLY_EXTRA_SIZE, SEQUENCE_RESERVE_MAX_PAYLOAD_SIZE, SEQUENCE_SET_MAX_PAYLOAD_SIZE,
-    },
 };
 
 pub const OPCODE_SIZE: usize = 1;
 pub const AUTH_TAG_SIZE: usize = 8;
 /// Fixed head of every reply: `[shape:1][correlation:u16]`. What follows is the body the shape
-/// names, which is nothing at all for four of the eleven shapes.
+/// names, which is nothing at all for three of the nine shapes.
 pub const REPLY_HEAD_SIZE: usize = 3;
 
-/// Widest body a reply may carry. A granted charge is the only variable one — two masks, a length
-/// and at most two sub bytes per required slot — and a sequence value is the widest fixed one.
-pub const REPLY_MAX_BODY_SIZE: usize = if 3 + 2 * MAX_REQUIRED_ACCESS > SEQUENCE_REPLY_EXTRA_SIZE {
-    3 + 2 * MAX_REQUIRED_ACCESS
-} else {
-    SEQUENCE_REPLY_EXTRA_SIZE
-};
+/// Widest body a reply may carry: a granted charge, two masks, a length and at most two sub bytes
+/// per required slot.
+pub const REPLY_MAX_BODY_SIZE: usize = 3 + 2 * MAX_REQUIRED_ACCESS;
 /// Width of the length header every opcode carries between the opcode and its payload.
 pub const LENGTH_PREFIX_SIZE: usize = 2;
 
@@ -71,12 +62,9 @@ pub enum ReplyShape {
     Ack = 0x07,
     /// The budget was not mutated. The body is `BudgetMutationReply`, minus its success value.
     BudgetRefused = 0x08,
-    /// A reserved or replaced counter value.
-    SequenceValue = 0x09,
-    /// The sequence request was malformed, which no retry fixes.
-    SequenceInvalid = 0x0A,
+    // 0x09 and 0x0A were the sequence service's replies, removed with it: MariaDB owns sequences.
     /// "I could not answer." Every operation's policy for it stays on the client: credits fail
-    /// closed, a sequence fails the write, lock call sites decide individually.
+    /// closed, lock call sites decide individually.
     Unavailable = 0x7F,
     /// A push: a lease elapsed and the daemon dropped a hold the client still believes it owns.
     LockLost = 0x80,
@@ -93,8 +81,6 @@ impl ReplyShape {
             0x06 => Some(Self::LockRefused),
             0x07 => Some(Self::Ack),
             0x08 => Some(Self::BudgetRefused),
-            0x09 => Some(Self::SequenceValue),
-            0x0A => Some(Self::SequenceInvalid),
             0x7F => Some(Self::Unavailable),
             0x80 => Some(Self::LockLost),
             _ => None,
@@ -115,13 +101,12 @@ impl ReplyShape {
     /// push, and the one reply whose body varies.
     pub fn body_size(self) -> Option<usize> {
         match self {
-            Self::ChargeAllowed | Self::Ack | Self::SequenceInvalid | Self::Unavailable => Some(0),
+            Self::ChargeAllowed | Self::Ack | Self::Unavailable => Some(0),
             Self::ChargeCreditViolation
             | Self::ChargeAccessDenied
             | Self::LockRefused
             | Self::BudgetRefused => Some(1),
             Self::LockGranted => Some(2),
-            Self::SequenceValue => Some(SEQUENCE_REPLY_EXTRA_SIZE),
             // Two masks, a sub-byte count, and that many sub bytes.
             Self::ChargeGranted => None,
             // A push states its own length, so an unknown one is skippable.
@@ -157,8 +142,6 @@ pub enum Reply {
     LockRefused(u8),
     Ack,
     BudgetRefused(u8),
-    SequenceValue(i64),
-    SequenceInvalid,
     Unavailable,
     LockLost {
         action: u16,
@@ -177,8 +160,6 @@ impl Reply {
             Self::LockRefused(_) => ReplyShape::LockRefused,
             Self::Ack => ReplyShape::Ack,
             Self::BudgetRefused(_) => ReplyShape::BudgetRefused,
-            Self::SequenceValue(_) => ReplyShape::SequenceValue,
-            Self::SequenceInvalid => ReplyShape::SequenceInvalid,
             Self::Unavailable => ReplyShape::Unavailable,
             Self::LockLost { .. } => ReplyShape::LockLost,
         }
@@ -199,7 +180,7 @@ impl Reply {
         frame.push(self.shape() as u8);
         frame.extend_from_slice(&((sequence & 0xFFFF) as u16).to_be_bytes());
         match self {
-            Self::ChargeAllowed | Self::Ack | Self::SequenceInvalid | Self::Unavailable => {}
+            Self::ChargeAllowed | Self::Ack | Self::Unavailable => {}
             Self::ChargeGranted {
                 granted_mask,
                 has_subs_mask,
@@ -217,7 +198,6 @@ impl Reply {
             Self::LockGranted { generation } => {
                 frame.extend_from_slice(&generation.to_be_bytes())
             }
-            Self::SequenceValue(value) => frame.extend_from_slice(&value.to_be_bytes()),
             Self::LockLost { action, identifier } => {
                 // Length first: every push carries one so a client that predates the shape can
                 // step over it instead of losing the connection.
@@ -234,7 +214,7 @@ impl Reply {
 /// widest by far — it carries strings — but still small enough to keep the buffer on the stack.
 ///
 /// `const fn` rather than a chain of `if` expressions, which is what this was while the widths
-/// came from two different families: eight opcodes, one rule, one place to add the ninth.
+/// came from two different families: one rule, one place to add the next opcode.
 const fn larger(left: usize, right: usize) -> usize {
     if left > right { left } else { right }
 }
@@ -244,13 +224,7 @@ const LARGEST_PAYLOAD_SIZE: usize = larger(
         larger(CHARGE_MAX_PAYLOAD_SIZE, ACQUIRE_MAX_PAYLOAD_SIZE),
         larger(RELEASE_MAX_PAYLOAD_SIZE, MUTATE_BUDGET_MAX_PAYLOAD_SIZE),
     ),
-    larger(
-        larger(INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE, REQUEST_LOG_MAX_PAYLOAD_SIZE),
-        larger(
-            SEQUENCE_RESERVE_MAX_PAYLOAD_SIZE,
-            SEQUENCE_SET_MAX_PAYLOAD_SIZE,
-        ),
-    ),
+    larger(INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE, REQUEST_LOG_MAX_PAYLOAD_SIZE),
 );
 pub const MAX_FRAME_SIZE: usize =
     OPCODE_SIZE + LENGTH_PREFIX_SIZE + LARGEST_PAYLOAD_SIZE + AUTH_TAG_SIZE;
@@ -264,8 +238,7 @@ pub enum Opcode {
     LogRequest = 0x04,
     MutateCompanyBudget = 0x05,
     InvalidateUserAccess = 0x06,
-    ReserveSequence = 0x07,
-    SetSequence = 0x08,
+    // 0x07 and 0x08 were ReserveSequence and SetSequence, removed with the sequence service.
 }
 
 impl Opcode {
@@ -279,8 +252,6 @@ impl Opcode {
             0x04 => Some(Self::LogRequest),
             0x05 => Some(Self::MutateCompanyBudget),
             0x06 => Some(Self::InvalidateUserAccess),
-            0x07 => Some(Self::ReserveSequence),
-            0x08 => Some(Self::SetSequence),
             _ => None,
         }
     }
@@ -296,9 +267,6 @@ impl Opcode {
             Self::LogRequest => REQUEST_LOG_MAX_PAYLOAD_SIZE,
             Self::MutateCompanyBudget => MUTATE_BUDGET_MAX_PAYLOAD_SIZE,
             Self::InvalidateUserAccess => INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE,
-            Self::ReserveSequence => SEQUENCE_RESERVE_MAX_PAYLOAD_SIZE,
-            // Same shape as a reservation, one field wider: an absolute i64 instead of a u32 count.
-            Self::SetSequence => SEQUENCE_SET_MAX_PAYLOAD_SIZE,
         }
     }
 
@@ -327,8 +295,6 @@ mod tests {
             Opcode::LogRequest,
             Opcode::MutateCompanyBudget,
             Opcode::InvalidateUserAccess,
-            Opcode::ReserveSequence,
-            Opcode::SetSequence,
         ] {
             let widest =
                 OPCODE_SIZE + LENGTH_PREFIX_SIZE + opcode.max_payload_size() + AUTH_TAG_SIZE;
@@ -339,14 +305,6 @@ mod tests {
     #[test]
     fn two_opcodes_are_unanswered_and_the_rest_are_answered() {
         assert_eq!(Opcode::from_byte(0x04), Some(Opcode::LogRequest));
-        assert_eq!(Opcode::from_byte(0x07), Some(Opcode::ReserveSequence));
-        assert_eq!(Opcode::from_byte(0x08), Some(Opcode::SetSequence));
-        // A reservation is length-prefixed but still answered — the reserved value is the point of
-        // the call, so unlike the request log a client does park a caller waiting for it.
-        assert!(Opcode::ReserveSequence.expects_reply());
-        // A set is answered too: it reports the value it replaced, which is the caller's only
-        // record of what the counter held before a destructive repair.
-        assert!(Opcode::SetSequence.expects_reply());
 
         // Nothing is sent back for either of these, so a client must not park a caller waiting.
         assert!(!Opcode::LogRequest.expects_reply());
@@ -362,12 +320,9 @@ mod tests {
         }
     }
 
-    /// The reserved value is an `i64`, so a body that could not carry eight bytes would truncate an
-    /// id into a different, valid-looking id.
+    /// A body length always fits the one byte that states it.
     #[test]
-    fn the_widest_body_can_carry_a_reserved_value() {
-        assert!(REPLY_MAX_BODY_SIZE >= SEQUENCE_REPLY_EXTRA_SIZE);
-        // And a body length always fits the one byte that states it.
+    fn the_widest_body_fits_its_length_byte() {
         assert!(REPLY_MAX_BODY_SIZE <= usize::from(u8::MAX));
     }
 
@@ -376,7 +331,7 @@ mod tests {
         assert_eq!(Reply::Ack.encode(0), [0x07, 0x00, 0x00]);
         assert_eq!(Reply::ChargeAllowed.encode(1), [0x01, 0x00, 0x01]);
         assert_eq!(Reply::Unavailable.encode(7), [0x7F, 0x00, 0x07]);
-        assert_eq!(Reply::SequenceInvalid.encode(300), [0x0A, 0x01, 0x2C]);
+        assert_eq!(Reply::BudgetRefused(1).encode(300), [0x08, 0x01, 0x2C, 0x01]);
         // Only the low 16 bits travel, so a client correlates on the same truncation.
         assert_eq!(Reply::Ack.encode(0x1_0002), [0x07, 0x00, 0x02]);
     }
@@ -393,8 +348,6 @@ mod tests {
             Reply::LockRefused(2),
             Reply::Ack,
             Reply::BudgetRefused(1),
-            Reply::SequenceValue(9_876_543_210),
-            Reply::SequenceInvalid,
             Reply::Unavailable,
         ];
         for reply in cases {
@@ -431,10 +384,6 @@ mod tests {
         assert_eq!(
             Reply::LockGranted { generation: 300 }.encode(7),
             [0x05, 0x00, 0x07, 0x01, 0x2C]
-        );
-        assert_eq!(
-            Reply::SequenceValue(1).encode(7),
-            [0x09, 0x00, 0x07, 0, 0, 0, 0, 0, 0, 0, 1]
         );
         assert_eq!(
             Reply::LockLost {
@@ -474,7 +423,8 @@ mod tests {
     #[test]
     fn the_shape_byte_is_a_closed_set_with_room_for_pushes() {
         assert_eq!(ReplyShape::from_byte(0x00), None);
-        assert_eq!(ReplyShape::from_byte(0x0B), None);
+        assert_eq!(ReplyShape::from_byte(0x09), None);
+        assert_eq!(ReplyShape::from_byte(0x0A), None);
         assert_eq!(ReplyShape::from_byte(0x81), None);
         assert_eq!(ReplyShape::from_byte(0x80), Some(ReplyShape::LockLost));
         assert!(ReplyShape::LockLost.is_push());
@@ -488,7 +438,8 @@ mod tests {
         assert_eq!(Opcode::from_byte(0x03), Some(Opcode::LockRelease));
         // Unassigned bytes must not resolve, or a garbage frame would be dispatched.
         assert_eq!(Opcode::from_byte(0x00), None);
-        assert_eq!(Opcode::from_byte(0x09), None);
+        assert_eq!(Opcode::from_byte(0x07), None);
+        assert_eq!(Opcode::from_byte(0x08), None);
         assert_eq!(Opcode::from_byte(0xFF), None);
 
         // A ceiling is what an unauthenticated peer can make the daemon hold before the tag at the

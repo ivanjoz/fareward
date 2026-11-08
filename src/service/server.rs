@@ -40,10 +40,6 @@ use crate::{
         registry::{LockGuard, LockOutcome, LockRegistry},
     },
     reqlog::{protocol::parse_request_log, writer::RequestLogSink},
-    sequence::{
-        allocator::SequenceAllocator,
-        protocol::{parse_reserve, parse_set},
-    },
     service::{
         auth,
         protocol::{
@@ -118,7 +114,6 @@ pub async fn run(
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
     request_logs: RequestLogSink,
-    sequences: Arc<SequenceAllocator>,
     secret: Arc<Vec<u8>>,
     frame_timeout: Duration,
     max_connections: usize,
@@ -176,7 +171,6 @@ pub async fn run(
         let limiter = limiter.clone();
         let locks = locks.clone();
         let request_logs = request_logs.clone();
-        let sequences = sequences.clone();
         let secret = secret.clone();
         let connection_shutdown = shutdown.clone();
         // Split here rather than inside handle_connection: `into_split` gives lock-free owned
@@ -202,7 +196,6 @@ pub async fn run(
                 limiter,
                 locks,
                 request_logs,
-                sequences,
                 &secret,
                 frame_timeout,
                 max_inflight,
@@ -231,7 +224,6 @@ async fn handle_connection(
     limiter: Arc<RateLimiter>,
     locks: Arc<LockRegistry>,
     request_logs: RequestLogSink,
-    sequences: Arc<SequenceAllocator>,
     secret: &[u8],
     frame_timeout: Duration,
     max_inflight: usize,
@@ -258,10 +250,6 @@ async fn handle_connection(
 
     let (acquire_sender, mut acquire_receiver) = mpsc::channel::<AcquireOutcome>(max_inflight);
     let inflight = Arc::new(Semaphore::new(max_inflight));
-    // Sequences get their own ceiling: a block miss is a ScyllaDB counter update, which slows down
-    // with the database, and sharing one ceiling let a pile of slow reservations refuse the charges
-    // and locks that answer from memory. The client keeps a matching pool per class.
-    let sequence_inflight = Arc::new(Semaphore::new(max_inflight));
     // Dropping this aborts every spawned handler, including an acquire still parked in the
     // registry's queue. Without that, a disconnected client's queued acquire would still be
     // granted a lock that nobody holds and nobody will release.
@@ -387,10 +375,7 @@ async fn handle_connection(
 
         // Refusing beyond the ceiling keeps one connection from spawning without bound. Taken
         // before spawning so the permit's lifetime is exactly the handler's.
-        let permit = match opcode {
-            Opcode::ReserveSequence | Opcode::SetSequence => sequence_inflight.clone().try_acquire_owned().ok(),
-            _ => inflight.clone().try_acquire_owned().ok(),
-        };
+        let permit = inflight.clone().try_acquire_owned().ok();
 
         match opcode {
             Opcode::ChargeCredits => {
@@ -408,7 +393,7 @@ async fn handle_connection(
                 let reply_sender = reply_sender.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
-                    // A cold subject loads its usage from Scylla, so this cannot be inlined in the
+                    // A cold subject loads its usage from MariaDB, so this cannot be inlined in the
                     // reader without head-of-line blocking every other request behind it.
                     //
                     // The two refusals are two shapes rather than two fields of one: a credit
@@ -574,7 +559,7 @@ async fn handle_connection(
                     Err(error) => break Err(error).context("authenticated frame is invalid"),
                 };
                 // Takes a permit, unlike the request log: this awaits the shard mutex, which the
-                // charge path holds across ScyllaDB reads, so it can genuinely wait. At the ceiling
+                // charge path holds across MariaDB reads, so it can genuinely wait. At the ceiling
                 // the frame is dropped — there is nobody to answer, and the TTL is precisely the
                 // backstop for an invalidation that did not land.
                 let Some(permit) = permit else {
@@ -592,92 +577,6 @@ async fn handle_connection(
                         user_id = invalidation.user_id,
                         "dropped cached user access grants"
                     );
-                });
-            }
-            Opcode::ReserveSequence => {
-                let request = match parse_reserve(&frame[payload_offset..tag_offset]) {
-                    Ok(request) => request,
-                    // Unlike the request log, a malformed reservation is answered rather than
-                    // discarded: a caller is parked waiting for a value, and no reply at all would
-                    // hang it until its own timeout.
-                    Err(parse_error) => {
-                        warn!(%peer, sequence = frame_sequence, error = %parse_error,
-                              "refusing a malformed sequence reservation");
-                        send_reply(&reply_sender, frame_sequence, Reply::SequenceInvalid).await;
-                        continue;
-                    }
-                };
-                // Spawned for the same reason as a charge: a request that exhausts its block goes
-                // to ScyllaDB, and inlining that would stall every other frame on this connection
-                // behind it.
-                let Some(permit) = permit else {
-                    warn!(%peer, "in-flight ceiling reached, refusing a sequence reservation");
-                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
-                    continue;
-                };
-                let sequences = sequences.clone();
-                let reply_sender = reply_sender.clone();
-                handlers.spawn(async move {
-                    let _permit = permit;
-                    match sequences.reserve(&request.name, request.increment).await {
-                        Ok(start) => {
-                            send_reply(&reply_sender, frame_sequence, Reply::SequenceValue(start))
-                                .await;
-                        }
-                        // Fails closed: the client turns any non-zero status into an error and
-                        // refuses the write, because the alternative — falling back to its own
-                        // allocator — is what would mint a duplicate id.
-                        Err(reserve_error) => {
-                            // `{:#}` and not `%`: every failure on this path arrives wrapped in
-                            // `.context()`, and Display prints only the outermost layer — which
-                            // reports "counter update failed" and hides the ScyllaDB error that
-                            // says why. A reservation failure blocks every insert on the counter,
-                            // so it is the last place to be economical about a log line.
-                            warn!(counter = %request.name, error = %format_args!("{reserve_error:#}"),
-                                  "sequence reservation failed");
-                            send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
-                        }
-                    }
-                });
-            }
-            Opcode::SetSequence => {
-                let request = match parse_set(&frame[payload_offset..tag_offset]) {
-                    Ok(request) => request,
-                    Err(parse_error) => {
-                        warn!(%peer, sequence = frame_sequence, error = %parse_error,
-                              "refusing a malformed sequence assignment");
-                        send_reply(&reply_sender, frame_sequence, Reply::SequenceInvalid).await;
-                        continue;
-                    }
-                };
-                let Some(permit) = permit else {
-                    warn!(%peer, "in-flight ceiling reached, refusing a sequence assignment");
-                    send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
-                    continue;
-                };
-                let sequences = sequences.clone();
-                let reply_sender = reply_sender.clone();
-                handlers.spawn(async move {
-                    let _permit = permit;
-                    match sequences.set(&request.name, request.value).await {
-                        Ok(previous) => {
-                            // Logged unconditionally: this is a destructive administrative write,
-                            // and the value it replaced exists nowhere else afterwards.
-                            info!(counter = %request.name, previous, assigned = request.value,
-                                  "sequence counter reassigned");
-                            send_reply(
-                                &reply_sender,
-                                frame_sequence,
-                                Reply::SequenceValue(previous),
-                            )
-                            .await;
-                        }
-                        Err(set_error) => {
-                            warn!(counter = %request.name, error = %format_args!("{set_error:#}"),
-                                  "sequence assignment failed");
-                            send_reply(&reply_sender, frame_sequence, Reply::Unavailable).await;
-                        }
-                    }
                 });
             }
         }

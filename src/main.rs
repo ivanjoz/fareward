@@ -12,10 +12,10 @@ use anyhow::{Context, Result};
 use fareward::{
     bridge::{self, channel::ChannelRegistry, http::BridgeState},
     config::AppConfig,
-    limiter::{quota::RateLimiter, storage::ScyllaLimiterStore},
+    database::connect_pool,
+    limiter::{quota::RateLimiter, storage::MariaLimiterStore},
     lock::registry::LockRegistry,
-    reqlog::writer::{RequestLogSink, RequestLogWriter, connect_session},
-    sequence::{allocator::SequenceAllocator, store::ScyllaSequenceStore},
+    reqlog::writer::{RequestLogSink, RequestLogWriter},
     service::server,
     sysmetrics::writer::ServerMetricsWriter,
 };
@@ -32,12 +32,12 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AppConfig::load().context("fareward configuration is invalid")?;
-    // One pool to the cluster, shared by the limiter and the request-log writer. Two would double
-    // the connections to the same nodes for nothing.
-    let session = connect_session(&config.database)
+    // One pool shared by the limiter and both writers. Fails the start: the limiter must load the
+    // existing usage before admitting anything.
+    let pool = connect_pool(&config.database)
         .await
-        .context("ScyllaDB connection failed")?;
-    let store = Arc::new(ScyllaLimiterStore::with_session(session.clone()).await?);
+        .context("MariaDB connection failed")?;
+    let store = Arc::new(MariaLimiterStore::new(pool.clone()));
     let limiter = Arc::new(RateLimiter::new(
         config.shard_count,
         config.policy,
@@ -47,16 +47,6 @@ async fn main() -> Result<()> {
     // Purely in-memory, unlike the limiter: locks are not loaded from anywhere and do not
     // survive a restart.
     let locks = Arc::new(LockRegistry::new(config.shard_count, config.locks));
-    // Fails at startup rather than at the first insert, unlike the request log and the metrics
-    // collector: a backend configured to reserve its ids here has no second way to get one, so a
-    // daemon that silently came up unable to serve them would break every write instead of a log
-    // row. The `sequences` table is the ORM's, and a keyspace without it has no tables to number.
-    let sequence_store = Arc::new(ScyllaSequenceStore::with_session(session.clone()).await?);
-    let sequences = Arc::new(SequenceAllocator::new(
-        sequence_store,
-        config.shard_count,
-        config.sequences,
-    ));
     let listener = TcpListener::bind(config.listen_address)
         .await
         .with_context(|| format!("failed to bind {}", config.listen_address))?;
@@ -72,17 +62,11 @@ async fn main() -> Result<()> {
     let internal_apikey = Arc::new(config.internal_apikey.clone());
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
 
-    // Fails open, unlike everything else started here: if the statements cannot be prepared the
-    // daemon runs on with logging disabled rather than refusing to serve. A missing log row is not
-    // worth stopping the limiter and the bridge for.
+    // Fails open, unlike the limiter: a write that fails drops its rows rather than stopping the
+    // daemon. A missing log row is not worth stopping the limiter and the bridge for.
     let request_logs = if config.request_log.enabled {
-        match RequestLogWriter::prepare(session.clone(), config.request_log.clone()).await {
-            Ok(writer) => writer.spawn(shutdown_receiver.clone()),
-            Err(prepare_error) => {
-                error!(error = %prepare_error, "request log writer disabled: preparation failed");
-                RequestLogSink::disabled()
-            }
-        }
+        RequestLogWriter::new(pool.clone(), config.request_log.clone())
+            .spawn(shutdown_receiver.clone())
     } else {
         info!("request log writer disabled by configuration");
         RequestLogSink::disabled()
@@ -93,12 +77,10 @@ async fn main() -> Result<()> {
     // only task here that keeps running when the backend is a Lambda, which is the whole point of
     // sampling the machine from this process rather than from the backend.
     let metrics_task = if config.server_metrics.enabled {
-        // No fallible startup step any more. The insert is prepared on first write and retried
-        // while it keeps failing, because a daemon that starts before `fn-homologate` has created
-        // its table is ordinary deploy ordering — and it used to leave the collector off until
-        // somebody restarted the process by hand.
+        // No fallible startup step: a daemon that starts before `fn-homologate` has created the
+        // table only drops rows until it exists.
         Some(
-            ServerMetricsWriter::new(session.clone(), &config.server_metrics)
+            ServerMetricsWriter::new(pool.clone(), &config.server_metrics)
                 .spawn(config.server_metrics.clone(), shutdown_receiver.clone()),
         )
     } else {
@@ -135,7 +117,6 @@ async fn main() -> Result<()> {
         limiter.clone(),
         locks,
         request_logs,
-        sequences,
         internal_apikey.clone(),
         config.frame_timeout,
         config.max_connections,
@@ -191,5 +172,8 @@ async fn main() -> Result<()> {
     server_task.await.context("server task failed")??;
     let written = limiter.flush_dirty().await;
     info!(written, "final usage flush finished");
+    if let Err(disconnect_error) = pool.disconnect().await {
+        error!(error = %disconnect_error, "MariaDB pool did not close cleanly");
+    }
     Ok(())
 }
