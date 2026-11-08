@@ -1,4 +1,4 @@
-//! Decimal period keys shared by aggregation and Scylla persistence.
+//! Decimal period keys shared by aggregation and store persistence.
 
 use thiserror::Error;
 

@@ -4,7 +4,6 @@ use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use toml::{Table, Value};
-use tracing::warn;
 
 use crate::{
     limiter::quota::{CreditLimits, LimitPolicy, ScopeLimits, Windows},
@@ -13,8 +12,8 @@ use crate::{
 
 const DEFAULT_LISTEN_PORT: u16 = 14013;
 const DEFAULT_FLUSH_SECONDS: u64 = 15;
-/// How long a user's authorization grants stay cached. The backend invalidates actively after
-/// rewriting them, so this bounds only the case where that frame was lost or the backend restarted.
+/// How long a user's authorization grants stay cached. A grants push drops the cached grants of
+/// the users it stores, so this is only a backstop that re-reads the store now and then.
 const DEFAULT_ACCESS_CACHE_SECONDS: u64 = 600;
 const DEFAULT_FRAME_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
@@ -43,7 +42,7 @@ const DEFAULT_SERVER_METRICS_TTL_DAYS: u64 = 30;
 const MINIMUM_SERVER_METRICS_ROW_SECONDS: u64 = 3;
 const DEFAULT_SERVER_METRICS_BACKEND_UNIT: &str = "genix.service";
 const DEFAULT_SERVER_METRICS_FAREWARD_UNIT: &str = "fareward.service";
-/// The database's unit. Its samples land in the scylla_* columns, which the Go schema still names.
+/// The database's unit, sampled into the metrics' database columns.
 const DEFAULT_SERVER_METRICS_DATABASE_UNIT: &str = "mariadb.service";
 
 #[derive(Clone, Debug)]
@@ -118,7 +117,7 @@ pub struct ServerMetricsConfig {
     /// at all when it runs on Lambda, which is the case the `-1` sentinel exists for.
     pub backend_unit: String,
     pub fareward_unit: String,
-    pub scylla_unit: String,
+    pub database_unit: String,
 }
 
 #[derive(Clone, Debug)]
@@ -364,9 +363,9 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
             "server_metrics.fareward_unit",
             DEFAULT_SERVER_METRICS_FAREWARD_UNIT,
         ),
-        scylla_unit: unit_name(
-            "SERVER_METRICS_SCYLLA_UNIT",
-            "server_metrics.scylla_unit",
+        database_unit: unit_name(
+            "SERVER_METRICS_DATABASE_UNIT",
+            "server_metrics.database_unit",
             DEFAULT_SERVER_METRICS_DATABASE_UNIT,
         ),
     })
@@ -417,80 +416,44 @@ fn validate_windows(windows: Windows) -> Result<()> {
 
 fn load_scope_limits(config: &Table, env_scope: &str, toml_scope: &str) -> Result<ScopeLimits> {
     // Environment names stay flat while TOML values live in the grouped rate_limit section.
-    let value = |env_credit, toml_credit, window: &LimitName| {
+    let value = |env_credit, toml_credit, env_window, toml_window| {
         rate_limit_value(
             config,
             env_scope,
             toml_scope,
             env_credit,
             toml_credit,
-            window,
+            env_window,
+            toml_window,
         )
     };
     Ok(ScopeLimits {
         cpu: CreditLimits {
-            short: value("CPU", "cpu", &SHORT_LIMIT)?,
-            long: value("CPU", "cpu", &LONG_LIMIT)?,
+            short: value("CPU", "cpu", "SHORT", "short")?,
+            long: value("CPU", "cpu", "LONG", "long")?,
         },
         inference: CreditLimits {
-            short: value("INFERENCE", "inference", &SHORT_LIMIT)?,
-            long: value("INFERENCE", "inference", &LONG_LIMIT)?,
+            short: value("INFERENCE", "inference", "SHORT", "short")?,
+            long: value("INFERENCE", "inference", "LONG", "long")?,
         },
     })
 }
 
-/// The suffix of one window's credit limit, now and before the windows were configurable.
-struct LimitName {
-    env: &'static str,
-    toml: &'static str,
-    legacy_env: &'static str,
-    legacy_toml: &'static str,
-}
-
-const SHORT_LIMIT: LimitName = LimitName {
-    env: "SHORT",
-    toml: "short",
-    legacy_env: "10S",
-    legacy_toml: "10s",
-};
-
-const LONG_LIMIT: LimitName = LimitName {
-    env: "LONG",
-    toml: "long",
-    legacy_env: "1H",
-    legacy_toml: "1h",
-};
-
-/// The credits per window, from `company_cpu_short` and the like. The names before the windows were
-/// configurable (`_10s`, `_1h`) are still read, with a warning, so an existing deployment keeps
-/// starting; the new name wins when both are set.
+/// The credits per window, from `company_cpu_short` and the like.
 fn rate_limit_value(
     config: &Table,
     env_scope: &str,
     toml_scope: &str,
     env_credit: &str,
     toml_credit: &str,
-    window: &LimitName,
+    env_window: &str,
+    toml_window: &str,
 ) -> Result<u64> {
-    let env_key = format!("RATE_LIMIT_{env_scope}_{env_credit}_{}", window.env);
-    let toml_path = format!("rate_limit.{toml_scope}_{toml_credit}_{}", window.toml);
-    if value_text(config, &env_key, &toml_path).is_some() {
-        return required_u64(config, &env_key, &toml_path);
-    }
-    let legacy_env = format!("RATE_LIMIT_{env_scope}_{env_credit}_{}", window.legacy_env);
-    let legacy_toml = format!(
-        "rate_limit.{toml_scope}_{toml_credit}_{}",
-        window.legacy_toml
-    );
-    if value_text(config, &legacy_env, &legacy_toml).is_some() {
-        warn!(
-            old = %legacy_toml,
-            new = %toml_path,
-            "deprecated rate-limit name: it now means credits per configured window, rename it"
-        );
-        return required_u64(config, &legacy_env, &legacy_toml);
-    }
-    required_u64(config, &env_key, &toml_path)
+    required_u64(
+        config,
+        &format!("RATE_LIMIT_{env_scope}_{env_credit}_{env_window}"),
+        &format!("rate_limit.{toml_scope}_{toml_credit}_{toml_window}"),
+    )
 }
 
 fn validate_policy(policy: LimitPolicy) -> Result<()> {
@@ -770,7 +733,7 @@ mod tests {
         assert_eq!(metrics.row_seconds, 5);
         assert_eq!(metrics.sample_interval, Duration::from_secs(1));
         assert_eq!(metrics.backend_unit, "genix.service");
-        assert_eq!(metrics.scylla_unit, "mariadb.service");
+        assert_eq!(metrics.database_unit, "mariadb.service");
         assert_eq!(metrics.retention_days, 30);
         assert!(metrics.network_interface.is_empty());
     }
@@ -874,28 +837,24 @@ mod tests {
         assert!(windows("[rate_limit]\nlong_window_minutes = 15").is_ok());
     }
 
-    /// `_short`/`_long` are the names; `_10s`/`_1h` still start an older deployment, and the new
-    /// name wins when both are there.
+    /// `_short`/`_long` are the only names: the `_10s`/`_1h` ones are not read at all.
     #[test]
-    fn window_limits_are_read_under_the_new_and_the_old_names() {
-        let new: Table = toml::from_str(
+    fn window_limits_are_read_under_their_short_and_long_names() {
+        let configured: Table = toml::from_str(
             "[rate_limit]\ncompany_cpu_short = 5\ncompany_cpu_long = 50\n\
              company_inference_short = 6\ncompany_inference_long = 60",
         )
         .unwrap();
-        let limits = load_scope_limits(&new, "COMPANY", "company").unwrap();
+        let limits = load_scope_limits(&configured, "COMPANY", "company").unwrap();
         assert_eq!((limits.cpu.short, limits.cpu.long), (5, 50));
         assert_eq!((limits.inference.short, limits.inference.long), (6, 60));
 
-        let old: Table = toml::from_str(
+        let old_names: Table = toml::from_str(
             "[rate_limit]\ncompany_cpu_10s = 5\ncompany_cpu_1h = 50\n\
-             company_inference_10s = 6\ncompany_inference_1h = 60\ncompany_cpu_short = 7",
+             company_inference_10s = 6\ncompany_inference_1h = 60",
         )
         .unwrap();
-        let limits = load_scope_limits(&old, "COMPANY", "company").unwrap();
-        assert_eq!((limits.cpu.short, limits.cpu.long), (7, 50));
-        assert_eq!(limits.inference.long, 60);
-
+        assert!(load_scope_limits(&old_names, "COMPANY", "company").is_err());
         assert!(load_scope_limits(&Table::new(), "COMPANY", "company").is_err());
     }
 

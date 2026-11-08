@@ -9,7 +9,6 @@
 //! bytes a value needs and omit a zero-valued field entirely.
 
 use crate::{
-    limiter::access::INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE,
     limiter::access::MAX_REQUIRED_ACCESS,
     limiter::budget::MUTATE_BUDGET_MAX_PAYLOAD_SIZE,
     limiter::protocol::CHARGE_MAX_PAYLOAD_SIZE,
@@ -205,9 +204,7 @@ impl Reply {
             | Self::ChargeAccessDenied(code)
             | Self::LockRefused(code)
             | Self::BudgetRefused(code) => frame.push(*code),
-            Self::LockGranted { generation } => {
-                frame.extend_from_slice(&generation.to_be_bytes())
-            }
+            Self::LockGranted { generation } => frame.extend_from_slice(&generation.to_be_bytes()),
             Self::Report(body) => {
                 frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 frame.extend_from_slice(body);
@@ -238,10 +235,7 @@ const LARGEST_PAYLOAD_SIZE: usize = larger(
         larger(CHARGE_MAX_PAYLOAD_SIZE, ACQUIRE_MAX_PAYLOAD_SIZE),
         larger(RELEASE_MAX_PAYLOAD_SIZE, MUTATE_BUDGET_MAX_PAYLOAD_SIZE),
     ),
-    larger(
-        INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE,
-        larger(QUERY_MAX_PAYLOAD_SIZE, GRANTS_MAX_PAYLOAD_SIZE),
-    ),
+    larger(QUERY_MAX_PAYLOAD_SIZE, GRANTS_MAX_PAYLOAD_SIZE),
 );
 pub const MAX_FRAME_SIZE: usize =
     OPCODE_SIZE + LENGTH_PREFIX_SIZE + LARGEST_PAYLOAD_SIZE + AUTH_TAG_SIZE;
@@ -253,9 +247,10 @@ pub enum Opcode {
     LockAcquire = 0x02,
     LockRelease = 0x03,
     // 0x04 was LogRequest: the backend writes its request log itself now, so the opcode is retired
-    // and stays unassigned like 0x07 and 0x08.
+    // and stays unassigned like 0x06, 0x07 and 0x08.
     MutateCompanyBudget = 0x05,
-    InvalidateUserAccess = 0x06,
+    // 0x06 was InvalidateUserAccess, retired: PutGrants drops the cached grants of the users it
+    // stores, so a save pushes instead of invalidating.
     // 0x07 and 0x08 were ReserveSequence and SetSequence, removed with the sequence service, and
     // stay unassigned so a stale client cannot reach a new operation with them.
     /// Reads usage, budgets or server metrics out of the store (`store::query`).
@@ -273,7 +268,6 @@ impl Opcode {
             0x02 => Some(Self::LockAcquire),
             0x03 => Some(Self::LockRelease),
             0x05 => Some(Self::MutateCompanyBudget),
-            0x06 => Some(Self::InvalidateUserAccess),
             0x09 => Some(Self::Report),
             0x0A => Some(Self::PutGrants),
             _ => None,
@@ -289,19 +283,9 @@ impl Opcode {
             Self::LockAcquire => ACQUIRE_MAX_PAYLOAD_SIZE,
             Self::LockRelease => RELEASE_MAX_PAYLOAD_SIZE,
             Self::MutateCompanyBudget => MUTATE_BUDGET_MAX_PAYLOAD_SIZE,
-            Self::InvalidateUserAccess => INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE,
             Self::Report => QUERY_MAX_PAYLOAD_SIZE,
             Self::PutGrants => GRANTS_MAX_PAYLOAD_SIZE,
         }
-    }
-
-    /// Whether the daemon answers this opcode at all.
-    ///
-    /// One operation has nothing to say back: an access invalidation is a best-effort promise, the
-    /// TTL bounds the damage if it is lost, so a user save must not wait on it. The client writes
-    /// the frame and moves on.
-    pub fn expects_reply(self) -> bool {
-        !matches!(self, Self::InvalidateUserAccess)
     }
 }
 
@@ -316,7 +300,6 @@ mod tests {
             Opcode::LockAcquire,
             Opcode::LockRelease,
             Opcode::MutateCompanyBudget,
-            Opcode::InvalidateUserAccess,
             Opcode::Report,
             Opcode::PutGrants,
         ] {
@@ -327,24 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn one_opcode_is_unanswered_and_the_rest_are_answered() {
-        // The retired opcodes stay unassigned: a stale client's frame closes the connection.
-        for retired in [0x00, 0x04, 0x07, 0x08] {
+    fn retired_opcodes_stay_unassigned() {
+        // A stale client's frame closes the connection instead of reaching a new operation.
+        for retired in [0x00, 0x04, 0x06, 0x07, 0x08] {
             assert_eq!(Opcode::from_byte(retired), None);
-        }
-
-        // Nothing is sent back for this one, so a client must not park a caller waiting.
-        assert_eq!(Opcode::from_byte(0x06), Some(Opcode::InvalidateUserAccess));
-        assert!(!Opcode::InvalidateUserAccess.expects_reply());
-        for opcode in [
-            Opcode::ChargeCredits,
-            Opcode::LockAcquire,
-            Opcode::LockRelease,
-            Opcode::MutateCompanyBudget,
-            Opcode::Report,
-            Opcode::PutGrants,
-        ] {
-            assert!(opcode.expects_reply());
         }
     }
 
@@ -359,7 +328,10 @@ mod tests {
         assert_eq!(Reply::Ack.encode(0), [0x07, 0x00, 0x00]);
         assert_eq!(Reply::ChargeAllowed.encode(1), [0x01, 0x00, 0x01]);
         assert_eq!(Reply::Unavailable.encode(7), [0x7F, 0x00, 0x07]);
-        assert_eq!(Reply::BudgetRefused(1).encode(300), [0x08, 0x01, 0x2C, 0x01]);
+        assert_eq!(
+            Reply::BudgetRefused(1).encode(300),
+            [0x08, 0x01, 0x2C, 0x01]
+        );
         // Only the low 16 bits travel, so a client correlates on the same truncation.
         assert_eq!(Reply::Ack.encode(0x1_0002), [0x07, 0x00, 0x02]);
     }
@@ -402,7 +374,11 @@ mod tests {
         let shape = ReplyShape::from_byte(frame[0]).expect("a shape it just wrote");
         assert!(shape.is_push());
         assert_eq!(shape.body_size(), None);
-        assert_eq!(u16::from_be_bytes([frame[1], frame[2]]), 0, "no correlation");
+        assert_eq!(
+            u16::from_be_bytes([frame[1], frame[2]]),
+            0,
+            "no correlation"
+        );
         assert_eq!(usize::from(frame[REPLY_HEAD_SIZE]), LOCK_LOST_BODY_SIZE);
         assert_eq!(frame.len(), REPLY_HEAD_SIZE + 1 + LOCK_LOST_BODY_SIZE);
     }
@@ -419,7 +395,9 @@ mod tests {
                 identifier: -7
             }
             .encode(0),
-            [0x80, 0x00, 0x00, 0x0A, 0x00, 0x09, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF9]
+            [
+                0x80, 0x00, 0x00, 0x0A, 0x00, 0x09, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF9
+            ]
         );
     }
 
@@ -442,7 +420,10 @@ mod tests {
             sub_bytes: vec![0x06, 0x81, 0x20],
         }
         .encode(7);
-        assert_eq!(frame, [0x02, 0x00, 0x07, 0b101, 0b100, 0x03, 0x06, 0x81, 0x20]);
+        assert_eq!(
+            frame,
+            [0x02, 0x00, 0x07, 0b101, 0b100, 0x03, 0x06, 0x81, 0x20]
+        );
         assert_eq!(ReplyShape::ChargeGranted.body_size(), None);
 
         // And one that holds no sub-accesses still says so.
@@ -487,7 +468,6 @@ mod tests {
             Opcode::LockAcquire,
             Opcode::LockRelease,
             Opcode::MutateCompanyBudget,
-            Opcode::InvalidateUserAccess,
             Opcode::Report,
         ] {
             let ceiling = opcode.max_payload_size();

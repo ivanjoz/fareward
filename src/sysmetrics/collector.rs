@@ -46,7 +46,7 @@ const SERVICE_UNIT_COUNT: usize = 3;
 pub struct ServiceUnits {
     pub backend: String,
     pub fareward: String,
-    pub scylla: String,
+    pub database: String,
 }
 
 /// Counters from the previous sub-sample. Rates are deltas, so the first sub-sample after startup
@@ -155,7 +155,7 @@ impl SystemMetricsCollector {
             network_tx_rate,
             backend: make_service(0),
             fareward: make_service(1),
-            scylla: make_service(2),
+            database: make_service(2),
         })
     }
 
@@ -163,7 +163,7 @@ impl SystemMetricsCollector {
         [
             &self.units.backend,
             &self.units.fareward,
-            &self.units.scylla,
+            &self.units.database,
         ]
     }
 
@@ -509,7 +509,7 @@ mod tests {
             ServiceUnits {
                 backend: "late.service".into(),
                 fareward: String::new(),
-                scylla: String::new(),
+                database: String::new(),
             },
             "/".into(),
             String::new(),
@@ -660,7 +660,7 @@ mod tests {
             ServiceUnits {
                 backend: "genix.service".into(),
                 fareward: "fareward.service".into(),
-                scylla: "scylla-server.service".into(),
+                database: "scylla-server.service".into(),
             },
             "/".into(),
             String::new(),
@@ -672,7 +672,7 @@ mod tests {
         let sample = collector
             .sample()
             .expect("the second sample must produce a row");
-        for service in [sample.backend, sample.fareward, sample.scylla] {
+        for service in [sample.backend, sample.fareward, sample.database] {
             assert_eq!(service.memory_mb, NOT_MEASURED);
             assert_eq!(service.cpu_percent, NOT_MEASURED);
         }

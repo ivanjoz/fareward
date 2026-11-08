@@ -1278,7 +1278,7 @@ impl RateLimiter {
 
     /// Loads a user's grants into the shard on a miss or past the TTL.
     ///
-    /// The ScyllaDB read happens while holding the shard mutex, which is head-of-line blocking for
+    /// The store read happens while holding the shard mutex, which is head-of-line blocking for
     /// other callers in the same shard. That is worth saying out loud, but it is exactly what
     /// `ensure_subject` already does for the daily and long-window usage rows: this adds a third awaited
     /// read to a path that already had two. `server.rs` spawns each charge onto its own task
@@ -1300,29 +1300,22 @@ impl RateLimiter {
             .load_user_access(company_id, user_id)
             .await
             .context("failed to load user access grants")?;
-        // A miss is cached like a hit, or a token naming a deleted user would re-read ScyllaDB on
+        // A miss is cached like a hit, or a token naming a deleted user would re-read the store on
         // every request it sends.
         let state = UserAccessState::from_row(row, unix_seconds)?;
         shard.access.insert((company_id, user_id), state);
         Ok(())
     }
 
-    /// Drops cached grants so the next request re-reads them. `user_id == 0` drops every user of the
-    /// company.
+    /// Drops one user's cached grants so the next request re-reads them.
     ///
-    /// This is what makes the TTL a backstop rather than the mechanism: the backend sends it after
-    /// rewriting `accesos_computed`, so a revoked access stops working immediately instead of at the
-    /// end of the window. Sharding is by company, so a wildcard touches exactly one shard.
-    pub async fn invalidate_access(&self, company_id: i32, user_id: i32) {
+    /// This is what makes the TTL a backstop rather than the mechanism: a grants push calls it for
+    /// every user it stores, so a revoked access stops working immediately instead of at the end of
+    /// the window.
+    async fn drop_cached_access(&self, company_id: i32, user_id: i32) {
         let shard_index = company_id as usize % self.shards.len();
         let mut shard = self.shards[shard_index].lock().await;
-        if user_id == 0 {
-            shard
-                .access
-                .retain(|(company, _), _| *company != company_id);
-        } else {
-            shard.access.remove(&(company_id, user_id));
-        }
+        shard.access.remove(&(company_id, user_id));
     }
 
     async fn ensure_subject(
@@ -1484,7 +1477,7 @@ impl RateLimiter {
             .collect();
         self.store.put_grants(entries).await?;
         for (company_id, user_id) in users {
-            self.invalidate_access(company_id, user_id).await;
+            self.drop_cached_access(company_id, user_id).await;
         }
         Ok(())
     }
@@ -3424,7 +3417,7 @@ mod tests {
     }
 
     /// A frame with empty slots must never reach the access map: that is the unmapped-GET,
-    /// self-service and user-1 path, and it has to stay free of a ScyllaDB read.
+    /// self-service and user-1 path, and it has to stay free of a store read.
     #[tokio::test]
     async fn a_frame_with_no_required_access_never_reads_the_user_row() {
         let store = Arc::new(MemoryStore::default());
@@ -3493,7 +3486,7 @@ mod tests {
 
     /// What makes the TTL a backstop rather than the mechanism.
     #[tokio::test]
-    async fn invalidation_forces_a_reread_for_one_user_or_a_whole_company() {
+    async fn dropping_cached_access_forces_a_reread_for_that_user_only() {
         let store = Arc::new(MemoryStore::default());
         store.put_user(7, 42, &[packed(3, 1)], 1);
         store.put_user(7, 43, &[packed(3, 1)], 1);
@@ -3514,11 +3507,11 @@ mod tests {
         }
         assert_eq!(store.user_reads.load(Ordering::Relaxed), 2);
 
-        // A profile edit raises user 42 to nivel 4 and tells the daemon about it. Without the
-        // invalidation this would stay denied for the rest of the TTL.
+        // A profile edit raises user 42 to nivel 4 and pushes it. Without dropping the cached
+        // grants this would stay denied for the rest of the TTL.
         store.put_user(7, 42, &[packed(3, 4)], 1);
         store.put_user(7, 43, &[packed(3, 4)], 1);
-        limiter.invalidate_access(7, 42).await;
+        limiter.drop_cached_access(7, 42).await;
         assert_eq!(
             limiter
                 .admit_at(request, 1_800_000_000, Instant::now())
@@ -3533,16 +3526,6 @@ mod tests {
                 .await
                 .unwrap(),
             Decision::AccessDenied(AccessDenial::NoAccess)
-        );
-
-        // The wildcard drops every user of the company.
-        limiter.invalidate_access(7, 0).await;
-        assert_eq!(
-            limiter
-                .admit_at(other_user, 1_800_000_000, Instant::now())
-                .await
-                .unwrap(),
-            allowed_slots(0b1)
         );
     }
 

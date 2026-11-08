@@ -282,14 +282,14 @@ pub fn decode_metrics(value: &[u8]) -> Result<MetricsSample> {
             memory_mb: reader.i16(),
             cpu_percent: reader.i16(),
         },
-        scylla: ServiceSample {
+        database: ServiceSample {
             memory_mb: reader.i16(),
             cpu_percent: reader.i16(),
         },
     })
 }
 
-/// The column order of a metrics value. `scylla` is the database unit's sample, whatever it is.
+/// The column order of a metrics value. `database` is the database unit's sample, whatever it is.
 fn metrics_fields(sample: &MetricsSample) -> [i16; 11] {
     [
         sample.cpu_percent,
@@ -301,8 +301,8 @@ fn metrics_fields(sample: &MetricsSample) -> [i16; 11] {
         sample.backend.cpu_percent,
         sample.fareward.memory_mb,
         sample.fareward.cpu_percent,
-        sample.scylla.memory_mb,
-        sample.scylla.cpu_percent,
+        sample.database.memory_mb,
+        sample.database.cpu_percent,
     ]
 }
 

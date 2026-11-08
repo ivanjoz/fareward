@@ -1,4 +1,4 @@
-//! One user's authorization grants, held in memory and answered without touching ScyllaDB.
+//! One user's authorization grants, held in memory and answered without touching the store.
 //!
 //! This is the half of the charge frame that is not about credits. The Go router used to answer it
 //! itself with a `SELECT accesos_computed FROM users` behind a five-minute in-process cache, which
@@ -12,8 +12,6 @@
 //! every policy rule around that — an unmapped GET being free, `POST.user-self` needing no access,
 //! user 1 bypassing the check entirely — stays in Go, where the catalogue is embedded.
 
-use colbin::Colbin;
-
 use crate::limiter::storage::StoredUserAccess;
 
 /// How many required grants one frame can carry. `access_list.yml` maps at most two accesses to any
@@ -21,32 +19,6 @@ use crate::limiter::storage::StoredUserAccess;
 /// fifth is refused Go-side at encode time, never here — a rejected frame is indistinguishable from
 /// the daemon being down and would surface as a 503 instead of as the bug it is.
 pub const MAX_REQUIRED_ACCESS: usize = 4;
-
-/// Ceiling on one invalidation payload: two `i32` at their widest, plus the root byte.
-pub const INVALIDATE_ACCESS_MAX_PAYLOAD_SIZE: usize = 16;
-
-/// Which cached grants to drop. `user_id == 0` is the wildcard, since user ids start at 1 — and the
-/// wildcard is therefore the frame that carries no user field at all, colbin omitting the zero.
-///
-/// Mirrors `accessInvalidationFrame` in fareward/go/access_invalidation.go.
-#[derive(Colbin, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AccessInvalidation {
-    #[cb(1)]
-    pub company_id: i32,
-    /// Zero means every cached user of the company.
-    #[cb(2)]
-    pub user_id: i32,
-}
-
-/// Decodes one invalidation. Only the company is required to be real: a wildcard is the point of
-/// user zero, and a stale entry for a user the backend has since deleted is still worth dropping.
-pub fn parse_access_invalidation(payload: &[u8]) -> anyhow::Result<AccessInvalidation> {
-    let invalidation = AccessInvalidation::decode(payload)?;
-    if invalidation.company_id <= 0 {
-        anyhow::bail!("company_id must be positive");
-    }
-    Ok(invalidation)
-}
 
 /// `users.status` value that means the user exists and may act. Anything else — 0 from a soft
 /// delete, or a value some future migration invents — is refused.
@@ -97,7 +69,7 @@ impl AccessVerdict {
 
 /// One user's cached authorization state.
 ///
-/// Both blobs are held **verbatim**, exactly as ScyllaDB returned them. The `Vec<u16>` this used to
+/// Both blobs are held **verbatim**, exactly as the store returned them. The `Vec<u16>` this used to
 /// decode into was an allocation and a sort per cache load that bought nothing: the Go ORM writes
 /// `[]byte` through a `reflect.Copy` fast path, so the bytes on both sides are already identical.
 ///
@@ -114,7 +86,7 @@ pub struct UserAccessState {
     sub_grants: Box<[u8]>,
     status: i8,
     /// Whether the row exists at all. A miss is cached like a hit, or a token naming a deleted user
-    /// would re-query ScyllaDB on every request it sends.
+    /// would re-query the store on every request it sends.
     found: bool,
     /// Unix seconds of the load. Reloaded once older than the configured TTL.
     loaded_at: i64,
@@ -402,7 +374,9 @@ mod tests {
         for acceso_id in [7, 8] {
             for nivel in 1..=4 {
                 assert!(
-                    state.verdict(&required(&[packed(acceso_id, nivel)])).is_ok(),
+                    state
+                        .verdict(&required(&[packed(acceso_id, nivel)]))
+                        .is_ok(),
                     "acceso {acceso_id} nivel {nivel} should be granted"
                 );
             }
@@ -581,37 +555,6 @@ mod tests {
         assert!(!state.is_fresh(1_601, 600));
         // Earlier than the load: something reset the clock, so treat the entry as unusable.
         assert!(!state.is_fresh(999, 600));
-    }
-
-    #[test]
-    fn an_invalidation_decodes_its_two_ids_and_its_wildcard() {
-        let invalidation = parse_access_invalidation(
-            &AccessInvalidation {
-                company_id: 7,
-                user_id: 300,
-            }
-            .encode(),
-        )
-        .unwrap();
-        assert_eq!(invalidation.company_id, 7);
-        assert_eq!(invalidation.user_id, 300);
-
-        // User zero is the wildcard, not an error: user ids start at 1. It is also the frame that
-        // carries no user field at all, since colbin does not write a zero — so the wildcard is
-        // the cheapest invalidation as well as the broadest.
-        let wildcard = AccessInvalidation {
-            company_id: 7,
-            user_id: 0,
-        }
-        .encode();
-        assert_eq!(parse_access_invalidation(&wildcard).unwrap().user_id, 0);
-        assert!(wildcard.len() < invalidation.encode().len());
-
-        // A frame naming no company at all is refused: there is nothing it could invalidate.
-        assert!(parse_access_invalidation(&AccessInvalidation::default().encode()).is_err());
-        // And a message cut short is refused rather than read as offsets.
-        let encoded = invalidation.encode();
-        assert!(parse_access_invalidation(&encoded[..encoded.len() - 1]).is_err());
     }
 
     #[test]

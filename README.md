@@ -147,7 +147,6 @@ if err := fareward.ConfigureFareward(addr, secret); err != nil { return err }
 err := fareward.ChargeAPIUsage(ctx, companyID, userID, routeID, method, payloadBytes, required)
 lock, err := fareward.AcquireLock(ctx, action, identifier, maxWaiters)
 err := fareward.PutUserGrants(ctx, users)
-err := fareward.InvalidateUserAccess(ctx, companyID, userID)
 err := fareward.MutateCompanyCreditBudget(ctx, companyID, op, amount)
 ```
 
@@ -196,8 +195,8 @@ src/
 ├── siphash.rs   # SipHash-2-4: the keyed tag on both internal schemes (not the token)
 ├── service/     # the raw-TCP port: server (listener, handshake, opcode dispatch),
 │                # protocol (opcode table), auth (frame tag)
-├── limiter/     # opcodes 0x01/0x05/0x06: charging, authorization, company-budget
-│                # mutation and grant-cache invalidation,
+├── limiter/     # opcodes 0x01/0x05: charging, authorization and company-budget
+│                # mutation,
 │                # quota, protocol, aggregation, credits_blob, time_frame, storage
 ├── lock/        # opcodes 0x02/0x03: registry.rs (sharded key mutexes), protocol
 ├── routes/      # the route table the backend generates: table (parse, lookup, tariff,
@@ -372,7 +371,7 @@ shards                = 0 # 0 uses the logical CPU count
 # Requests one connection may have in flight at once. Multiplexing removed the backpressure that
 # one-request-per-socket used to give for free, so it has to be stated.
 max_inflight_per_connection = 64
-access_cache_seconds  = 600 # TTL of the cached user grants; INVALIDATE_USER_ACCESS is the fast path
+access_cache_seconds  = 600 # TTL of the cached user grants; a PUT_GRANTS push drops them at once
 
 # Two rate-limit windows, always two. Optional; absent means 10 seconds and 60 minutes.
 # The short window is a token bucket: its credits refill continuously over this many seconds.
@@ -381,7 +380,7 @@ short_window_seconds  = 10
 # a restart rebuilds it from the five-minute usage rows; at most 1440 and longer than the short one.
 long_window_minutes   = 10
 
-# Credits per window. The old names (_10s, _1h) are still read, with a warning in the log.
+# Credits per window. Required.
 company_cpu_short       = 2000
 company_inference_short = 1000
 company_cpu_long        = 40000
@@ -570,31 +569,20 @@ shape, with ids 1..16 so both sides use four-bit keys. `PROTOCOL_SHAPES.md` is t
 | `0x02` | `LOCK_ACQUIRE` | colbin | action `u16` · identifier `i64` · max_waiters `u8` · wait_ms `u32` · lease_ms `u32` | 40 |
 | `0x03` | `LOCK_RELEASE` | colbin | action `u16` · identifier `i64` · generation `u16` | 24 |
 | `0x05` | `MUTATE_COMPANY_BUDGET` | colbin | company `i32` · operation `u8` · CPU `u64` · inference `u64` | 32 |
-| `0x06` | `INVALIDATE_USER_ACCESS` | colbin | company `i32` · user `i32` (`0` = every user of the company) | 16 |
 | `0x09` | `REPORT` | colbin | kind `u8` · company `i32` · user `i32` · first `i64` · last `i64` | 48 |
 | `0x0A` | `PUT_GRANTS` | hand-rolled | count `u16`, then per user: company `i32` · user `i32` · flags `u8` · status `i8` · grants `u16`-prefixed · sub-grants `u16`-prefixed | 8 192 |
 
 A colbin field holding its zero value is not written at all, so a payload is as small as the record
-is sparse: an ungated charge is 10 bytes against the 20 the old fixed layout always spent, and the
-wildcard invalidation is 3.
+is sparse: an ungated charge is 10 bytes against the 20 the old fixed layout always spent.
 
-`0x00` stays unassigned so an all-zero frame cannot route. `0x04` (the retired request log) and
-`0x07`/`0x08` (the retired sequence opcodes) stay unassigned too, so a stale client's frame closes
-the connection. New *use cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
+`0x00` stays unassigned so an all-zero frame cannot route. `0x04` (the retired request log), `0x06`
+(the retired grant-cache invalidation, replaced by `PUT_GRANTS`) and `0x07`/`0x08` (the retired
+sequence opcodes) stay unassigned too, so a stale client's frame closes the connection. New *use cases* for the lock cost none of them, since they are namespaced by the `u16` action instead.
 
-A malformed payload closes the connection, whatever the opcode. Whether it is answered varies, on
-purpose:
-
-| Op | Answered |
-|---|---|
-| `0x01` `0x02` `0x03` `0x05` `0x09` `0x0A` | yes |
-| `0x06` `INVALIDATE_USER_ACCESS` | **never** |
+A malformed payload closes the connection, whatever the opcode. Every opcode is answered.
 
 Every opcode is length-prefixed. There used to be a second, fixed-width framing for the payloads
 whose width the opcode alone implied; nothing is left that a fixed width could describe, so one
 reader path replaced two. The length is inside the signed bytes, and one declaring more than its
 opcode's ceiling closes the connection before a byte of payload is buffered.
-
-`0x06` is not answered — the grant cache's TTL already bounds a lost invalidation, so a user save
-must not wait on it — but it still advances the sequence, which is what the tag is bound to.
 

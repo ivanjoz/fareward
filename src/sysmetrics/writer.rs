@@ -59,7 +59,7 @@ impl ServerMetricsWriter {
                 ServiceUnits {
                     backend: config.backend_unit.clone(),
                     fareward: config.fareward_unit.clone(),
-                    scylla: config.scylla_unit.clone(),
+                    database: config.database_unit.clone(),
                 },
                 config.disk_mount.clone(),
                 config.network_interface.clone(),

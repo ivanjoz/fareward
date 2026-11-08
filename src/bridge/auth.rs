@@ -2,7 +2,7 @@
 //!
 //!   - The **browser** presents the session token the backend already issued
 //!     (`Authorization: Bearer <token>`). It is self-contained (colbin payload + tag), so
-//!     identity is verified without touching ScyllaDB. Keyed by `secret_phrase`, because
+//!     identity is verified without touching the store. Keyed by `secret_phrase`, because
 //!     that is what signed it.
 //!   - The **backend** presents a timestamped signature (`X-Bridge-Auth`). Keyed by
 //!     `internal_apikey`, the project's service-to-service secret.
@@ -173,17 +173,17 @@ mod tests {
     #[test]
     fn matches_the_official_blake2s_128_keyed_vectors() {
         const OFFICIAL_VECTORS: [(usize, &str); 11] = [
-        (0, "9536f9b267655743dee97b8a670f9f53"),
-        (1, "13bacfb85b48a1223c595f8c1e7e82cb"),
-        (2, "d47a9b1645e2feae501cd5fe44ce6333"),
-        (31, "d114cc11e7d5b33a360c45f18d4c7c6e"),
-        (32, "c43b5e836af88620a8a71b1652cb8640"),
-        (33, "9491c653e8867ed73c1b4ac6b5a9bb4d"),
-        (63, "ece382a8bd5018f1de5da44b72cea75b"),
-        (64, "f1efa90d2547036841ecd3627fafbc36"),
-        (65, "811ff8686d23a435ecbd0bdafcd27b1b"),
-        (127, "25887fab1422700d7fa3edc0b20206e2"),
-        (128, "8c09f698d03eaf88abf69f8147865ef6"),
+            (0, "9536f9b267655743dee97b8a670f9f53"),
+            (1, "13bacfb85b48a1223c595f8c1e7e82cb"),
+            (2, "d47a9b1645e2feae501cd5fe44ce6333"),
+            (31, "d114cc11e7d5b33a360c45f18d4c7c6e"),
+            (32, "c43b5e836af88620a8a71b1652cb8640"),
+            (33, "9491c653e8867ed73c1b4ac6b5a9bb4d"),
+            (63, "ece382a8bd5018f1de5da44b72cea75b"),
+            (64, "f1efa90d2547036841ecd3627fafbc36"),
+            (65, "811ff8686d23a435ecbd0bdafcd27b1b"),
+            (127, "25887fab1422700d7fa3edc0b20206e2"),
+            (128, "8c09f698d03eaf88abf69f8147865ef6"),
         ];
 
         let key: [u8; 32] = core::array::from_fn(|index| index as u8);

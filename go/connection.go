@@ -57,14 +57,8 @@ const (
 	opcodeLockRelease   = byte(0x03)
 	// 0x04 was the request log, retired: the backend writes its request log itself.
 	opcodeMutateCompanyBudget = byte(0x05)
-	// opcodeInvalidateUserAccess is the only unanswered opcode: the TTL on the daemon's grant
-	// cache is the backstop if it is lost, so a user save does not wait for an acknowledgement.
-	opcodeInvalidateUserAccess = byte(0x06)
-	// The two sequence opcodes are the only request payloads that are not colbin messages. They are
-	// a scalar and a counter name, and PROTOCOL_SHAPES.md §4.3 is why they stay hand-rolled: the
-	// reserve path is the ORM's insert path, and the shape has no room to grow.
-	opcodeReserveSequence = byte(0x07)
-	opcodeSetSequence     = byte(0x08)
+	// 0x06 was the grant-cache invalidation, retired: a grants push drops the cached grants itself.
+	// 0x07 and 0x08 were the sequence service, retired: MariaDB owns sequences.
 	// opcodeReport reads usage, budgets and server metrics out of the daemon's store (reports.go).
 	opcodeReport = byte(0x09)
 
@@ -102,12 +96,11 @@ const (
 	replyLockRefused           = byte(0x06)
 	replyAck                   = byte(0x07)
 	replyBudgetRefused         = byte(0x08)
-	replySequenceValue         = byte(0x09)
-	replySequenceInvalid       = byte(0x0A)
+	// 0x09 and 0x0A were the sequence service's replies, retired with it.
 	// replyReport is the one reply that may be large: [length:u32][body].
 	replyReport = byte(0x0B)
 	// replyUnavailable is "I could not answer". Every operation applies its own policy to it:
-	// credits fail closed, a sequence fails the write, lock call sites decide individually.
+	// credits fail closed, lock call sites decide individually.
 	replyUnavailable = byte(0x7F)
 	// replyLockLost and anything above it is a push: a frame the daemon sends without being asked,
 	// which carries no correlation and is routed on its shape alone. Every push is [len:u8][body],
@@ -121,14 +114,12 @@ const (
 // Mirrors ReplyShape::body_size; a disagreement here desynchronizes every reply after the first.
 func replyBodySize(shape byte) (int, bool) {
 	switch shape {
-	case replyChargeAllowed, replyAck, replySequenceInvalid, replyUnavailable:
+	case replyChargeAllowed, replyAck, replyUnavailable:
 		return 0, true
 	case replyChargeCreditViolation, replyChargeAccessDenied, replyLockRefused, replyBudgetRefused:
 		return 1, true
 	case replyLockGranted:
 		return 2, true
-	case replySequenceValue:
-		return sequenceReplyExtraSize, true
 	case replyChargeGranted:
 		// Two masks, a sub-byte count, and that many sub bytes.
 		return -1, true
@@ -186,10 +177,6 @@ type muxConnection struct {
 	// "unavailable" instead of queuing it, so the queue lives here: a caller past the cap waits for
 	// a slot, under its own deadline, rather than failing.
 	inflightSlots chan struct{}
-	// sequenceSlots is the same queue for sequence reservations and assignments, which the daemon
-	// caps on a ceiling of their own: a block miss waits on ScyllaDB, and slow reservations must not
-	// hold the slots charges and locks wait on.
-	sequenceSlots chan struct{}
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -312,61 +299,6 @@ func (client *FarewardClient) requestOnce(
 	return reply, nil
 }
 
-// send writes one frame the daemon will not answer, and returns as soon as the bytes are in the
-// socket.
-//
-// No pending entry is registered, which is the point: the reader would otherwise log every
-// unmatched reply, and a caller would be parked waiting for one that never comes. The frame
-// sequence still advances under writeMu in lockstep with the daemon's, because that is what the
-// tag is bound to — a fire-and-forget frame that skipped the sequence would invalidate every
-// frame after it on this connection.
-//
-// One retry, for the same reason a request gets one: a pooled connection the daemon closed while
-// idle is indistinguishable from a live one until the write fails.
-func (client *FarewardClient) send(ctx context.Context, opcode byte, payload []byte) error {
-	var lastError error
-	for attempt := range 2 {
-		connection, reused, err := client.connection(ctx)
-		if err != nil {
-			return fmt.Errorf("%w: connect: %v", ErrFarewardUnavailable, err)
-		}
-		if err := connection.write(client.secret, opcode, payload); err == nil {
-			return nil
-		} else {
-			lastError = err
-		}
-		if reused && attempt == 0 {
-			continue
-		}
-		break
-	}
-	return fmt.Errorf("%w: %v", ErrFarewardUnavailable, lastError)
-}
-
-// write builds and writes one length-prefixed frame under the sequence lock.
-func (connection *muxConnection) write(secret []byte, opcode byte, payload []byte) error {
-	connection.writeMu.Lock()
-	if connection.sequence == ^uint64(0) {
-		connection.writeMu.Unlock()
-		connection.fail(errors.New("frame sequence exhausted"))
-		return errors.New("frame sequence exhausted")
-	}
-	sequence := connection.sequence
-	connection.sequence++
-
-	frame := buildFarewardFrame(secret, &connection.nonce, sequence, opcode, payload)
-	writeErr := connection.conn.SetWriteDeadline(time.Now().Add(farewardWriteTimeout))
-	if writeErr == nil {
-		writeErr = writeCompleteFrame(connection.conn, frame)
-	}
-	connection.writeMu.Unlock()
-
-	if writeErr != nil {
-		connection.fail(writeErr)
-	}
-	return writeErr
-}
-
 // connection returns the shared connection, dialing one if none is healthy, and reports whether
 // it was already open.
 func (client *FarewardClient) connection(ctx context.Context) (*muxConnection, bool, error) {
@@ -406,7 +338,6 @@ func (client *FarewardClient) dial(ctx context.Context) (*muxConnection, error) 
 		pending:       map[uint16]*pendingRequest{},
 		held:          map[heldKey]*Lock{},
 		inflightSlots: make(chan struct{}, currentMaxInflightPerConnection()),
-		sequenceSlots: make(chan struct{}, currentMaxInflightPerConnection()),
 		closed:        make(chan struct{}),
 	}
 	if err := socket.SetReadDeadline(time.Now().Add(farewardDialTimeout)); err != nil {
@@ -441,9 +372,6 @@ func (connection *muxConnection) exchange(
 	// The wait for a slot counts against the same deadline as the reply: a caller does not get
 	// its full wait twice.
 	slots := connection.inflightSlots
-	if opcode == opcodeReserveSequence || opcode == opcodeSetSequence {
-		slots = connection.sequenceSlots
-	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
@@ -709,10 +637,8 @@ func (connection *muxConnection) isClosed() bool {
 // buildFarewardFrame lays out one frame: the opcode, the payload's length, the payload, and the
 // tag over all three.
 //
-// Every opcode is length-prefixed. There used to be a second, fixed-width form for the operations
-// whose payload the opcode alone described, but no such operation is left: six of the eight are
-// colbin messages that write only the bytes a value needs, and the other two carry a counter name.
-// The tag covers the length header too, so a peer cannot make the daemon buffer a different amount
+// Every opcode is length-prefixed; most payloads are colbin messages that write only the bytes a
+// value needs. The tag covers the length header too, so a peer cannot make the daemon buffer a different amount
 // than the one that was signed.
 //
 // Mirrors the frame reader in fareward/src/service/protocol.rs.

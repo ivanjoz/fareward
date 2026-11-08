@@ -15,8 +15,8 @@ import (
 // credit limiter.
 //
 // The problem it solves: concurrent Lambdas serving the same tenant read the same state, all
-// conclude the same thing, and all write. Scylla has no transaction to stop them and the ORM has
-// no LWT. A lock orders them so each one re-reads what the previous one wrote.
+// conclude the same thing, and all write. The ORM's writes do not run inside a transaction that
+// would stop them, so a lock orders them and each one re-reads what the previous one wrote.
 //
 // The daemon ties a lock to the connection it was granted on, so a dead socket frees it at once
 // — a killed Lambda blocks nobody. The lease we send is the daemon's own deadline on us, its

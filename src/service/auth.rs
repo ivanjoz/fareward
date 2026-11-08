@@ -118,8 +118,8 @@ mod tests {
         // moved with it.
         //
         // These are the exact bytes the Go client puts on the wire — the same frames its
-        // TestChargeFrameMatchesTheRustAuthVector, TestAccessInvalidationFrameMatchesTheRustAuthVector
-        // and TestAcquireAndReleaseFramesMatchTheRustVectors assert from the other end. Each is
+        // TestChargeFrameMatchesTheRustAuthVector and TestAcquireAndReleaseFramesMatchTheRustVectors
+        // assert from the other end. Each is
         // signed by one implementation and verified by the other, which is the only way a framing
         // disagreement surfaces as a failing test rather than as a connection that dies on its
         // first frame in production.
@@ -151,27 +151,19 @@ mod tests {
             compute_hash(secret, &nonce, 0, &acquire),
             [0x0D, 0xFE, 0xE3, 0x58, 0xC3, 0x6E, 0xE9, 0xA4]
         );
-
-        // Opcode 0x06 for company 7 / user 300: the invalidation is signed like everything else.
-        let invalidate = [0x06, 0x00, 0x05, 0x04, 0x07, 0x15, 0x2C, 0x01];
-        assert_eq!(
-            compute_hash(secret, &nonce, 0, &invalidate),
-            [0x06, 0xA5, 0x35, 0x7E, 0x78, 0xF3, 0x8C, 0x72]
-        );
     }
 
     /// The frames above are not just signed by the daemon — they are what its own decoders read.
     /// Signing bytes nobody parses would pin the tag and miss the payload entirely.
     #[test]
     fn the_go_client_vectors_are_frames_this_daemon_can_parse() {
-        use crate::limiter::access::parse_access_invalidation;
         use crate::limiter::protocol::parse_charge;
         use crate::lock::protocol::parse_acquire;
 
         // Payload only: past the opcode and the two-byte length, and these carry no tag.
         let charge = parse_charge(&[
-            0x06, 0x56, 0x34, 0x12, 0x14, 0x2A, 0x24, 0x67, 0x35, 0x2C, 0x01, 0x44, 0x19,
-            0x65, 0x39, 0x01, 0x74, 0x8B,
+            0x06, 0x56, 0x34, 0x12, 0x14, 0x2A, 0x24, 0x67, 0x35, 0x2C, 0x01, 0x44, 0x19, 0x65,
+            0x39, 0x01, 0x74, 0x8B,
         ])
         .expect("the Go client's charge payload must parse");
         assert_eq!(charge.company_id, 0x12_34_56);
@@ -184,16 +176,11 @@ mod tests {
         let acquire = parse_acquire(&[
             0x04, 0x07, 0x1C, 0x01, 0x2A, 0x22, 0x35, 0x88, 0x13, 0x45, 0x98, 0x3A,
         ])
-            .expect("the Go client's acquire payload must parse");
+        .expect("the Go client's acquire payload must parse");
         assert_eq!(acquire.action, 7);
         assert_eq!(acquire.identifier, -42);
         assert_eq!(acquire.max_waiters, 3);
         assert_eq!(acquire.wait_ms, 5_000);
         assert_eq!(acquire.lease_ms, 15_000);
-
-        let invalidate = parse_access_invalidation(&[0x04, 0x07, 0x15, 0x2C, 0x01])
-            .expect("the Go client's invalidation payload must parse");
-        assert_eq!(invalidate.company_id, 7);
-        assert_eq!(invalidate.user_id, 300);
     }
 }

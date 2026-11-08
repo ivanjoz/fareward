@@ -59,7 +59,7 @@ pub struct MetricsSample {
     pub network_tx_rate: i16,
     pub backend: ServiceSample,
     pub fareward: ServiceSample,
-    pub scylla: ServiceSample,
+    pub database: ServiceSample,
 }
 
 impl Default for MetricsSample {
@@ -72,7 +72,7 @@ impl Default for MetricsSample {
             network_tx_rate: NOT_MEASURED,
             backend: ServiceSample::default(),
             fareward: ServiceSample::default(),
-            scylla: ServiceSample::default(),
+            database: ServiceSample::default(),
         }
     }
 }
@@ -118,7 +118,7 @@ impl WindowPeaks {
             network_tx_rate: peak(current.network_tx_rate, sample.network_tx_rate),
             backend: peak_service(current.backend, sample.backend),
             fareward: peak_service(current.fareward, sample.fareward),
-            scylla: peak_service(current.scylla, sample.scylla),
+            database: peak_service(current.database, sample.database),
         };
         self.absorbed += 1;
     }
@@ -210,7 +210,7 @@ mod tests {
         let mut window = WindowPeaks::default();
         window.absorb(MetricsSample::default());
         window.absorb(MetricsSample {
-            scylla: ServiceSample {
+            database: ServiceSample {
                 memory_mb: 128,
                 cpu_percent: 0,
             },
@@ -221,8 +221,8 @@ mod tests {
         let row = window.take();
         assert_eq!(row.backend.memory_mb, NOT_MEASURED);
         assert_eq!(row.backend.cpu_percent, NOT_MEASURED);
-        assert_eq!(row.scylla.memory_mb, 128);
-        assert_eq!(row.scylla.cpu_percent, 0);
+        assert_eq!(row.database.memory_mb, 128);
+        assert_eq!(row.database.cpu_percent, 0);
     }
 
     /// Taking the peaks must also reset them, or the next window inherits this one's spike and the

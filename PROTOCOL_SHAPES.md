@@ -17,6 +17,13 @@ colbin payload is a byte shorter. The v0.8 decoder still reads the old rooted me
 on v0.8 accepts both a v0.6.2 and a v0.8 client: **deploy the daemon first**, then the backend. A
 v0.6.2 daemon refuses a v0.8 client (it closes the connection on the first frame).
 
+**2026-11-08: retired opcodes.** This document is the record of the 2026-09 study and still
+describes three request opcodes that no longer exist: `0x04` LogRequest (the backend writes its own
+request log), `0x06` InvalidateUserAccess (a `0x0A` PutGrants push drops the cached grants itself)
+and `0x07`/`0x08` ReserveSequence/SetSequence (MariaDB owns sequences), along with the
+`SequenceValue`/`SequenceInvalid` replies. All of them stay unassigned. The current opcode table is
+the README's.
+
 Two consequences of Phase 3 that were not in the plan and are worth knowing before reading further:
 **every opcode is length-prefixed now** — the fixed-width framing had nothing left to describe and
 was deleted on both sides — and **the 65.5 s lease ceiling in §2.7 is gone** rather than raised.

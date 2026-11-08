@@ -94,7 +94,8 @@ impl SipHasher24 {
 
         let mut chunks = remaining.chunks_exact(8);
         for chunk in &mut chunks {
-            let word = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
+            let word =
+                u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
             self.compress(word);
         }
 
@@ -258,6 +259,9 @@ mod tests {
         // Raw 16-byte truncation would make these two secrets identical.
         let first = derive_key(b"0123456789abcdef-first");
         let second = derive_key(b"0123456789abcdef-second");
-        assert_ne!(siphash_of(&first, b"message"), siphash_of(&second, b"message"));
+        assert_ne!(
+            siphash_of(&first, b"message"),
+            siphash_of(&second, b"message")
+        );
     }
 }

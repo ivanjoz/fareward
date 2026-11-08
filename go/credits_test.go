@@ -336,32 +336,6 @@ func TestChargeFrameMatchesTheRustAuthVector(t *testing.T) {
 	}
 }
 
-// The invalidation frame, pinned against the same Rust vector set.
-func TestAccessInvalidationFrameMatchesTheRustAuthVector(t *testing.T) {
-	payload, err := encodeAccessInvalidation(7, 300)
-	if err != nil {
-		t.Fatalf("encodeAccessInvalidation refused a valid target: %v", err)
-	}
-	nonce := [farewardNonceSize]byte{1, 2, 3, 4, 5, 6, 7, 8}
-	frame := buildFarewardFrame([]byte("test-secret"), &nonce, 0, opcodeInvalidateUserAccess, payload)
-	want := []byte{
-		0x06, 0x00, 0x05,
-		0x04, 0x07, 0x15, 0x2C, 0x01,
-		0x06, 0xA5, 0x35, 0x7E, 0x78, 0xF3, 0x8C, 0x72,
-	}
-	if !bytes.Equal(frame, want) {
-		t.Fatalf("invalidation frame = % X; want % X", frame, want)
-	}
-
-	// Zero is the wildcard and must encode; a company of zero has no meaning and must not.
-	if _, err := encodeAccessInvalidation(7, InvalidateAllCompanyUsers); err != nil {
-		t.Fatalf("the company wildcard was refused: %v", err)
-	}
-	if _, err := encodeAccessInvalidation(0, 1); err == nil {
-		t.Fatal("company zero was accepted")
-	}
-}
-
 // The regression this replaces: the operator's credits used to be zeroed here before the frame was
 // built, so the daemon never saw a charge, never wrote a credit_usage row, and every number on the
 // operator's own usage report sat at zero with nothing to explain it. The frame must carry the real

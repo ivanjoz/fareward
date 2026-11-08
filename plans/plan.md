@@ -591,8 +591,8 @@ company_cpu_long  = 40000   # credits per long window
 - **Names by role, not length:** `_short`/`_long` for the limits, `rejected_short`/`rejected_long`
   for the counters, `Window::Short`/`Window::Long` in the code, `Short`/`Long` in the Go client's
   `Rejections`, and "short window"/"long window" in its `CreditLimitExceeded`. The old limit names
-  (`company_cpu_10s`, `_1h`, and their `RATE_LIMIT_*_10S`/`_1H` variables) are still read with a
-  warning, and the new name wins when both are set. The counters' byte layout is unchanged.
+  (`company_cpu_10s`, `_1h`, and their `RATE_LIMIT_*_10S`/`_1H` variables) are not read: a config
+  that only has them fails to start for a missing setting. The counters' byte layout is unchanged.
 - **The 429 page words the window from its length:** "en los últimos 10 segundos", "en los últimos
   10 minutos", "en la última hora" (`Windows::describe`).
 

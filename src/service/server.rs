@@ -30,22 +30,20 @@ use tracing::{debug, info, warn};
 
 use crate::{
     limiter::{
-        access::{AccessVerdict, parse_access_invalidation},
+        access::AccessVerdict,
         budget::{BudgetMutationReply, parse_budget_mutation},
         protocol::parse_charge,
         quota::{Decision, RateLimiter},
     },
-    store::{grants::parse_grants, query::parse_report_query},
     lock::{
         protocol::{LockReply, parse_acquire, parse_release},
         registry::{LockGuard, LockOutcome, LockRegistry},
     },
     service::{
         auth,
-        protocol::{
-            AUTH_TAG_SIZE, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE, OPCODE_SIZE, Opcode, Reply,
-        },
+        protocol::{AUTH_TAG_SIZE, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE, OPCODE_SIZE, Opcode, Reply},
     },
+    store::{grants::parse_grants, query::parse_report_query},
 };
 
 type LockKey = (u16, i64);
@@ -89,9 +87,8 @@ pub fn bind_unix_socket(socket_path: &Path) -> Result<UnixListener> {
                 socket_path.display()
             ));
         }
-        fs::remove_file(socket_path).with_context(|| {
-            format!("failed to remove stale socket {}", socket_path.display())
-        })?;
+        fs::remove_file(socket_path)
+            .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
     }
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
@@ -173,18 +170,22 @@ pub async fn run(
         let connection_shutdown = shutdown.clone();
         // Split here rather than inside handle_connection: `into_split` gives lock-free owned
         // halves for both stream types, which `tokio::io::split` on a generic stream would not.
-        let (reader, writer): (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) =
-            match socket {
-                AcceptedSocket::Tcp(stream) => {
-                    stream.set_nodelay(true).context("failed to set TCP_NODELAY")?;
-                    let (reader, writer) = stream.into_split();
-                    (Box::new(reader), Box::new(writer))
-                }
-                AcceptedSocket::Unix(stream) => {
-                    let (reader, writer) = stream.into_split();
-                    (Box::new(reader), Box::new(writer))
-                }
-            };
+        let (reader, writer): (
+            Box<dyn AsyncRead + Send + Unpin>,
+            Box<dyn AsyncWrite + Send + Unpin>,
+        ) = match socket {
+            AcceptedSocket::Tcp(stream) => {
+                stream
+                    .set_nodelay(true)
+                    .context("failed to set TCP_NODELAY")?;
+                let (reader, writer) = stream.into_split();
+                (Box::new(reader), Box::new(writer))
+            }
+            AcceptedSocket::Unix(stream) => {
+                let (reader, writer) = stream.into_split();
+                (Box::new(reader), Box::new(writer))
+            }
+        };
         connections.spawn(async move {
             let _slot = slot;
             if let Err(connection_error) = handle_connection(
@@ -331,7 +332,8 @@ async fn handle_connection(
         {
             break Err(error);
         }
-        let payload_size = u16::from_be_bytes([frame[OPCODE_SIZE], frame[OPCODE_SIZE + 1]]) as usize;
+        let payload_size =
+            u16::from_be_bytes([frame[OPCODE_SIZE], frame[OPCODE_SIZE + 1]]) as usize;
         let maximum = opcode.max_payload_size();
         if payload_size > maximum {
             break Err(anyhow!(
@@ -359,7 +361,13 @@ async fn handle_connection(
         received_tag.copy_from_slice(&frame[tag_offset..frame_size]);
         // The opcode is inside the signed bytes, so a frame cannot be replayed as another
         // operation, and the sequence keeps it from being replayed as itself.
-        if !auth::verify_hash(secret, &nonce, sequence, &frame[..tag_offset], &received_tag) {
+        if !auth::verify_hash(
+            secret,
+            &nonce,
+            sequence,
+            &frame[..tag_offset],
+            &received_tag,
+        ) {
             warn!(%peer, sequence, opcode = frame[0], "frame authentication failed");
             break Ok(());
         }
@@ -579,33 +587,6 @@ async fn handle_connection(
                     }
                 };
                 send_reply(&reply_sender, frame_sequence, reply).await;
-            }
-            Opcode::InvalidateUserAccess => {
-                let payload = &frame[payload_offset..tag_offset];
-                let invalidation = match parse_access_invalidation(payload) {
-                    Ok(invalidation) => invalidation,
-                    Err(error) => break Err(error).context("authenticated frame is invalid"),
-                };
-                // Takes a permit: this awaits the shard mutex, which the charge path holds across
-                // store reads, so it can genuinely wait. At the ceiling
-                // the frame is dropped — there is nobody to answer, and the TTL is precisely the
-                // backstop for an invalidation that did not land.
-                let Some(permit) = permit else {
-                    warn!(%peer, "in-flight ceiling reached, dropping an access invalidation");
-                    continue;
-                };
-                let limiter = limiter.clone();
-                handlers.spawn(async move {
-                    let _permit = permit;
-                    limiter
-                        .invalidate_access(invalidation.company_id, invalidation.user_id)
-                        .await;
-                    debug!(
-                        company_id = invalidation.company_id,
-                        user_id = invalidation.user_id,
-                        "dropped cached user access grants"
-                    );
-                });
             }
         }
     };

@@ -6,10 +6,10 @@
 //! on the Lima business day the usage rows are bucketed by — atomically, in memory.
 //!
 //! Accepted charges are aggregated per API group into five-minute and daily records and
-//! flushed to ScyllaDB as absolute snapshots every 15 seconds — company totals to
-//! `credit_usage_company`, per-user totals to `credit_usage_user` — and only the rows
+//! flushed to the store as absolute snapshots every 15 seconds — company totals to
+//! `usage_company`, per-user totals to `usage_user` — and only the rows
 //! that actually changed. The same flush publishes each charged company's daily and
-//! month-to-date counters into `company_credit_budget`, next to the entitlement they are
+//! month-to-date counters into `budget`, next to the entitlement they are
 //! compared against, so a reader gets the figures admission was decided on instead of
 //! re-summing the usage rows. It fails closed: usage that cannot be loaded blocks admission.
 //!

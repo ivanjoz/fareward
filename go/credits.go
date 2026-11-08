@@ -573,21 +573,9 @@ func decodeCreditLimitResponse(code uint8) error {
 	}
 }
 
-func writeUint24(target []byte, value uint32) {
-	target[0], target[1], target[2] = byte(value>>16), byte(value>>8), byte(value)
-}
-
 func ceilDivide(value, divisor uint64) uint64 {
 	if value == 0 {
 		return 0
 	}
 	return 1 + (value-1)/divisor
-}
-
-func connectionDeadline(ctx context.Context) time.Time {
-	deadline := time.Now().Add(3 * time.Second)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		return contextDeadline
-	}
-	return deadline
 }
