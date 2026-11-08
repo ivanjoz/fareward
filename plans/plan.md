@@ -92,10 +92,11 @@ Shape of the file:
 ```toml
 version = "<hash of the sources>"   # exported as a metric; the parity test checks it
 
-# The size steps are global per method, not per route.
+# The size steps are global per method, not per route. step_kib is [rate_limit] get_block_kib /
+# post_block_kib, which the backend's tariff (fareward/go tariff.go) reads.
 [tariff.GET]
 base_kib = 8
-step_kib = 16
+step_kib = 32
 
 [tariff.POST]          # PUT is the same behaviour (TestPostAndPutAreIndistinguishable)
 base_kib = 8

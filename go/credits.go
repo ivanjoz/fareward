@@ -44,8 +44,6 @@ const (
 	// is what catches it before a request ever does.
 	MaxRequiredAccess = 4
 
-	creditBlockBytes = 8 * 1024
-
 	// Fourteen bits of the persisted blob's two-byte header, mirrored from
 	// fareward/src/limiter/credits_blob.rs. Refused here rather than at the daemon so an
 	// unencodable route is a caller's error and not a rejected frame — a rejection would be
@@ -124,46 +122,6 @@ func (limit *CreditLimitExceeded) Error() string {
 		scope = "company"
 	}
 	return fmt.Sprintf("%s %s credit limit exhausted (code=%d)", scope, limit.Window, limit.Code)
-}
-
-// APICPUCredits applies the read/write base charge and rounds each partial extra block up.
-//
-// POST and PUT share one case, and that is the whole point: they are the same operation as far as
-// this tariff is concerned — a body arrives and the handler writes — so the two must never be able
-// to disagree about what they cost. Splitting them into separate cases is what let PUT fall through
-// to the error branch and be silently free.
-func APICPUCredits(method string, payloadBytes int) (uint16, error) {
-	if payloadBytes < 0 {
-		return 0, errors.New("payload size cannot be negative")
-	}
-	baseCredits, extraBlockBytes := uint64(0), uint64(0)
-	switch strings.ToUpper(method) {
-	case "GET":
-		baseCredits, extraBlockBytes = 2, 16*1024
-	case "POST", "PUT":
-		baseCredits, extraBlockBytes = 5, 8*1024
-	default:
-		return 0, fmt.Errorf("credit rate limiting does not support method %q", method)
-	}
-	extraBytes := uint64(0)
-	if payloadBytes > creditBlockBytes {
-		extraBytes = uint64(payloadBytes - creditBlockBytes)
-	}
-	credits := baseCredits + ceilDivide(extraBytes, extraBlockBytes)
-	if credits > uint64(^uint16(0)) {
-		return 0, fmt.Errorf("calculated API credits %d exceed uint16", credits)
-	}
-	return uint16(credits), nil
-}
-
-// APICPUBaseCredits is what a request costs before its payload is measured.
-//
-// It exists because a GET is charged in two steps: the byte count only exists after the handler has
-// run, but the authorization verdict is needed before it. The pre-handler frame therefore carries
-// the base, and a top-up follows only when the response exceeded the first free block — which for a
-// GET means only when it is over 8 KB.
-func APICPUBaseCredits(method string) (uint16, error) {
-	return APICPUCredits(method, 0)
 }
 
 // inferenceTokenBlock is one inference credit block in tokens: 2048 tokens is the 8 KB block the

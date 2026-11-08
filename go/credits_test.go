@@ -186,7 +186,7 @@ func TestGetBaseAndTopUpSumToTheWholeCharge(t *testing.T) {
 		}
 	}
 	// Past it, base plus top-up must equal what the single old charge would have been.
-	for _, responseBytes := range []int{8*1024 + 1, 24 * 1024, 24*1024 + 1, 1 << 20} {
+	for _, responseBytes := range []int{8*1024 + 1, 40 * 1024, 40*1024 + 1, 1 << 20} {
 		total, _ := APICPUCredits("GET", responseBytes)
 		if total <= base {
 			t.Fatalf("a %d-byte GET response owes only %d", responseBytes, total)
@@ -267,7 +267,9 @@ func TestCreditFormulasRoundPartialBlocksUp(t *testing.T) {
 		want   uint16
 	}{
 		{"GET", 0, 2}, {"GET", 8 * 1024, 2}, {"GET", 8*1024 + 1, 3},
-		{"GET", 24 * 1024, 3}, {"GET", 24*1024 + 1, 4},
+		{"GET", 40 * 1024, 3}, {"GET", 40*1024 + 1, 4},
+		// 1 MiB: 1 040 384 bytes past the free block are 32 started 32 KiB blocks.
+		{"GET", 1 << 20, 34},
 		{"POST", 0, 5}, {"POST", 8 * 1024, 5}, {"POST", 8*1024 + 1, 6},
 		{"POST", 16 * 1024, 6}, {"POST", 16*1024 + 1, 7},
 		// PUT is a write like POST and shares its tariff exactly; see APICPUCredits.
