@@ -386,7 +386,7 @@ company_inference_short = 1000
 company_cpu_long        = 40000
 company_inference_long  = 10000
 
-user_cpu_short          = 400
+user_cpu_short          = 320
 user_inference_short    = 500
 user_cpu_long           = 20000
 user_inference_long     = 5000
