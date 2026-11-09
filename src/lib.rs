@@ -8,6 +8,7 @@ pub mod bridge;
 pub mod config;
 pub mod limiter;
 pub mod lock;
+pub mod mariadb;
 pub mod routes;
 pub mod service;
 pub mod siphash;

@@ -7,7 +7,7 @@
 //! | `usage_company` | company, time_frame | version, three refusal counters, credits blob |
 //! | `usage_user` | company, user, time_frame | version, credits blob |
 //! | `budget` | company | version, entitlement and usage counters (`BudgetRecord`) |
-//! | `server_metrics` | date, slot | version, eleven i16 columns |
+//! | `server_metrics` | date, slot | metrics version (2), fourteen i16 columns; v1 rows had eleven |
 //! | `grants` | company, user | version, status, the two grant blobs (pushed by the backend) |
 //! | `meta` | one byte | the store's own state |
 //!

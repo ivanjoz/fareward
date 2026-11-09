@@ -17,7 +17,8 @@ use std::{
 };
 
 use crate::sysmetrics::{
-    MetricsSample, NOT_MEASURED, ServiceSample, megabytes, network_rate, percent_hundredths,
+    DatabaseEngineSample, MetricsSample, NOT_MEASURED, ServiceSample, megabytes, network_rate,
+    percent_hundredths,
 };
 
 /// The cgroup v2 mount, searched for each unit rather than assumed to be its parent.
@@ -156,6 +157,8 @@ impl SystemMetricsCollector {
             backend: make_service(0),
             fareward: make_service(1),
             database: make_service(2),
+            // Not read from /proc: the writer fills it from the MariaDB probe's newest reading.
+            database_engine: DatabaseEngineSample::default(),
         })
     }
 

@@ -28,6 +28,9 @@ getrandom = "0.4"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Only for mysql_native_password, the one auth plugin the small MariaDB client in src/mariadb.rs
+# speaks.
+sha1 = "0.10"
 # Only to compress a configuration secret into the 128-bit key SipHash takes: see src/siphash.rs.
 sha2 = "0.10"
 subtle = "2.6"

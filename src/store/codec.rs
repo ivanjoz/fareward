@@ -13,7 +13,7 @@ use anyhow::{Result, bail};
 use crate::limiter::block::Rejections;
 use crate::limiter::credits_blob::Credits;
 use crate::limiter::storage::{StoredBudget, StoredBudgetUsage, StoredExtraUsage};
-use crate::sysmetrics::{MetricsSample, ServiceSample};
+use crate::sysmetrics::{DatabaseEngineSample, MetricsSample, ServiceSample};
 
 /// The version byte every value of this layout starts with.
 pub const VALUE_VERSION: u8 = 1;
@@ -248,12 +248,23 @@ impl BudgetRecord {
     }
 }
 
-/// `server_metrics`: `[version]` then the eleven columns of `MetricsSample`, i16 each.
-pub const METRICS_VALUE_SIZE: usize = 1 + 11 * 2;
+/// `server_metrics` before the database engine columns: `[1]` then eleven `i16`. Rows written by
+/// an older daemon stay in the store until the retention purges them, so they still decode, with
+/// the three engine columns absent.
+const METRICS_V1_VERSION: u8 = 1;
+const METRICS_V1_SIZE: usize = 1 + 11 * 2;
+
+/// `server_metrics`: `[2]` then the fourteen columns of `MetricsSample`, `i16` each.
+///
+/// The metrics value has its own version, not [`VALUE_VERSION`]: only this layout grew, and the
+/// report reply carries it verbatim, so a Go client that only knows the eleven-column layout fails
+/// on the version byte instead of reading the next row's key as a column.
+pub const METRICS_VALUE_VERSION: u8 = 2;
+pub const METRICS_VALUE_SIZE: usize = 1 + 14 * 2;
 
 pub fn encode_metrics(sample: &MetricsSample) -> Vec<u8> {
     let mut value = Vec::with_capacity(METRICS_VALUE_SIZE);
-    value.push(VALUE_VERSION);
+    value.push(METRICS_VALUE_VERSION);
     for field in metrics_fields(sample) {
         value.extend_from_slice(&field.to_be_bytes());
     }
@@ -261,14 +272,16 @@ pub fn encode_metrics(sample: &MetricsSample) -> Vec<u8> {
 }
 
 pub fn decode_metrics(value: &[u8]) -> Result<MetricsSample> {
-    if value.len() != METRICS_VALUE_SIZE || value[0] != VALUE_VERSION {
-        bail!("server_metrics value has an unknown layout");
-    }
+    let has_engine_columns = match (value.first(), value.len()) {
+        (Some(&METRICS_VALUE_VERSION), METRICS_VALUE_SIZE) => true,
+        (Some(&METRICS_V1_VERSION), METRICS_V1_SIZE) => false,
+        _ => bail!("server_metrics value has an unknown layout"),
+    };
     let mut reader = Reader {
         bytes: value,
         offset: 1,
     };
-    Ok(MetricsSample {
+    let mut sample = MetricsSample {
         cpu_percent: reader.i16(),
         memory_percent: reader.i16(),
         disk_percent: reader.i16(),
@@ -286,11 +299,20 @@ pub fn decode_metrics(value: &[u8]) -> Result<MetricsSample> {
             memory_mb: reader.i16(),
             cpu_percent: reader.i16(),
         },
-    })
+        database_engine: DatabaseEngineSample::default(),
+    };
+    if has_engine_columns {
+        sample.database_engine = DatabaseEngineSample {
+            buffer_pool_mb: reader.i16(),
+            dirty_mb: reader.i16(),
+            disk_gb_tenths: reader.i16(),
+        };
+    }
+    Ok(sample)
 }
 
 /// The column order of a metrics value. `database` is the database unit's sample, whatever it is.
-fn metrics_fields(sample: &MetricsSample) -> [i16; 11] {
+fn metrics_fields(sample: &MetricsSample) -> [i16; 14] {
     [
         sample.cpu_percent,
         sample.memory_percent,
@@ -303,6 +325,9 @@ fn metrics_fields(sample: &MetricsSample) -> [i16; 11] {
         sample.fareward.cpu_percent,
         sample.database.memory_mb,
         sample.database.cpu_percent,
+        sample.database_engine.buffer_pool_mb,
+        sample.database_engine.dirty_mb,
+        sample.database_engine.disk_gb_tenths,
     ]
 }
 
@@ -430,5 +455,40 @@ mod tests {
         assert!(decode_user_usage(&[]).is_err());
         assert!(BudgetRecord::decode(1, &[0; BUDGET_VALUE_SIZE]).is_err());
         assert!(decode_metrics(&[1; 3]).is_err());
+        // A v1 length under the v2 version byte, and the reverse, are both refused.
+        assert!(decode_metrics(&[METRICS_VALUE_VERSION; METRICS_V1_SIZE]).is_err());
+        assert!(decode_metrics(&[METRICS_V1_VERSION; METRICS_VALUE_SIZE]).is_err());
+    }
+
+    /// Rows written before the engine columns existed stay in the store until the retention purges
+    /// them. They must keep decoding, with the new columns absent rather than zero.
+    #[test]
+    fn a_v1_metrics_row_decodes_with_engine_columns_absent() {
+        let mut v1 = vec![METRICS_V1_VERSION];
+        for column in 1_i16..=11 {
+            v1.extend_from_slice(&column.to_be_bytes());
+        }
+        let sample = decode_metrics(&v1).unwrap();
+        assert_eq!(sample.cpu_percent, 1);
+        assert_eq!(sample.database.cpu_percent, 11);
+        assert_eq!(sample.database_engine, DatabaseEngineSample::default());
+
+        // And it re-encodes in the current layout, which is what the report reply carries.
+        let current = encode_metrics(&sample);
+        assert_eq!(current.len(), METRICS_VALUE_SIZE);
+        assert_eq!(decode_metrics(&current).unwrap(), sample);
+    }
+
+    #[test]
+    fn engine_columns_round_trip() {
+        let sample = MetricsSample {
+            database_engine: DatabaseEngineSample {
+                buffer_pool_mb: 1_024,
+                dirty_mb: 37,
+                disk_gb_tenths: 42,
+            },
+            ..MetricsSample::default()
+        };
+        assert_eq!(decode_metrics(&encode_metrics(&sample)).unwrap(), sample);
     }
 }

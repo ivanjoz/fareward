@@ -52,6 +52,9 @@ const (
 	// companyUsageHead is a usage_company value up to its credits blob: version and three counters.
 	companyUsageHead  = 1 + 3*4
 	storeValueVersion = byte(1)
+	// metricsValueVersion is the server_metrics layout with the database engine columns: fourteen
+	// int16 where version 1 had eleven. It has its own version because only this layout grew.
+	metricsValueVersion = byte(2)
 )
 
 // ErrReportMalformed means the daemon answered a report this client cannot read: the two binaries
@@ -124,6 +127,12 @@ type ServerMetricRow struct {
 	FarewardCPUPercent int16
 	DatabaseMemMB      int16
 	DatabaseCPUPercent int16
+	// What MariaDB reports over SQL, as opposed to its cgroup: innodb_buffer_pool_size and
+	// Innodb_buffer_pool_bytes_dirty in megabytes, and the tables' data plus indexes in tenths of a
+	// gigabyte. -1 when the probe is off, the server is unreachable or the row predates them.
+	DatabaseBufferPoolMB int16
+	DatabaseDirtyMB      int16
+	DatabaseDiskGBTenths int16
 }
 
 // QueryCompanyUsage reads one company's rows over the time frames [first, last]. Company 0 is the
@@ -237,13 +246,14 @@ func QueryServerMetrics(
 	out := make([]ServerMetricRow, 0, rows)
 	for range rows {
 		row := ServerMetricRow{Date: reader.i16(), Slot: reader.i16()}
-		if reader.byte() != storeValueVersion && reader.err == nil {
+		if reader.byte() != metricsValueVersion && reader.err == nil {
 			return nil, fmt.Errorf("%w: server_metrics value layout", ErrReportMalformed)
 		}
 		for _, field := range []*int16{
 			&row.CPUPercent, &row.MemPercent, &row.DiskPercent, &row.NetRxRate, &row.NetTxRate,
 			&row.BackendMemMB, &row.BackendCPUPercent, &row.FarewardMemMB, &row.FarewardCPUPercent,
 			&row.DatabaseMemMB, &row.DatabaseCPUPercent,
+			&row.DatabaseBufferPoolMB, &row.DatabaseDirtyMB, &row.DatabaseDiskGBTenths,
 		} {
 			*field = reader.i16()
 		}

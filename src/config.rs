@@ -8,6 +8,7 @@ use toml::{Table, Value};
 use crate::{
     limiter::quota::{CreditLimits, LimitPolicy, ScopeLimits, Windows},
     lock::registry::LockLimits,
+    mariadb::{MariaDbAddress, MariaDbSettings},
 };
 
 const DEFAULT_LISTEN_PORT: u16 = 14013;
@@ -44,6 +45,8 @@ const DEFAULT_SERVER_METRICS_BACKEND_UNIT: &str = "genix.service";
 const DEFAULT_SERVER_METRICS_FAREWARD_UNIT: &str = "fareward.service";
 /// The database's unit, sampled into the metrics' database columns.
 const DEFAULT_SERVER_METRICS_DATABASE_UNIT: &str = "mariadb.service";
+/// MariaDB's own default, and what `[mariadb].port` means when it is absent.
+const DEFAULT_MARIADB_PORT: u64 = 3306;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -118,6 +121,10 @@ pub struct ServerMetricsConfig {
     pub backend_unit: String,
     pub fareward_unit: String,
     pub database_unit: String,
+    /// The `[mariadb]` section the backend also reads, for the probe that asks the server for its
+    /// buffer pool, dirty pages and table sizes. `None` when there is no `[mariadb].user` or when
+    /// `server_metrics.mariadb_probe = false`: the engine columns then stay `-1`.
+    pub mariadb: Option<MariaDbSettings>,
 }
 
 #[derive(Clone, Debug)]
@@ -368,7 +375,57 @@ fn load_server_metrics(config: &Table) -> Result<ServerMetricsConfig> {
             "server_metrics.database_unit",
             DEFAULT_SERVER_METRICS_DATABASE_UNIT,
         ),
+        mariadb: load_mariadb_probe(config)?,
     })
+}
+
+/// The same `[mariadb]` keys the backend dials with, so the probe cannot point at a different
+/// server than the one Genix uses. On by default whenever a user is configured; a socket wins over
+/// host and port, as it does for the backend, because it is only set when the database shares
+/// this host.
+fn load_mariadb_probe(config: &Table) -> Result<Option<MariaDbSettings>> {
+    let probe_enabled = optional_string(
+        config,
+        "SERVER_METRICS_MARIADB_PROBE",
+        "server_metrics.mariadb_probe",
+    )
+    .is_none_or(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if !probe_enabled {
+        return Ok(None);
+    }
+    let Some(user) = optional_string(config, "MARIADB_USER", "mariadb.user") else {
+        return Ok(None);
+    };
+    let address = match optional_string(config, "MARIADB_SOCKET", "mariadb.socket") {
+        Some(socket) => MariaDbAddress::Socket(socket),
+        None => {
+            let port = optional_u64(config, "MARIADB_PORT", "mariadb.port")?
+                .unwrap_or(DEFAULT_MARIADB_PORT);
+            MariaDbAddress::Tcp {
+                host: optional_string(config, "MARIADB_HOST", "mariadb.host")
+                    .unwrap_or_else(|| "127.0.0.1".to_owned()),
+                port: u16::try_from(port)
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .context("mariadb.port must be a port number between 1 and 65535")?,
+            }
+        }
+    };
+    Ok(Some(MariaDbSettings {
+        address,
+        user,
+        // value_text trims, which is right for every other key and wrong for a password, so this
+        // one is read raw from the TOML when the environment does not set it.
+        password: env::var("MARIADB_PASSWORD")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                value_at_path(config, "mariadb.password")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default(),
+    }))
 }
 
 /// `rate_limit.short_window_seconds` and `rate_limit.long_window_minutes`. Absent means the windows
@@ -736,6 +793,50 @@ mod tests {
         assert_eq!(metrics.database_unit, "mariadb.service");
         assert_eq!(metrics.retention_days, 30);
         assert!(metrics.network_interface.is_empty());
+    }
+
+    #[test]
+    fn the_mariadb_probe_reads_the_shared_section() {
+        // No [mariadb] user, no probe: a deployment without the database is not an error.
+        assert!(
+            load_server_metrics(&Table::new())
+                .unwrap()
+                .mariadb
+                .is_none()
+        );
+
+        let tcp: Table = toml::from_str(
+            "[mariadb]\nhost = '10.0.0.5'\nport = 14016\nuser = 'genix'\npassword = ' p w '\nsocket = ''",
+        )
+        .unwrap();
+        let settings = load_server_metrics(&tcp).unwrap().mariadb.unwrap();
+        assert_eq!(
+            settings.address,
+            MariaDbAddress::Tcp {
+                host: "10.0.0.5".into(),
+                port: 14016
+            }
+        );
+        assert_eq!(settings.user, "genix");
+        // Spaces are part of a password.
+        assert_eq!(settings.password, " p w ");
+
+        let socket: Table =
+            toml::from_str("[mariadb]\nuser = 'genix'\nsocket = '/run/mysqld/mysqld.sock'")
+                .unwrap();
+        assert_eq!(
+            load_server_metrics(&socket)
+                .unwrap()
+                .mariadb
+                .unwrap()
+                .address,
+            MariaDbAddress::Socket("/run/mysqld/mysqld.sock".into())
+        );
+
+        let disabled: Table =
+            toml::from_str("[mariadb]\nuser = 'genix'\n[server_metrics]\nmariadb_probe = false")
+                .unwrap();
+        assert!(load_server_metrics(&disabled).unwrap().mariadb.is_none());
     }
 
     /// row_seconds is the meaning of the clustering key, so the values that would corrupt it are

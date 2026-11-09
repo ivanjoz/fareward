@@ -103,16 +103,30 @@ func TestEveryReportKindDecodes(t *testing.T) {
 		t.Fatalf("budgets %+v %v", budgets, err)
 	}
 
-	// Kind 5: day 100, slot 2, cpu 2345 and everything else not measured.
-	metric := []byte{5, 0, 0, 0, 1, 0, 100, 0, 2, 1, 0x09, 0x29}
+	// Kind 5: day 100, slot 2, cpu 2345, a 1024 MB buffer pool with 37 MB dirty, and everything
+	// else not measured.
+	metric := []byte{5, 0, 0, 0, 1, 0, 100, 0, 2, 2, 0x09, 0x29}
 	for range 10 {
 		metric = append(metric, 0xFF, 0xFF)
 	}
+	metric = append(metric, 0x04, 0x00, 0x00, 37, 0xFF, 0xFF)
 	answerReports(stub, t, metric)
 	metrics, err := QueryServerMetrics(ctx, 100, 0, 101, 0)
 	if err != nil || len(metrics) != 1 || metrics[0].CPUPercent != 2345 ||
-		metrics[0].DatabaseCPUPercent != -1 || metrics[0].Slot != 2 {
+		metrics[0].DatabaseCPUPercent != -1 || metrics[0].Slot != 2 ||
+		metrics[0].DatabaseBufferPoolMB != 1024 || metrics[0].DatabaseDirtyMB != 37 ||
+		metrics[0].DatabaseDiskGBTenths != -1 {
 		t.Fatalf("metrics %+v %v", metrics, err)
+	}
+
+	// A daemon still on the eleven-column layout is refused by its version byte, not misread.
+	legacy := []byte{5, 0, 0, 0, 1, 0, 100, 0, 2, 1, 0x09, 0x29}
+	for range 10 {
+		legacy = append(legacy, 0xFF, 0xFF)
+	}
+	answerReports(stub, t, legacy)
+	if _, err := QueryServerMetrics(ctx, 100, 0, 101, 0); !errors.Is(err, ErrReportMalformed) {
+		t.Fatalf("legacy metrics layout: %v", err)
 	}
 }
 

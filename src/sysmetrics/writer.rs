@@ -25,6 +25,7 @@ use crate::{
     sysmetrics::{
         WindowPeaks,
         collector::{ServiceUnits, SystemMetricsCollector},
+        database::{DatabaseProbe, DatabaseReadings},
     },
 };
 
@@ -64,6 +65,19 @@ impl ServerMetricsWriter {
                 config.disk_mount.clone(),
                 config.network_interface.clone(),
             );
+            // The probe is its own task so a slow database never delays the host sample; this loop
+            // only borrows its newest reading. Stopped by the same shutdown signal.
+            let (database_readings, database_task) = match config.mariadb.clone() {
+                Some(settings) => {
+                    let (readings, task) = DatabaseProbe::new(settings)
+                        .spawn(config.sample_interval, shutdown.clone());
+                    (Some(readings), Some(task))
+                }
+                None => {
+                    info!("MariaDB metrics probe off: no [mariadb].user configured");
+                    (None, None)
+                }
+            };
             let mut peaks = WindowPeaks::default();
             let mut pending_row_index: Option<i64> = None;
             let mut rows_written = 0_u64;
@@ -108,7 +122,11 @@ impl ServerMetricsWriter {
                             .await;
                         }
 
-                        if let Some(sample) = collector.sample() {
+                        if let Some(mut sample) = collector.sample() {
+                            sample.database_engine = database_readings
+                                .as_ref()
+                                .map(DatabaseReadings::latest)
+                                .unwrap_or_default();
                             peaks.absorb(sample);
                         }
                         pending_row_index = Some(row_index);
@@ -127,6 +145,9 @@ impl ServerMetricsWriter {
                     &mut write_failures,
                 )
                 .await;
+            }
+            if let Some(database_task) = database_task {
+                database_task.await.ok();
             }
             info!(
                 rows_written,

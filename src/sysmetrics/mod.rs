@@ -15,6 +15,7 @@
 //! along with it.
 
 pub mod collector;
+pub mod database;
 pub mod writer;
 
 /// Nothing could be read for this column: the service has no cgroup on this box — the backend
@@ -48,6 +49,30 @@ impl Default for ServiceSample {
     }
 }
 
+/// What the database server reports about itself over SQL (`database.rs`), as opposed to what its
+/// cgroup reports about the process. All three default to [`NOT_MEASURED`]: no `[mariadb]` section,
+/// an unreachable server and a stale reading all look the same in a row, and none of them is zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatabaseEngineSample {
+    /// `innodb_buffer_pool_size`: the RAM the server reserves for cached pages, in megabytes.
+    pub buffer_pool_mb: i16,
+    /// `Innodb_buffer_pool_bytes_dirty`: pages modified in RAM and not yet flushed to disk, in
+    /// megabytes. What a crash would have to recover from the redo log.
+    pub dirty_mb: i16,
+    /// Data plus indexes of the visible tables, in tenths of a gigabyte (see [`gigabyte_tenths`]).
+    pub disk_gb_tenths: i16,
+}
+
+impl Default for DatabaseEngineSample {
+    fn default() -> Self {
+        Self {
+            buffer_pool_mb: NOT_MEASURED,
+            dirty_mb: NOT_MEASURED,
+            disk_gb_tenths: NOT_MEASURED,
+        }
+    }
+}
+
 /// Everything read in one second. The same shape is reused for the window's peaks, since taking a
 /// maximum does not change what a field means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +85,7 @@ pub struct MetricsSample {
     pub backend: ServiceSample,
     pub fareward: ServiceSample,
     pub database: ServiceSample,
+    pub database_engine: DatabaseEngineSample,
 }
 
 impl Default for MetricsSample {
@@ -73,6 +99,7 @@ impl Default for MetricsSample {
             backend: ServiceSample::default(),
             fareward: ServiceSample::default(),
             database: ServiceSample::default(),
+            database_engine: DatabaseEngineSample::default(),
         }
     }
 }
@@ -119,6 +146,20 @@ impl WindowPeaks {
             backend: peak_service(current.backend, sample.backend),
             fareward: peak_service(current.fareward, sample.fareward),
             database: peak_service(current.database, sample.database),
+            database_engine: DatabaseEngineSample {
+                buffer_pool_mb: peak(
+                    current.database_engine.buffer_pool_mb,
+                    sample.database_engine.buffer_pool_mb,
+                ),
+                dirty_mb: peak(
+                    current.database_engine.dirty_mb,
+                    sample.database_engine.dirty_mb,
+                ),
+                disk_gb_tenths: peak(
+                    current.database_engine.disk_gb_tenths,
+                    sample.database_engine.disk_gb_tenths,
+                ),
+            },
         };
         self.absorbed += 1;
     }
@@ -158,6 +199,16 @@ pub fn percent_hundredths(ratio: f64) -> i16 {
 pub fn megabytes(bytes: u64) -> i16 {
     let megabytes = bytes / (1024 * 1024);
     i16::try_from(megabytes).unwrap_or(i16::MAX)
+}
+
+/// Bytes as tenths of a gigabyte (GiB), rounded and saturating. Megabytes would cap a database at
+/// 32 GB in an `i16`; tenths reach 3.2 TB while still resolving 100 MB of growth.
+pub fn gigabyte_tenths(bytes: u64) -> i16 {
+    let tenths = (bytes as f64 / (1024.0 * 1024.0 * 1024.0 / 10.0)).round();
+    if tenths >= f64::from(i16::MAX) {
+        return i16::MAX;
+    }
+    tenths as i16
 }
 
 /// Bytes per second in 5 KB/s units, saturating. Rounds rather than truncates so a steady 3 KB/s
@@ -262,6 +313,32 @@ mod tests {
         assert_eq!(megabytes(0), 0);
         assert_eq!(megabytes(32 * 1024 * 1024), 32);
         assert_eq!(megabytes(u64::MAX), i16::MAX);
+    }
+
+    #[test]
+    fn disk_is_tenths_of_a_gigabyte_and_saturates() {
+        assert_eq!(gigabyte_tenths(0), 0);
+        assert_eq!(gigabyte_tenths(1024 * 1024 * 1024), 10);
+        // 150 MB rounds to 0.1 GB rather than vanishing.
+        assert_eq!(gigabyte_tenths(150 * 1024 * 1024), 1);
+        assert_eq!(gigabyte_tenths(u64::MAX), i16::MAX);
+    }
+
+    #[test]
+    fn database_engine_columns_keep_their_peaks() {
+        let mut window = WindowPeaks::default();
+        for dirty in [4, 90, 12] {
+            window.absorb(MetricsSample {
+                database_engine: DatabaseEngineSample {
+                    dirty_mb: dirty,
+                    ..DatabaseEngineSample::default()
+                },
+                ..MetricsSample::default()
+            });
+        }
+        let row = window.take();
+        assert_eq!(row.database_engine.dirty_mb, 90);
+        assert_eq!(row.database_engine.buffer_pool_mb, NOT_MEASURED);
     }
 
     #[test]

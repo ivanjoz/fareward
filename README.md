@@ -73,7 +73,7 @@ report opcode (below) and no longer has tables for them. Pure binary, company-fi
 | `usage_company` | company, time_frame | version, `rejected_short`, `rejected_long`, `rejected_no_funds` (u32 each), the credits blob |
 | `usage_user` | company, user, time_frame | version, the credits blob |
 | `budget` | company | version, the entitlement and the usage counters, fixed 111 bytes |
-| `server_metrics` | date, slot | version, eleven i16 columns |
+| `server_metrics` | date, slot | metrics version (2), fourteen i16 columns (v1 rows: eleven) |
 | `grants` | company, user | version, status, the grants blob, the sub-grants blob — as last pushed |
 | `meta` | one byte | the store's layout version; a store of another layout refuses to open |
 
@@ -206,7 +206,9 @@ src/
 │                # LimiterStore over it), metrics (the MetricsSink), query (reports)
 ├── sysmetrics/  # no opcode: samples the machine once a second and writes the peak
 │                # of each five-second window to the store. collector (/proc +
-│                # cgroup v2), writer (the tick loop and the write)
+│                # cgroup v2), database (the MariaDB probe, its own task), writer (the
+│                # tick loop and the write)
+├── mariadb.rs   # the minimal MariaDB client the probe uses (auth + text queries)
 └── bridge/      # token.rs (colbin + channel token), auth (the browser's session
                  # token and the backend's service header), channel, http (axum)
 
@@ -419,8 +421,32 @@ The store is local and Fareward's own:
 path = "/var/lib/fareward/store"
 ```
 
-Fareward reads no database settings: `[mariadb]`, `db.name` and `[request_log]` in a shared config
-file are ignored.
+Fareward stores nothing in the database: `db.name` and `[request_log]` in a shared config file are
+ignored. It reads `[mariadb]` (`socket`, else `host`/`port`, plus `user`/`password`) for one thing
+only: the server metrics probe, which once a second asks MariaDB for its InnoDB buffer pool size,
+the dirty bytes in it still owed to disk, and — every minute — the tables' data plus index size.
+Those land in three more `server_metrics` columns; the database's CPU and resident memory still
+come from the `database_unit` cgroup. No `[mariadb].user`, or `server_metrics.mariadb_probe =
+false`, turns the probe off and the three columns read `-1`. The account needs no privilege beyond
+logging in: global status and variables are readable by any user, and `information_schema.TABLES`
+lists only the tables it can see.
+
+```toml
+# Purpose: The database the probe reads its own state from (shared with the backend).
+[mariadb]
+host     = "127.0.0.1"
+port     = 3306
+user     = "genix"
+password = "..."
+socket   = "/run/mysqld/mysqld.sock"   # optional: wins over host/port
+
+[server_metrics]
+mariadb_probe = true                    # default
+```
+
+The client is `src/mariadb.rs`, written for this and nothing else: `mysql_native_password` over TCP
+or the Unix socket, text queries only, no TLS. An account on another auth plugin is reported in the
+log by name and the three columns stay `-1`.
 
 The SSE bridge adds one small section:
 
