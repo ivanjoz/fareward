@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"net"
 	"testing"
 )
 
@@ -127,6 +128,48 @@ func TestEveryReportKindDecodes(t *testing.T) {
 	answerReports(stub, t, legacy)
 	if _, err := QueryServerMetrics(ctx, 100, 0, 101, 0); !errors.Is(err, ErrReportMalformed) {
 		t.Fatalf("legacy metrics layout: %v", err)
+	}
+}
+
+func TestADeviceReportDecodesItsPairs(t *testing.T) {
+	stub := startMuxDaemonStub(t)
+	installStubAsConfiguredFareward(t, stub)
+	ctx := context.Background()
+
+	// Kind 6: company 7, frame 100000010, 2 refusals, 40 distinct pairs, one listed:
+	// 10.0.0.1 (IPv4 mapped), device -42, 9 requests, 27 CPU. Same layout as
+	// src/store/codec.rs encode_devices.
+	value := []byte{1, 0, 0, 0, 2, 0, 0, 0, 40, 1}
+	value = append(value, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 10, 0, 0, 1)
+	value = binary.BigEndian.AppendUint64(value, uint64(0xFFFFFFFFFFFFFFD6)) // -42
+	value = binary.BigEndian.AppendUint32(value, 9)
+	value = binary.BigEndian.AppendUint64(value, 27)
+	body := []byte{6, 0, 0, 0, 1, 0, 0, 0, 7}
+	body = binary.BigEndian.AppendUint32(body, 100_000_010)
+	body = binary.BigEndian.AppendUint32(body, uint32(len(value)))
+	body = append(body, value...)
+	answerReports(stub, t, body)
+
+	rows, err := QueryDeviceUsage(ctx, 0, 100_000_000, 100_000_047)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows %+v %v", rows, err)
+	}
+	row := rows[0]
+	if row.CompanyID != 7 || row.TimeFrame != 100_000_010 || row.Rejected != 2 || row.Distinct != 40 ||
+		len(row.Top) != 1 {
+		t.Fatalf("row %+v", row)
+	}
+	pair := row.Top[0]
+	if net.IP(pair.IP[:]).String() != "10.0.0.1" || pair.Device != -42 || pair.Requests != 9 || pair.CPU != 27 {
+		t.Fatalf("pair %+v (%s)", pair, net.IP(pair.IP[:]))
+	}
+
+	// An entry count the value does not hold is refused, not read past.
+	truncated := append([]byte{}, body...)
+	truncated[len(truncated)-len(value)+deviceUsageHead-1] = 2
+	answerReports(stub, t, truncated)
+	if _, err := QueryDeviceUsage(ctx, 0, 0, 1); !errors.Is(err, ErrReportMalformed) {
+		t.Fatalf("truncated: %v", err)
 	}
 }
 

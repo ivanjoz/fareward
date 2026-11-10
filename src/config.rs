@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 use toml::{Table, Value};
 
 use crate::{
-    limiter::quota::{CreditLimits, LimitPolicy, ScopeLimits, Windows},
+    limiter::{
+        devices::DeviceLimits,
+        quota::{CreditLimits, LimitPolicy, ScopeLimits, Windows},
+    },
     lock::registry::LockLimits,
     mariadb::{MariaDbAddress, MariaDbSettings},
 };
@@ -241,6 +244,7 @@ impl AppConfig {
                 "RATE_LIMIT_DISABLE_USER_LIMIT",
                 "rate_limit.disable_user_limit",
             ),
+            devices: load_device_limits(&config)?,
         };
         validate_policy(policy)?;
 
@@ -449,6 +453,31 @@ fn load_windows(config: &Table) -> Result<Windows> {
     };
     validate_windows(windows)?;
     Ok(windows)
+}
+
+/// `rate_limit.max_devices_short` and `rate_limit.max_devices_long`: distinct (IP, device) pairs one
+/// company may use per short and per long window. Absent means zero means that window is not capped,
+/// like the extra pool: a guessed ceiling would lock real offices out.
+fn load_device_limits(config: &Table) -> Result<DeviceLimits> {
+    let value = |env_key, toml_key: &str| -> Result<u32> {
+        optional_u64(config, env_key, toml_key)?
+            .unwrap_or(0)
+            .try_into()
+            .with_context(|| format!("{toml_key} must fit in uint32"))
+    };
+    let limits = DeviceLimits {
+        short: value(
+            "RATE_LIMIT_MAX_DEVICES_SHORT",
+            "rate_limit.max_devices_short",
+        )?,
+        long: value("RATE_LIMIT_MAX_DEVICES_LONG", "rate_limit.max_devices_long")?,
+    };
+    // The long window holds every pair the short one does, so a smaller long cap would make the
+    // short one unreachable.
+    if limits.short > 0 && limits.long > 0 && limits.long < limits.short {
+        bail!("rate_limit.max_devices_long must not be smaller than rate_limit.max_devices_short");
+    }
+    Ok(limits)
 }
 
 fn validate_windows(windows: Windows) -> Result<()> {
@@ -878,6 +907,7 @@ mod tests {
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 100,
             disable_user_limit: false,
+            devices: Default::default(),
             windows: Windows::default(),
         };
 
@@ -899,6 +929,7 @@ mod tests {
             company_extra_daily_cpu: i64::MAX as u64 + 1,
             user_daily_share_pct: 100,
             disable_user_limit: false,
+            devices: Default::default(),
             windows: Windows::default(),
         };
         assert!(validate_policy(policy).is_err());
@@ -972,6 +1003,7 @@ mod tests {
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 80,
             disable_user_limit: false,
+            devices: Default::default(),
             windows: Windows::default(),
         };
         assert!(validate_policy(policy).is_ok());

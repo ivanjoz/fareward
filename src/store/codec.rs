@@ -8,10 +8,13 @@
 //! The report replies (`store::query`) reuse these value layouts verbatim, so the Go client decodes
 //! one format per table rather than a second one for the wire.
 
+use std::net::Ipv6Addr;
+
 use anyhow::{Result, bail};
 
 use crate::limiter::block::Rejections;
 use crate::limiter::credits_blob::Credits;
+use crate::limiter::devices::{Client, DeviceUsage, StoredDevices};
 use crate::limiter::storage::{StoredBudget, StoredBudgetUsage, StoredExtraUsage};
 use crate::sysmetrics::{DatabaseEngineSample, MetricsSample, ServiceSample};
 
@@ -124,6 +127,63 @@ pub fn decode_user_usage(value: &[u8]) -> Result<Vec<u8>> {
         Some((&VALUE_VERSION, used_credits)) => Ok(used_credits.to_vec()),
         _ => bail!("usage_user value has an unknown layout"),
     }
+}
+
+/// One `usage_device` entry: `[ip:16][device:i64][requests:u32][cpu:u64]`, big-endian, the address
+/// as IPv6 (IPv4 mapped).
+pub const DEVICE_ENTRY_SIZE: usize = 16 + 8 + 4 + 8;
+/// Version, the two counters and the entry count.
+pub const DEVICE_HEAD: usize = 1 + 4 + 4 + 1;
+
+/// `usage_device` (key `[company_id][time_frame]`, as `usage_company`):
+/// `[version][rejected:u32][distinct:u32][count:u8][count × entry]`, entries most requests first.
+/// The report reply (kind 6) carries this value verbatim; `go/reports.go` decodes it.
+pub fn encode_devices(row: &StoredDevices) -> Vec<u8> {
+    let count = row.top.len().min(usize::from(u8::MAX));
+    let mut value = Vec::with_capacity(DEVICE_HEAD + count * DEVICE_ENTRY_SIZE);
+    value.push(VALUE_VERSION);
+    value.extend_from_slice(&row.rejected.to_be_bytes());
+    value.extend_from_slice(&row.distinct.to_be_bytes());
+    value.push(count as u8);
+    for (client, usage) in &row.top[..count] {
+        value.extend_from_slice(&client.ip.octets());
+        value.extend_from_slice(&client.device.to_be_bytes());
+        value.extend_from_slice(&usage.requests.to_be_bytes());
+        value.extend_from_slice(&usage.cpu.to_be_bytes());
+    }
+    value
+}
+
+pub fn decode_devices(value: &[u8]) -> Result<StoredDevices> {
+    if value.len() < DEVICE_HEAD || value[0] != VALUE_VERSION {
+        bail!("usage_device value has an unknown layout");
+    }
+    let count = usize::from(value[DEVICE_HEAD - 1]);
+    let entries = &value[DEVICE_HEAD..];
+    if entries.len() != count * DEVICE_ENTRY_SIZE {
+        bail!("usage_device value is truncated");
+    }
+    let top = entries
+        .chunks_exact(DEVICE_ENTRY_SIZE)
+        .map(|entry| {
+            let ip: [u8; 16] = entry[..16].try_into().expect("sixteen bytes");
+            let device = i64::from_be_bytes(entry[16..24].try_into().expect("eight bytes"));
+            let requests = u32::from_be_bytes(entry[24..28].try_into().expect("four bytes"));
+            let cpu = u64::from_be_bytes(entry[28..36].try_into().expect("eight bytes"));
+            (
+                Client {
+                    ip: Ipv6Addr::from(ip),
+                    device,
+                },
+                DeviceUsage { requests, cpu },
+            )
+        })
+        .collect();
+    Ok(StoredDevices {
+        rejected: u32::from_be_bytes([value[1], value[2], value[3], value[4]]),
+        distinct: u32::from_be_bytes([value[5], value[6], value[7], value[8]]),
+        top,
+    })
 }
 
 /// One company's whole budget: the entitlement the panel sets and the usage counters the flush
@@ -358,6 +418,31 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_row_refuses_an_unknown_layout_or_a_truncated_entry() {
+        let row = StoredDevices {
+            rejected: 1,
+            distinct: 40,
+            top: vec![(
+                Client {
+                    ip: Ipv6Addr::LOCALHOST,
+                    device: 5,
+                },
+                DeviceUsage {
+                    requests: 2,
+                    cpu: 3,
+                },
+            )],
+        };
+        let mut value = encode_devices(&row);
+        assert_eq!(value.len(), DEVICE_HEAD + DEVICE_ENTRY_SIZE);
+        assert_eq!(decode_devices(&value).unwrap(), row);
+        value.pop();
+        assert!(decode_devices(&value).is_err());
+        value[0] = VALUE_VERSION + 1;
+        assert!(decode_devices(&value).is_err());
+    }
 
     #[test]
     fn keys_sort_numerically_across_the_sign() {

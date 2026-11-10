@@ -122,6 +122,7 @@ async fn start_server(frame_timeout: Duration) -> TestServer {
             // fixture out of the way.
             user_daily_share_pct: 100,
             disable_user_limit: false,
+            devices: Default::default(),
             windows: Windows::default(),
         },
         Arc::new(EmptyStore),

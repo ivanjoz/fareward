@@ -39,6 +39,12 @@ const (
 	reportKindEveryCompanyUsage = uint8(3)
 	reportKindBudgets           = uint8(4)
 	reportKindServerMetrics     = uint8(5)
+	reportKindDeviceUsage       = uint8(6)
+
+	// deviceUsageHead is a usage_device value up to its entries: version, rejected, distinct and
+	// the entry count. Each entry is [ip:16][device:i64][requests:u32][cpu:u64].
+	deviceUsageHead = 1 + 4 + 4 + 1
+	deviceEntrySize = 16 + 8 + 4 + 8
 
 	// reportBodySize is what replyBodySize answers for a report: not a width but a marker that the
 	// body states its own length in four bytes.
@@ -133,6 +139,74 @@ type ServerMetricRow struct {
 	DatabaseBufferPoolMB int16
 	DatabaseDirtyMB      int16
 	DatabaseDiskGBTenths int16
+}
+
+// DevicePair is one (IP, device) pair's activity in one five-minute frame. IP is IPv6, with an
+// IPv4 address mapped into it (net.IP(pair.IP[:]).String() prints the IPv4 form). Device is the
+// browser signature (fareward DEVICE_SIGNATURE.md), 0 when the token carried none.
+type DevicePair struct {
+	IP       [16]byte
+	Device   int64
+	Requests uint32
+	CPU      uint64
+}
+
+// DeviceUsageRow is one company's five-minute device row: the device gate's refusals, the distinct
+// pairs served, and the busiest pairs by requests (at most twelve, most requests first).
+type DeviceUsageRow struct {
+	CompanyID int32
+	TimeFrame int32
+	Rejected  uint32
+	Distinct  uint32
+	Top       []DevicePair
+}
+
+// QueryDeviceUsage reads the device rows of one company over the five-minute frames [first, last],
+// or of every company when companyID is 0. Only the SPOE path fills them: a company never seen
+// through HAProxy has none.
+func QueryDeviceUsage(ctx context.Context, companyID, first, last int32) ([]DeviceUsageRow, error) {
+	body, err := report(ctx, reportQueryFrame{
+		Kind: reportKindDeviceUsage, CompanyID: companyID, First: int64(first), Last: int64(last),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return decodeDeviceUsageRows(body)
+}
+
+func decodeDeviceUsageRows(body []byte) ([]DeviceUsageRow, error) {
+	reader, rows, err := openReport(body, reportKindDeviceUsage)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DeviceUsageRow, 0, rows)
+	for range rows {
+		row := DeviceUsageRow{CompanyID: reader.i32(), TimeFrame: reader.i32()}
+		value := reader.value()
+		if reader.err != nil {
+			break
+		}
+		if len(value) < deviceUsageHead || value[0] != storeValueVersion {
+			return nil, fmt.Errorf("%w: usage_device value layout", ErrReportMalformed)
+		}
+		count := int(value[deviceUsageHead-1])
+		if len(value) != deviceUsageHead+count*deviceEntrySize {
+			return nil, fmt.Errorf("%w: usage_device value length", ErrReportMalformed)
+		}
+		row.Rejected = binary.BigEndian.Uint32(value[1:5])
+		row.Distinct = binary.BigEndian.Uint32(value[5:9])
+		row.Top = make([]DevicePair, count)
+		for index := range row.Top {
+			entry := value[deviceUsageHead+index*deviceEntrySize:]
+			pair := &row.Top[index]
+			copy(pair.IP[:], entry[:16])
+			pair.Device = int64(binary.BigEndian.Uint64(entry[16:24]))
+			pair.Requests = binary.BigEndian.Uint32(entry[24:28])
+			pair.CPU = binary.BigEndian.Uint64(entry[28:36])
+		}
+		out = append(out, row)
+	}
+	return out, reader.finish()
 }
 
 // QueryCompanyUsage reads one company's rows over the time frames [first, last]. Company 0 is the

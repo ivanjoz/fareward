@@ -48,6 +48,7 @@ async fn start(store: FjallStore) -> (String, watch::Sender<bool>) {
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 100,
             disable_user_limit: false,
+            devices: Default::default(),
             windows: Windows::default(),
         },
         // The grants come from the same store, as in the daemon.

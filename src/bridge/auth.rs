@@ -23,6 +23,7 @@ use blake2::digest::{KeyInit, Mac, consts::U16};
 use sha2::{Digest, Sha256};
 
 use crate::bridge::token::{TokenError, UserToken, decode_session_base64, decode_session_token};
+use crate::limiter::devices::parse_signature;
 use crate::siphash::{SipHasher24, derive_key};
 
 pub const SERVICE_AUTH_HEADER: &str = "X-Bridge-Auth";
@@ -93,10 +94,7 @@ pub fn authenticate_user(
         return Err(BridgeAuthError::MissingSessionToken);
     }
 
-    let encoded_token = header_value
-        .strip_prefix("Bearer ")
-        .unwrap_or(header_value)
-        .trim();
+    let (encoded_token, _) = split_signature(header_value);
     let user_token = decode_session_token(&decode_session_base64(encoded_token)?)?;
     if user_token.company_id <= 0 || user_token.id <= 0 {
         return Err(BridgeAuthError::NoIdentity);
@@ -109,6 +107,28 @@ pub fn authenticate_user(
         return Err(BridgeAuthError::InvalidSessionSignature);
     }
     Ok(user_token)
+}
+
+/// Splits `[Bearer ]<token>[.<signature>]` into the token and the device signature text. The token's
+/// alphabet has no `.`, so the first one can only be the separator. The signature is not covered by
+/// the token's tag: it is whatever the browser claims, which is all the device gate needs.
+fn split_signature(header_value: &str) -> (&str, Option<&str>) {
+    let token = header_value
+        .trim()
+        .strip_prefix("Bearer ")
+        .unwrap_or(header_value.trim())
+        .trim();
+    match token.split_once('.') {
+        Some((token, signature)) => (token, Some(signature)),
+        None => (token, None),
+    }
+}
+
+/// The device signature appended to the session token, 0 when there is none or it is unreadable.
+pub fn device_signature(authorization_header: Option<&str>) -> i64 {
+    authorization_header
+        .and_then(|header| split_signature(header).1)
+        .map_or(0, parse_signature)
 }
 
 /// Builds the value the backend sends on `X-Bridge-Auth`. Mirrored in
@@ -204,6 +224,23 @@ mod tests {
         assert_eq!(authenticated.company_id, 7);
         assert_eq!(authenticated.id, 42);
         assert_eq!(authenticated.user, "tester");
+    }
+
+    #[test]
+    fn the_device_signature_after_the_token_is_read_apart_and_ignored_by_the_tag() {
+        let header = format!("Bearer {GO_SESSION_TOKEN}.1311");
+        let authenticated = authenticate_user(Some(&header), TEST_SECRET).unwrap();
+        assert_eq!(authenticated.id, 42);
+        assert_eq!(device_signature(Some(&header)), 1311);
+        // No suffix, an empty one or a garbled one is the unknown device; the token still verifies.
+        assert_eq!(
+            device_signature(Some(&format!("Bearer {GO_SESSION_TOKEN}"))),
+            0
+        );
+        let garbled = format!("Bearer {GO_SESSION_TOKEN}.x1");
+        assert_eq!(device_signature(Some(&garbled)), 0);
+        assert!(authenticate_user(Some(&garbled), TEST_SECRET).is_ok());
+        assert_eq!(device_signature(None), 0);
     }
 
     #[test]

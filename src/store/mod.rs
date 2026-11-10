@@ -6,6 +6,7 @@
 //! |---|---|---|
 //! | `usage_company` | company, time_frame | version, three refusal counters, credits blob |
 //! | `usage_user` | company, user, time_frame | version, credits blob |
+//! | `usage_device` | company, time_frame | version, device refusals, the frame's top (IP, device) pairs |
 //! | `budget` | company | version, entitlement and usage counters (`BudgetRecord`) |
 //! | `server_metrics` | date, slot | metrics version (2), fourteen i16 columns; v1 rows had eleven |
 //! | `grants` | company, user | version, status, the two grant blobs (pushed by the backend) |
@@ -29,11 +30,13 @@ use anyhow::{Context, Result, bail};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use crate::limiter::block::Rejections;
+use crate::limiter::devices::StoredDevices;
 use crate::limiter::storage::{StoredBudget, StoredBudgetUsage, StoredUsage};
 use crate::sysmetrics::MetricsSample;
 use codec::{
-    BudgetRecord, CompanyUsageValue, budget_key, company_usage_key, decode_user_usage,
-    encode_metrics, encode_user_usage, metrics_key, read_key_i32, user_usage_key,
+    BudgetRecord, CompanyUsageValue, budget_key, company_usage_key, decode_devices,
+    decode_user_usage, encode_devices, encode_metrics, encode_user_usage, metrics_key,
+    read_key_i32, user_usage_key,
 };
 
 /// The layout version this binary writes. A store written by another layout refuses to open
@@ -51,6 +54,7 @@ struct Inner {
     database: Database,
     usage_company: Keyspace,
     usage_user: Keyspace,
+    usage_device: Keyspace,
     budget: Keyspace,
     server_metrics: Keyspace,
     grants: Keyspace,
@@ -88,6 +92,7 @@ impl FjallStore {
             inner: Arc::new(Inner {
                 usage_company: keyspace("usage_company")?,
                 usage_user: keyspace("usage_user")?,
+                usage_device: keyspace("usage_device")?,
                 budget: keyspace("budget")?,
                 server_metrics: keyspace("server_metrics")?,
                 grants: keyspace("grants")?,
@@ -251,6 +256,69 @@ impl FjallStore {
         Ok(())
     }
 
+    /// A company's five-minute device row.
+    pub fn devices(&self, company_id: i32, time_frame: i32) -> Result<Option<StoredDevices>> {
+        match self
+            .inner
+            .usage_device
+            .get(company_usage_key(company_id, time_frame))?
+        {
+            Some(stored) => decode_devices(&stored).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// A company's device rows over `[first, last]` frames, in frame order, as stored (the report
+    /// reply carries the value verbatim).
+    pub fn company_devices(
+        &self,
+        company_id: i32,
+        first: i32,
+        last: i32,
+    ) -> Result<Vec<(i32, Vec<u8>)>> {
+        let mut rows = Vec::new();
+        let range = company_usage_key(company_id, first)..=company_usage_key(company_id, last);
+        for item in self.inner.usage_device.range(range) {
+            let (key, value) = item.into_inner()?;
+            rows.push((read_key_i32(&key[4..8]), value.to_vec()));
+        }
+        Ok(rows)
+    }
+
+    /// Every company's device rows over `[first, last]` frames: `(company, frame, value)`. Skips
+    /// from one company to the next, as `every_company_usage` does.
+    pub fn every_company_devices(&self, first: i32, last: i32) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        let mut rows = Vec::new();
+        let mut company_id = i32::MIN;
+        loop {
+            let start = company_usage_key(company_id, i32::MIN);
+            let end = company_usage_key(i32::MAX, i32::MAX);
+            let Some(item) = self.inner.usage_device.range(start..=end).next() else {
+                break;
+            };
+            let key = item.key()?;
+            company_id = read_key_i32(&key[..4]);
+            for (frame, value) in self.company_devices(company_id, first, last)? {
+                rows.push((company_id, frame, value));
+            }
+            if company_id == i32::MAX {
+                break;
+            }
+            company_id += 1;
+        }
+        Ok(rows)
+    }
+
+    /// Replaces a company's five-minute device row. The flush already added in whatever a previous
+    /// process wrote, so this is an absolute write like the usage rows.
+    pub fn put_devices(&self, company_id: i32, time_frame: i32, row: &StoredDevices) -> Result<()> {
+        self.inner.usage_device.insert(
+            company_usage_key(company_id, time_frame),
+            encode_devices(row),
+        )?;
+        Ok(())
+    }
+
     fn company_value(&self, key: &[u8]) -> Result<CompanyUsageValue> {
         match self.inner.usage_company.get(key)? {
             Some(stored) => CompanyUsageValue::decode(&stored),
@@ -386,6 +454,47 @@ pub(crate) fn temporary_store() -> (tempfile::TempDir, FjallStore) {
 mod tests {
     use super::*;
     use crate::limiter::credits_blob::Credits;
+
+    #[test]
+    fn a_device_row_round_trips_and_stays_apart_from_the_company_row() {
+        use crate::limiter::devices::{Client, DeviceUsage};
+        let (_directory, store) = temporary_store();
+        assert_eq!(store.devices(7, 100_000_010).unwrap(), None);
+        let row = StoredDevices {
+            rejected: 3,
+            distinct: 2,
+            top: vec![
+                (
+                    Client {
+                        ip: std::net::Ipv4Addr::new(200, 48, 1, 9).to_ipv6_mapped(),
+                        device: -42,
+                    },
+                    DeviceUsage {
+                        requests: 9,
+                        cpu: 27,
+                    },
+                ),
+                (
+                    Client {
+                        ip: std::net::Ipv6Addr::LOCALHOST,
+                        device: i64::MAX,
+                    },
+                    DeviceUsage {
+                        requests: 1,
+                        cpu: 0,
+                    },
+                ),
+            ],
+        };
+        store.put_devices(7, 100_000_010, &row).unwrap();
+        assert_eq!(store.devices(7, 100_000_010).unwrap(), Some(row));
+        assert!(
+            store
+                .company_usage(7, 100_000_010, 100_000_010)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn usage_round_trips_and_a_company_row_keeps_its_counters() {

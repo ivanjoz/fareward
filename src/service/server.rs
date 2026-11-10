@@ -417,6 +417,14 @@ async fn handle_connection(
                         Ok(Decision::AccessDenied(denial)) => {
                             Reply::ChargeAccessDenied(denial.detail_code() as u8)
                         }
+                        // `admit` names no client, so the device gate never judges a TCP charge.
+                        Ok(Decision::DeviceViolation(violation)) => {
+                            warn!(
+                                ?violation,
+                                "device refusal on a charge that names no client"
+                            );
+                            Reply::Unavailable
+                        }
                         Err(admit_error) => {
                             // Including a failed grant read: "I could not answer" is already a
                             // shape the client fails closed on, so it needs no code of its own.

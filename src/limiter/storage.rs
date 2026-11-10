@@ -124,6 +124,23 @@ pub trait LimiterStore: Send + Sync {
     async fn flush_completed(&self) -> Result<()> {
         Ok(())
     }
+    /// A company's five-minute device row (`usage_device`), as a previous flush wrote it.
+    async fn load_devices(
+        &self,
+        _company_id: i32,
+        _time_frame: i32,
+    ) -> Result<Option<crate::limiter::devices::StoredDevices>> {
+        Ok(None)
+    }
+    /// Replaces a company's five-minute device row. A store that keeps none drops it.
+    async fn put_devices(
+        &self,
+        _company_id: i32,
+        _time_frame: i32,
+        _row: crate::limiter::devices::StoredDevices,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Answers a report query (opcode `0x09`) with the reply body. Only the real store keeps the
     /// rows a report reads, so a test double refuses.
     async fn report(&self, _query: crate::store::query::ReportQuery) -> Result<Vec<u8>> {

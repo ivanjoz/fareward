@@ -18,6 +18,7 @@ use crate::limiter::{
     block::{Block, CompanyBlocks, Until},
     budget::{BudgetMutation, BudgetMutationReply, BudgetOperation},
     credits_blob::{Credits, RoutedCredits, decode, encode, sum},
+    devices::{Client, CompanyDevices, DeviceLimits, DeviceViolation},
     protocol::{LimitViolation, Request, Scope, Window},
     storage::{LimiterStore, StoredBudget, StoredBudgetUsage},
     time_frame,
@@ -90,6 +91,9 @@ pub enum Decision {
     Allowed(AccessVerdict),
     CreditViolation(LimitViolation),
     AccessDenied(AccessDenial),
+    /// The company already used as many distinct (IP, device) pairs as the window allows, and this
+    /// request came from a new one. Only a caller that names its client (the SPOE agent) can get it.
+    DeviceViolation(DeviceViolation),
 }
 
 /// The figures a client is shown about its own consumption (the SPOE agent's `x-fareward-usage`
@@ -163,6 +167,9 @@ pub struct LimitPolicy {
     /// How long the short and the long window last. `CreditLimits::short` and `long` are credits
     /// per window.
     pub windows: Windows,
+    /// Distinct (IP, device) pairs one company may use per window (`limiter::devices`). Judged
+    /// only for a request that names its client, so the TCP charge path never meets it.
+    pub devices: DeviceLimits,
 }
 
 impl LimitPolicy {
@@ -549,6 +556,9 @@ struct ShardState {
     // that lives as long as the process), the company aggregate has no accesses, and because
     // denial precedes charging an unauthorized caller must not get a SubjectState allocated for it.
     access: HashMap<(i32, i32), UserAccessState>,
+    // The device gate and its five-minute tally, per company. Memory only between flushes, and
+    // bounded by the cap: a refused pair never enters it.
+    devices: HashMap<i32, CompanyDevices>,
 }
 
 pub struct RateLimiter {
@@ -604,9 +614,10 @@ impl RateLimiter {
     pub async fn admit_reported(
         &self,
         request: Request,
+        client: Option<Client>,
     ) -> Result<(Decision, Option<UsageReport>)> {
         let unix_seconds = current_unix_seconds()?;
-        self.judge(request, unix_seconds, Instant::now(), false)
+        self.judge(request, client, unix_seconds, Instant::now(), false)
             .await
     }
 
@@ -617,10 +628,12 @@ impl RateLimiter {
     ///
     /// It may still load state a cold company or user needs, as `admit` would: that is a cache
     /// fill, not an effect.
-    pub async fn evaluate(&self, request: Request) -> Result<Decision> {
+    pub async fn evaluate(&self, request: Request, client: Option<Client>) -> Result<Decision> {
         let unix_seconds = current_unix_seconds()?;
-        self.admit_mode_at(request, unix_seconds, Instant::now(), true)
-            .await
+        Ok(self
+            .judge(request, client, unix_seconds, Instant::now(), true)
+            .await?
+            .0)
     }
 
     async fn admit_at(
@@ -639,12 +652,16 @@ impl RateLimiter {
         now: Instant,
         dry_run: bool,
     ) -> Result<Decision> {
-        Ok(self.judge(request, unix_seconds, now, dry_run).await?.0)
+        Ok(self
+            .judge(request, None, unix_seconds, now, dry_run)
+            .await?
+            .0)
     }
 
     async fn judge(
         &self,
         request: Request,
+        client: Option<Client>,
         unix_seconds: i64,
         now: Instant,
         dry_run: bool,
@@ -689,6 +706,36 @@ impl RateLimiter {
                     );
                     return Ok((Decision::AccessDenied(denial), None));
                 }
+            }
+        }
+
+        // The device gate, before any credit is judged or any usage loaded: a refused pair costs
+        // the tenant nothing, like a 403. A refusal is counted (outside a dry run) but never blocks
+        // the company: the pairs already admitted must keep working.
+        let device_gate = self.policy.devices;
+        if let Some(client) = client
+            && device_gate.enabled()
+        {
+            let refusal = shard.devices.get(&request.company_id).and_then(|devices| {
+                devices.check(client, device_gate, self.policy.windows, unix_seconds, now)
+            });
+            if let Some(refusal) = refusal {
+                if !dry_run {
+                    shard
+                        .devices
+                        .entry(request.company_id)
+                        .or_default()
+                        .record_refusal(time_frame::five_minute(unix_seconds)?);
+                }
+                debug!(
+                    company_id = request.company_id,
+                    user_id = request.user_id,
+                    device = client.device,
+                    ip = %client.ip,
+                    ?refusal,
+                    "device gate refused"
+                );
+                return Ok((Decision::DeviceViolation(refusal), None));
             }
         }
 
@@ -904,6 +951,15 @@ impl RateLimiter {
         // paid for out of the pool was served like any other.
         increment_usage(&mut shard.usage, request, unix_seconds, !user_limited)?;
         increment_platform_usage(&mut platform_usage, request, unix_seconds)?;
+        if let Some(client) = client {
+            shard.devices.entry(request.company_id).or_default().record(
+                client,
+                request.credits.cpu,
+                time_frame::five_minute(unix_seconds)?,
+                device_gate.enabled(),
+                now,
+            );
+        }
         // After the charge, so the client sees what is left once this request is paid for.
         let report = self.usage_report(&shard, request.company_id, request.user_id);
         Ok((Decision::Allowed(access_verdict), Some(report)))
@@ -1458,6 +1514,7 @@ impl RateLimiter {
         }
         written += self.flush_dirty_budget_usage().await;
         written += self.flush_rejections().await;
+        written += self.flush_devices().await;
         if written > 0 {
             // One durable step for the whole flush rather than one per row.
             if let Err(persist_error) = self.store.flush_completed().await {
@@ -1666,6 +1723,84 @@ impl RateLimiter {
             .retain(|key, record| !record.is_clean() || key.time_frame == current_five_minute);
         Ok(())
     }
+
+    /// Writes every changed five-minute device row: the frame's busiest pairs and its refusals.
+    /// A frame a previous process may have written is read and added in first, outside the shard
+    /// lock, so a restart in the middle of a frame does not overwrite the row with a partial one.
+    async fn flush_devices(&self) -> usize {
+        let mut unseeded = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.lock().await;
+            for (&company_id, devices) in &shard.devices {
+                unseeded.extend(devices.unseeded().map(|frame| (company_id, frame)));
+            }
+        }
+        for (company_id, time_frame) in unseeded {
+            let stored = match self.store.load_devices(company_id, time_frame).await {
+                Ok(stored) => stored,
+                Err(load_error) => {
+                    // Left unseeded, so it is retried next flush rather than written partial.
+                    error!(
+                        company_id,
+                        time_frame,
+                        error = %load_error,
+                        "device usage row could not be read before the flush"
+                    );
+                    continue;
+                }
+            };
+            let shard_index = company_id as usize % self.shards.len();
+            let mut shard = self.shards[shard_index].lock().await;
+            if let Some(devices) = shard.devices.get_mut(&company_id) {
+                devices.seed(time_frame, stored);
+            }
+        }
+
+        let mut rows = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.lock().await;
+            for (&company_id, devices) in &shard.devices {
+                rows.extend(
+                    devices
+                        .dirty()
+                        .into_iter()
+                        .map(|(frame, row, version)| (company_id, frame, row, version)),
+                );
+            }
+        }
+        let mut written = 0;
+        for (company_id, time_frame, row, version) in rows {
+            if let Err(flush_error) = self.store.put_devices(company_id, time_frame, row).await {
+                error!(
+                    company_id,
+                    time_frame,
+                    error = %flush_error,
+                    "device usage row remains dirty after failed flush"
+                );
+                continue;
+            }
+            let shard_index = company_id as usize % self.shards.len();
+            let mut shard = self.shards[shard_index].lock().await;
+            if let Some(devices) = shard.devices.get_mut(&company_id) {
+                devices.mark_flushed(time_frame, version);
+            }
+            written += 1;
+        }
+
+        let Ok(current_frame) = current_unix_seconds()
+            .and_then(|unix_seconds| time_frame::five_minute(unix_seconds).map_err(Into::into))
+        else {
+            return written;
+        };
+        let now = Instant::now();
+        for shard in &self.shards {
+            let mut shard = shard.lock().await;
+            shard
+                .devices
+                .retain(|_, devices| !devices.prune(self.policy.windows, current_frame, now));
+        }
+        written
+    }
 }
 
 fn decode_optional(encoded: Option<&[u8]>) -> Result<RoutedCredits> {
@@ -1800,6 +1935,8 @@ mod tests {
         user_reads: AtomicU64,
         /// The rejection counters as added up by every flush, per (company, time frame).
         rejections: StdMutex<HashMap<(i32, i32), Rejections>>,
+        /// The device rows, per (company, time frame), as the last flush wrote them.
+        devices: StdMutex<HashMap<(i32, i32), crate::limiter::devices::StoredDevices>>,
     }
 
     impl MemoryStore {
@@ -1951,6 +2088,32 @@ mod tests {
                 .get(&(company_id, user_id))
                 .cloned())
         }
+
+        async fn load_devices(
+            &self,
+            company_id: i32,
+            time_frame: i32,
+        ) -> Result<Option<crate::limiter::devices::StoredDevices>> {
+            Ok(self
+                .devices
+                .lock()
+                .unwrap()
+                .get(&(company_id, time_frame))
+                .cloned())
+        }
+
+        async fn put_devices(
+            &self,
+            company_id: i32,
+            time_frame: i32,
+            row: crate::limiter::devices::StoredDevices,
+        ) -> Result<()> {
+            self.devices
+                .lock()
+                .unwrap()
+                .insert((company_id, time_frame), row);
+            Ok(())
+        }
     }
 
     fn test_policy(limit: u64) -> LimitPolicy {
@@ -1973,6 +2136,7 @@ mod tests {
             // below 100.
             user_daily_share_pct: 50,
             disable_user_limit: false,
+            devices: Default::default(),
             windows: Windows::default(),
         }
     }
@@ -2712,7 +2876,7 @@ mod tests {
         let now = Instant::now();
 
         let (decision, report) = limiter
-            .judge(read_request(2, false), unix_seconds, now, false)
+            .judge(read_request(2, false), None, unix_seconds, now, false)
             .await
             .unwrap();
         assert_eq!(decision, allowed());
@@ -2730,11 +2894,11 @@ mod tests {
         );
 
         limiter
-            .judge(read_request(2, false), unix_seconds, now, false)
+            .judge(read_request(2, false), None, unix_seconds, now, false)
             .await
             .unwrap();
         let (decision, report) = limiter
-            .judge(read_request(2, false), unix_seconds, now, false)
+            .judge(read_request(2, false), None, unix_seconds, now, false)
             .await
             .unwrap();
         assert_eq!(decision.violation().scope, Scope::User);
@@ -2755,10 +2919,172 @@ mod tests {
             600,
         );
         let (_, report) = company_only
-            .judge(read_request(2, false), unix_seconds, now, false)
+            .judge(read_request(2, false), None, unix_seconds, now, false)
             .await
             .unwrap();
         assert_eq!(report.unwrap().user_day_left, None);
+    }
+
+    const DEVICE_CLOCK: i64 = 1_800_000_000;
+
+    fn device_limiter(short: u32, long: u32) -> (Arc<MemoryStore>, RateLimiter) {
+        let store = Arc::new(MemoryStore::default());
+        store.put_budget(stored_budget(7, DEVICE_CLOCK, 1_000_000, 1_000_000));
+        let policy = LimitPolicy {
+            devices: DeviceLimits { short, long },
+            windows: Windows {
+                short_seconds: 10,
+                long_minutes: 10,
+            },
+            ..test_policy(1_000)
+        };
+        let limiter = RateLimiter::new(1, policy, store.clone(), 600);
+        (store, limiter)
+    }
+
+    fn device(device: i64) -> Option<Client> {
+        Some(Client {
+            ip: std::net::Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped(),
+            device,
+        })
+    }
+
+    /// Past the short cap a new pair is refused, charges nothing and blocks nobody: the pairs
+    /// already admitted keep being served.
+    #[tokio::test]
+    async fn the_device_gate_refuses_a_new_pair_and_keeps_serving_the_known_ones() {
+        let (_, limiter) = device_limiter(2, 5);
+        let now = Instant::now();
+        for signature in [1, 2] {
+            let (decision, _) = limiter
+                .judge(
+                    read_request(3, false),
+                    device(signature),
+                    DEVICE_CLOCK,
+                    now,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(decision, allowed());
+        }
+        let (decision, report) = limiter
+            .judge(read_request(3, false), device(3), DEVICE_CLOCK, now, false)
+            .await
+            .unwrap();
+        let Decision::DeviceViolation(refusal) = decision else {
+            panic!("expected a device refusal, got {decision:?}");
+        };
+        assert_eq!(refusal.window, Window::Short);
+        assert_eq!(refusal.seen, 2);
+        assert_eq!(refusal.retry_after, 11);
+        assert_eq!(report, None);
+
+        // The refusal did not charge and did not block the company.
+        let (decision, report) = limiter
+            .judge(read_request(3, false), device(1), DEVICE_CLOCK, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, allowed());
+        assert_eq!(report.unwrap().company_short_used, 9);
+
+        // Without a client (the TCP path) the gate does not apply at all.
+        let (decision, _) = limiter
+            .judge(read_request(3, false), None, DEVICE_CLOCK, now, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, allowed());
+
+        // Ten seconds on, the short window has room again.
+        let later = now + Duration::from_secs(10);
+        let (decision, _) = limiter
+            .judge(
+                read_request(3, false),
+                device(3),
+                DEVICE_CLOCK + 10,
+                later,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, allowed());
+    }
+
+    /// Shadow mode judges the pair but must not admit it into the set: the backend still decides.
+    #[tokio::test]
+    async fn a_dry_run_admits_no_pair() {
+        let (_, limiter) = device_limiter(1, 1);
+        let now = Instant::now();
+        for signature in [1, 2, 3] {
+            let (decision, _) = limiter
+                .judge(
+                    read_request(1, false),
+                    device(signature),
+                    DEVICE_CLOCK,
+                    now,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(decision, allowed());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_flush_writes_the_busiest_pairs_and_the_refusals_on_top_of_a_stored_row() {
+        let (store, limiter) = device_limiter(3, 3);
+        let frame = time_frame::five_minute(DEVICE_CLOCK).unwrap();
+        // As if a previous process had already written this frame.
+        store.devices.lock().unwrap().insert(
+            (7, frame),
+            crate::limiter::devices::StoredDevices {
+                rejected: 5,
+                distinct: 1,
+                top: vec![(
+                    device(2).unwrap(),
+                    crate::limiter::devices::DeviceUsage {
+                        requests: 10,
+                        cpu: 20,
+                    },
+                )],
+            },
+        );
+        let now = Instant::now();
+        for (signature, requests) in [(1, 3), (2, 1), (3, 2)] {
+            for _ in 0..requests {
+                limiter
+                    .judge(
+                        read_request(4, false),
+                        device(signature),
+                        DEVICE_CLOCK,
+                        now,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let (decision, _) = limiter
+            .judge(read_request(4, false), device(4), DEVICE_CLOCK, now, false)
+            .await
+            .unwrap();
+        assert!(matches!(decision, Decision::DeviceViolation(_)));
+
+        limiter.flush_dirty().await;
+        let row = store.devices.lock().unwrap()[&(7, frame)].clone();
+        assert_eq!(row.rejected, 6);
+        assert_eq!(row.distinct, 3);
+        let ranked: Vec<(i64, u32, u64)> = row
+            .top
+            .iter()
+            .map(|(client, usage)| (client.device, usage.requests, usage.cpu))
+            .collect();
+        assert_eq!(ranked, vec![(2, 11, 24), (1, 3, 12), (3, 2, 8)]);
+
+        // Nothing changed since: a second flush writes nothing, so the stored row is not re-added.
+        store.devices.lock().unwrap().clear();
+        limiter.flush_dirty().await;
+        assert!(store.devices.lock().unwrap().is_empty());
     }
 
     fn windowed_limiter(short: u64, long: u64, windows: Windows) -> RateLimiter {
@@ -2792,13 +3118,13 @@ mod tests {
         let now = Instant::now();
         for _ in 0..2 {
             let (decision, _) = limiter
-                .judge(read_request(2, false), start, now, false)
+                .judge(read_request(2, false), None, start, now, false)
                 .await
                 .unwrap();
             assert_eq!(decision, allowed());
         }
         let (decision, report) = limiter
-            .judge(read_request(2, false), start + 30, now, false)
+            .judge(read_request(2, false), None, start + 30, now, false)
             .await
             .unwrap();
         assert_eq!(decision.violation().window, Window::Long);
@@ -2809,14 +3135,14 @@ mod tests {
         // Still inside the window, the block answers; one second past it, the counter is fresh.
         assert!(matches!(
             limiter
-                .judge(read_request(2, false), start + 599, now, false)
+                .judge(read_request(2, false), None, start + 599, now, false)
                 .await
                 .unwrap()
                 .0,
             Decision::CreditViolation(_)
         ));
         let (decision, report) = limiter
-            .judge(read_request(2, false), start + 600, now, false)
+            .judge(read_request(2, false), None, start + 600, now, false)
             .await
             .unwrap();
         assert_eq!(decision, allowed());
@@ -2834,12 +3160,12 @@ mod tests {
         let unix_seconds = 1_800_000_000;
         let now = Instant::now();
         let (decision, _) = limiter
-            .judge(read_request(3, false), unix_seconds, now, false)
+            .judge(read_request(3, false), None, unix_seconds, now, false)
             .await
             .unwrap();
         assert_eq!(decision, allowed());
         let (decision, report) = limiter
-            .judge(read_request(1, false), unix_seconds, now, false)
+            .judge(read_request(1, false), None, unix_seconds, now, false)
             .await
             .unwrap();
         assert_eq!(decision.violation().window, Window::Short);
@@ -2848,7 +3174,13 @@ mod tests {
 
         let later = now + Duration::from_secs(10);
         let (decision, _) = limiter
-            .judge(read_request(1, false), unix_seconds + 10, later, false)
+            .judge(
+                read_request(1, false),
+                None,
+                unix_seconds + 10,
+                later,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(decision, allowed());
@@ -2883,6 +3215,7 @@ mod tests {
     fn company_only_policy(limit: u64) -> LimitPolicy {
         LimitPolicy {
             disable_user_limit: true,
+            devices: Default::default(),
             windows: Windows::default(),
             ..test_policy(limit)
         }

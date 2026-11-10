@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use crate::limiter::aggregation::UsageKey;
 use crate::limiter::block::Rejections;
+use crate::limiter::devices::StoredDevices;
 use crate::limiter::storage::{
     AccessSource, LimiterStore, StoredBudget, StoredBudgetRow, StoredBudgetUsage, StoredUsage,
     StoredUserAccess,
@@ -117,6 +118,29 @@ impl LimiterStore for StoreBackend {
         user_id: i32,
     ) -> Result<Option<StoredUserAccess>> {
         self.access.load_user_access(company_id, user_id).await
+    }
+
+    async fn load_devices(
+        &self,
+        company_id: i32,
+        time_frame: i32,
+    ) -> Result<Option<StoredDevices>> {
+        blocking(&self.store, move |store| {
+            store.devices(company_id, time_frame)
+        })
+        .await
+    }
+
+    async fn put_devices(
+        &self,
+        company_id: i32,
+        time_frame: i32,
+        row: StoredDevices,
+    ) -> Result<()> {
+        blocking(&self.store, move |store| {
+            store.put_devices(company_id, time_frame, &row)
+        })
+        .await
     }
 
     async fn flush_completed(&self) -> Result<()> {

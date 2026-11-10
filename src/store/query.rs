@@ -13,6 +13,7 @@
 //! | 3 every company's usage | frames | `[company:i32][frame:i32][len:u32][usage_company value]` |
 //! | 4 budgets | company (0 = every company) | `[company:i32][budget value]` |
 //! | 5 server metrics | `first`/`last` as `date << 16 \| slot` | `[date:i16][slot:i16][server_metrics value]` |
+//! | 6 device usage | company (0 = every company), five-minute frames | `[company:i32][frame:i32][len:u32][usage_device value]` |
 //!
 //! Company 0 is a real company in kind 1: the platform-wide aggregate lives under it.
 
@@ -72,6 +73,11 @@ pub enum ReportQuery {
     ServerMetrics {
         first: (i16, i16),
         last: (i16, i16),
+    },
+    DeviceUsage {
+        company_id: Option<i32>,
+        first: i32,
+        last: i32,
     },
 }
 
@@ -141,6 +147,14 @@ pub fn parse_report_query(payload: &[u8]) -> Result<ReportQuery, QueryProtocolEr
                 _ => return Err(QueryProtocolError::InvalidRange(frame.first, frame.last)),
             }
         }
+        6 => {
+            let (first, last) = frames()?;
+            ReportQuery::DeviceUsage {
+                company_id: optional(frame.company_id),
+                first,
+                last,
+            }
+        }
         kind => return Err(QueryProtocolError::UnknownKind(kind)),
     })
 }
@@ -153,6 +167,7 @@ impl ReportQuery {
             Self::EveryCompanyUsage { .. } => 3,
             Self::Budgets { .. } => 4,
             Self::ServerMetrics { .. } => 5,
+            Self::DeviceUsage { .. } => 6,
         }
     }
 
@@ -221,6 +236,27 @@ impl ReportQuery {
                         row.extend_from_slice(&date.to_be_bytes());
                         row.extend_from_slice(&slot.to_be_bytes());
                         row.extend_from_slice(&crate::store::codec::encode_metrics(&sample));
+                    })?;
+                }
+            }
+            Self::DeviceUsage {
+                company_id,
+                first,
+                last,
+            } => {
+                let rows = match company_id {
+                    Some(company_id) => store
+                        .company_devices(company_id, first, last)?
+                        .into_iter()
+                        .map(|(frame, value)| (company_id, frame, value))
+                        .collect(),
+                    None => store.every_company_devices(first, last)?,
+                };
+                for (company_id, frame, value) in rows {
+                    body.row(|row| {
+                        row.extend_from_slice(&company_id.to_be_bytes());
+                        row.extend_from_slice(&frame.to_be_bytes());
+                        put_value(row, &value);
                     })?;
                 }
             }
@@ -371,6 +407,65 @@ mod tests {
                 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 4, 1, 2,
             ]
         );
+    }
+
+    #[test]
+    fn a_device_report_carries_each_company_frame_row_verbatim() {
+        use crate::limiter::devices::{Client, DeviceUsage, StoredDevices};
+        let (_directory, store) = temporary_store();
+        let row = |device| StoredDevices {
+            rejected: 2,
+            distinct: 1,
+            top: vec![(
+                Client {
+                    ip: std::net::Ipv6Addr::LOCALHOST,
+                    device,
+                },
+                DeviceUsage {
+                    requests: 3,
+                    cpu: 9,
+                },
+            )],
+        };
+        store.put_devices(7, 100_000_010, &row(1)).unwrap();
+        store.put_devices(7, 100_000_099, &row(2)).unwrap(); // outside the range
+        store.put_devices(9, 100_000_011, &row(3)).unwrap();
+
+        assert_eq!(
+            parse_report_query(&frame(6, 0, 0, 100_000_000, 100_000_047)),
+            Ok(ReportQuery::DeviceUsage {
+                company_id: None,
+                first: 100_000_000,
+                last: 100_000_047
+            })
+        );
+        let every = ReportQuery::DeviceUsage {
+            company_id: None,
+            first: 100_000_000,
+            last: 100_000_047,
+        }
+        .answer(&store)
+        .unwrap();
+        let value = crate::store::codec::encode_devices(&row(1));
+        let mut expected = vec![6, 0, 0, 0, 2];
+        expected.extend_from_slice(&7_i32.to_be_bytes());
+        expected.extend_from_slice(&100_000_010_i32.to_be_bytes());
+        expected.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&value);
+        assert_eq!(&every[..expected.len()], expected.as_slice());
+        assert_eq!(
+            &every[expected.len()..expected.len() + 4],
+            9_i32.to_be_bytes()
+        );
+
+        let one = ReportQuery::DeviceUsage {
+            company_id: Some(9),
+            first: 100_000_000,
+            last: 100_000_047,
+        }
+        .answer(&store)
+        .unwrap();
+        assert_eq!(&one[..5], [6, 0, 0, 0, 1]);
     }
 
     #[test]

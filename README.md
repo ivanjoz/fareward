@@ -72,6 +72,7 @@ report opcode (below) and no longer has tables for them. Pure binary, company-fi
 |---|---|---|
 | `usage_company` | company, time_frame | version, `rejected_short`, `rejected_long`, `rejected_no_funds` (u32 each), the credits blob |
 | `usage_user` | company, user, time_frame | version, the credits blob |
+| `usage_device` | company, five-minute time_frame | version, `rejected` (u32), the frame's 12 busiest (IP, device) pairs by requests: IP (16 bytes, IPv4 mapped), device (i64), requests (u32), CPU (u64) |
 | `budget` | company | version, the entitlement and the usage counters, fixed 111 bytes |
 | `server_metrics` | date, slot | metrics version (2), fourteen i16 columns (v1 rows: eleven) |
 | `grants` | company, user | version, status, the grants blob, the sub-grants blob — as last pushed |
@@ -278,6 +279,16 @@ the reference material it ties together.
 - Counts every company refusal by cause, in the five-minute frame and in the day: `rejected_short` and
   `rejected_long` (abuse) and `rejected_no_funds` (day, month or an extra pool that could not pay).
   Counts only, not a request log.
+- On the SPOE path only, caps the distinct **(IP, device) pairs** one company may use per short and
+  per long window (`rate_limit.max_devices_short` / `max_devices_long`, 0 = no cap). The device is
+  the browser signature appended to the session token (`Bearer <token>.<signature>`, an int64 in
+  decimal; the layout is in [DEVICE_SIGNATURE.md](DEVICE_SIGNATURE.md)). The windows slide: a pair
+  already served inside a window passes again freely, and a new one is refused once the window holds
+  the cap. That is aimed at a caller rotating its signature or address: each rotation is a new pair,
+  the company runs out of them, and the rotating caller is refused while the pairs already admitted
+  keep working. A refused pair never enters the set, so the set cannot grow past the cap. The refusal
+  charges nothing and blocks nothing. Each five-minute frame's 12 busiest pairs and the refusal count
+  are flushed to `usage_device`; the rest stays in memory only.
 - Requires an explicitly activated current month; a new one stays blocked until `SET_CURRENT`. The
   month is the **local business month** (UTC-5), the same boundary the daily frames use — not the UTC
   month.
@@ -313,9 +324,16 @@ one keeps the previous table. A missing or invalid table at startup fails the st
 | Variable | Meaning |
 |---|---|
 | `status` | `0` go on; otherwise the HTTP status to answer (the backend's own: 400, 401, 403, 429, 500, 503; plus 411 for a charged write without Content-Length and 413 for a write whose charge overflows) |
-| `reason` | for the access log: `public`, `session`, `granted`, `operator`, `token`, `route`, `policy`, `no-access`, `identity`, `credit`, `unavailable` |
+| `reason` | for the access log: `public`, `session`, `granted`, `operator`, `token`, `route`, `policy`, `no-access`, `identity`, `credit`, `devices`, `unavailable` |
 | `company`, `user`, `route` | who was admitted, for which route |
 | `grant` | the granted slots and sub-accesses, the TCP reply's tail: `[mask][has_subs][len][bytes]` |
+| `window`, `spent`, `refused`, `retry` | on a credit refusal: the 429 page's figures and `Retry-After` |
+| `window`, `devices`, `retry` | on a device refusal (reason codes 13/14): the distinct pairs the company already used in the window; HAProxy picks the device page by whether `devices` is set |
+
+HAProxy sends `method`, `path`, `auth`, `length` and `ip` (`src`). Without `ip` the device gate is
+skipped. The token in `auth` may end in `.<signature>`: the agent and the bridge both ignore the
+suffix when they verify the token, **and so must the Go backend**. It sees the same `Authorization`
+header, and it has to cut the token at its first `.` (the token's alphabet has none) before decoding it.
 
 On an admitted request HAProxy forwards these as `x-fareward-admitted`, `-company`, `-user`, `-route`
 and `-grant` (hex), after deleting any the client sent. A backend with
@@ -396,6 +414,12 @@ user_inference_long     = 5000
 # Optional. true limits by company only: the user_* ceilings and user_daily_share_pct stop
 # applying (they are still required and validated). Default false.
 disable_user_limit    = false
+
+# Optional. Distinct (IP, device) pairs one company may use per short / long window, judged on
+# the SPOE path only. 0 (the default) means that window is not capped; the long cap may not be
+# smaller than the short one.
+max_devices_short     = 5
+max_devices_long      = 30
 ```
 
 The eight short/long ceilings are the only settings here with no built-in default: a guessed quota

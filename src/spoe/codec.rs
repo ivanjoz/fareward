@@ -96,6 +96,15 @@ impl TypedData {
         }
     }
 
+    /// An address of either family, IPv4 mapped into IPv6 so both share one key.
+    pub fn as_ip(&self) -> Option<Ipv6Addr> {
+        match *self {
+            TypedData::Ipv4(address) => Some(address.to_ipv6_mapped()),
+            TypedData::Ipv6(address) => Some(address),
+            _ => None,
+        }
+    }
+
     /// Any non-negative integer, whatever its declared width.
     pub fn as_u64(&self) -> Option<u64> {
         match *self {

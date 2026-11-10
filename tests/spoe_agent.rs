@@ -14,6 +14,7 @@ use fareward::{
         aggregation::UsageKey,
         block::Rejections,
         credits_blob::Credits,
+        devices::DeviceLimits,
         quota::{CreditLimits, LimitPolicy, RateLimiter, ScopeLimits, Windows},
         storage::{
             LimiterStore, StoredBudget, StoredBudgetRow, StoredBudgetUsage, StoredUsage,
@@ -147,13 +148,17 @@ struct TestAgent {
 }
 
 async fn start_agent(name: &str, burst: u64) -> TestAgent {
+    start_agent_with_devices(name, burst, DeviceLimits::default()).await
+}
+
+async fn start_agent_with_devices(name: &str, burst: u64, devices: DeviceLimits) -> TestAgent {
     let dir = std::env::temp_dir().join(format!("fareward-spoe-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    start_agent_in(dir, burst).await
+    start_agent_in(dir, burst, devices).await
 }
 
-async fn start_agent_in(dir: PathBuf, burst: u64) -> TestAgent {
+async fn start_agent_in(dir: PathBuf, burst: u64, devices: DeviceLimits) -> TestAgent {
     let routes_path = dir.join("routes.toml");
     std::fs::write(&routes_path, ROUTES).unwrap();
     let socket = dir.join("spoe.sock");
@@ -176,6 +181,7 @@ async fn start_agent_in(dir: PathBuf, burst: u64) -> TestAgent {
             company_extra_daily_cpu: 0,
             user_daily_share_pct: 100,
             disable_user_limit: true,
+            devices,
             windows: Windows::default(),
         },
         Arc::new(GrantStore),
@@ -238,6 +244,18 @@ fn check(
     auth: Option<&str>,
     length: Option<i64>,
 ) -> Vec<u8> {
+    check_from(stream_id, method, path, auth, length, TypedData::Null)
+}
+
+/// `check` with HAProxy's `src`, what the device gate needs.
+fn check_from(
+    stream_id: u64,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    length: Option<i64>,
+    ip: TypedData,
+) -> Vec<u8> {
     let mut payload = Vec::new();
     put_string(&mut payload, "fareward-check");
     let args = [
@@ -248,6 +266,7 @@ fn check(
             auth.map_or(TypedData::Null, |auth| TypedData::String(auth.into())),
         ),
         ("length", length.map_or(TypedData::Null, TypedData::Int64)),
+        ("ip", ip),
     ];
     payload.push(args.len() as u8);
     for (key, value) in args {
@@ -533,8 +552,69 @@ async fn a_credit_refusal_carries_what_the_429_page_says() {
     }
 }
 
+/// A third signature from the same address, inside ten seconds, is a third pair: 429 with the
+/// device variables instead of the credit ones. The first two keep being served, and a request
+/// without `ip` (an HAProxy that does not send it) is not judged by the gate at all.
+#[tokio::test]
+async fn a_company_out_of_device_pairs_is_refused_with_its_own_429() {
+    let agent =
+        start_agent_with_devices("devices", 1_000, DeviceLimits { short: 2, long: 3 }).await;
+    let mut stream = connect(&agent).await;
+    let office = TypedData::Ipv4(std::net::Ipv4Addr::new(200, 48, 1, 9));
+    let mut stream_id = 0;
+    let mut send = async |signature: &str, ip: TypedData| {
+        stream_id += 2;
+        let bearer = format!("Bearer {SESSION_TOKEN}.{signature}");
+        ask(
+            &mut stream,
+            check_from(stream_id, "GET", "/api/productos", Some(&bearer), None, ip),
+            stream_id,
+        )
+        .await
+    };
+
+    for signature in ["101", "102"] {
+        assert_eq!(
+            var(&send(signature, office.clone()).await, "status"),
+            &TypedData::Int32(0)
+        );
+    }
+    let refused = send("103", office.clone()).await;
+    assert_eq!(var(&refused, "status"), &TypedData::Int32(429));
+    assert_eq!(
+        var(&refused, "reason"),
+        &TypedData::String("devices".into())
+    );
+    assert_eq!(var(&refused, "devices"), &TypedData::Int32(2));
+    assert_eq!(
+        var(&refused, "window"),
+        &TypedData::String("en los últimos 10 segundos".into())
+    );
+    assert!(matches!(var(&refused, "retry"), TypedData::Int32(1..=11)));
+    assert!(refused.iter().all(|(name, _)| name != "spent"));
+    assert_eq!(usage(&refused)[3], "13");
+
+    // The same signature from another address is another pair, refused too.
+    let elsewhere = TypedData::Ipv6(std::net::Ipv6Addr::LOCALHOST);
+    assert_eq!(
+        var(&send("101", elsewhere).await, "status"),
+        &TypedData::Int32(429)
+    );
+    // The pairs already admitted are still served.
+    assert_eq!(
+        var(&send("102", office.clone()).await, "status"),
+        &TypedData::Int32(0)
+    );
+    // No `ip`, no gate.
+    assert_eq!(
+        var(&send("104", TypedData::Null).await, "status"),
+        &TypedData::Int32(0)
+    );
+}
+
 /// Serves the agent on `$FAREWARD_SPOE_E2E_DIR/spoe.sock` for `$FAREWARD_SPOE_E2E_SECONDS`, so a
-/// real HAProxy can be pointed at it (deploy/haproxy/, phase 0 of the plan). Burst of ten credits.
+/// real HAProxy can be pointed at it (deploy/haproxy/, phase 0 of the plan). Burst of ten credits,
+/// and two (IP, device) pairs per ten seconds, so a third signature shows the device page.
 #[tokio::test]
 #[ignore = "serves a real HAProxy; run by hand"]
 async fn serve_for_a_real_haproxy() {
@@ -543,7 +623,7 @@ async fn serve_for_a_real_haproxy() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(60);
-    let agent = start_agent_in(dir, 10).await;
+    let agent = start_agent_in(dir, 10, DeviceLimits { short: 2, long: 4 }).await;
     // HAProxy in a container connects as another uid: open the socket to it for the test only.
     std::fs::set_permissions(
         &agent.socket,

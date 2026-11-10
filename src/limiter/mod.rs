@@ -21,6 +21,7 @@ pub mod aggregation;
 pub mod block;
 pub mod budget;
 pub mod credits_blob;
+pub mod devices;
 pub mod protocol;
 pub mod quota;
 pub mod storage;

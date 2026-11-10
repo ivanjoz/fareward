@@ -6,8 +6,10 @@
 //! backend would have made over TCP.
 //!
 //! HAProxy sends the message `fareward-check` with `method`, `path`, `auth` (the Authorization
-//! header) and `length` (Content-Length, absent when the request has none). The agent sets, in the
-//! transaction scope (`txn.<engine-id>.<name>`):
+//! header), `length` (Content-Length, absent when the request has none) and `ip` (`src`, the
+//! client address). `auth` may carry the browser's device signature after the token,
+//! `Bearer <token>.<signature>` in decimal; with `ip` it names the pair the device gate counts
+//! (`limiter::devices`). The agent sets, in the transaction scope (`txn.<engine-id>.<name>`):
 //!
 //! | Variable  | Type   | Meaning |
 //! |-----------|--------|---------|
@@ -30,8 +32,13 @@
 //! `Retry-After`: `window` (string, the refusing window worded for the sentence), `spent` (int64,
 //! credits spent in that window), `refused` (int32, requests refused since the block began) and
 //! `retry` (int32, seconds to wait, with a one-second margin).
+//!
+//! On a device refusal (`reason` = `devices`, reason codes 13/14) the variables are `window`,
+//! `devices` (int32, distinct pairs the company already used in that window) and `retry`; HAProxy
+//! tells the two 429 pages apart by whether `devices` is set.
 
 use std::{
+    net::Ipv6Addr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -48,10 +55,11 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    bridge::auth::authenticate_user,
+    bridge::auth::{authenticate_user, device_signature},
     limiter::{
         access::{AccessDenial, AccessVerdict},
         credits_blob::Credits,
+        devices::{Client, DeviceViolation},
         protocol::{LimitViolation, Scope, Window},
         quota::{Decision, RateLimiter, UsageReport, Windows},
     },
@@ -107,6 +115,8 @@ pub struct Verdict {
     pub violation: Option<LimitViolation>,
     /// The limiter's figures for the usage header, when the limiter read any.
     pub usage: Option<UsageReport>,
+    /// The device gate's refusal: the company is out of distinct (IP, device) pairs.
+    pub devices: Option<DeviceViolation>,
 }
 
 impl Verdict {
@@ -120,16 +130,24 @@ impl Verdict {
             grant: None,
             violation: None,
             usage: None,
+            devices: None,
         }
     }
 
     /// The numeric reason the client sees, stable across releases: 0 let through, 1 bad or missing
     /// token, 2 unknown or inactive user, 3 no access, 4 route or route policy, 5/6 company over its
     /// short/long-window credits, 7/8 user over its short/long-window credits, 9/10 company/user out of
-    /// daily credits, 11 company over its monthly ceiling, 12 limiter unavailable.
+    /// daily credits, 11 company over its monthly ceiling, 12 limiter unavailable, 13/14 company out of
+    /// distinct (IP, device) pairs in the short/long window.
     pub fn reason_code(&self) -> u8 {
         if self.status == 0 {
             return 0;
+        }
+        if let Some(devices) = self.devices {
+            return match devices.window {
+                Window::Short => 13,
+                _ => 14,
+            };
         }
         if let Some(violation) = self.violation {
             return match (violation.scope, violation.window) {
@@ -176,13 +194,30 @@ impl Verdict {
     /// already worded for the sentence), the credits it had spent (`spent`), the requests refused
     /// since the block began (`refused`, this one counting) and the seconds to wait (`retry`).
     fn refusal_vars(&self, windows: Windows) -> Vec<(VarScope, &'static str, TypedData)> {
+        let int32 = |value: u64| TypedData::Int32(i32::try_from(value).unwrap_or(i32::MAX));
+        // A device refusal has its own page: `devices` (pairs already used in the window) instead
+        // of `spent` and `refused`, which describe credits.
+        if let Some(devices) = self.devices {
+            return vec![
+                (
+                    VarScope::Transaction,
+                    "window",
+                    TypedData::String(windows.describe(devices.window)),
+                ),
+                (
+                    VarScope::Transaction,
+                    "devices",
+                    int32(u64::from(devices.seen)),
+                ),
+                (VarScope::Transaction, "retry", int32(devices.retry_after)),
+            ];
+        }
         let (Some(violation), Some(usage)) = (self.violation, self.usage) else {
             return Vec::new();
         };
         let Some(retry_after) = usage.retry_after else {
             return Vec::new();
         };
-        let int32 = |value: u64| TypedData::Int32(i32::try_from(value).unwrap_or(i32::MAX));
         vec![
             (
                 VarScope::Transaction,
@@ -271,12 +306,17 @@ impl Agent {
     }
 
     /// The backend's gate, replayed: route, session, route policy, then the limiter.
+    ///
+    /// `client_ip` is HAProxy's `src`. With it, the request is judged by the device gate as the pair
+    /// of that address and the signature appended to the token; without it (an HAProxy that does
+    /// not send `ip`) the gate is skipped.
     pub async fn decide(
         &self,
         method: &str,
         path: &str,
         authorization: Option<&str>,
         content_length: Option<u64>,
+        client_ip: Option<Ipv6Addr>,
     ) -> Verdict {
         let table = self.routes.current();
         let entry = match table.lookup(method, path) {
@@ -308,7 +348,12 @@ impl Agent {
             grant: None,
             violation: None,
             usage: None,
+            devices: None,
         };
+        let client = client_ip.map(|ip| Client {
+            ip,
+            device: device_signature(authorization),
+        });
 
         let request = match table.admission(entry, user.company_id, user.id, content_length) {
             Admission::Refuse(refusal) => return identified(refusal.status(), "policy"),
@@ -320,7 +365,7 @@ impl Agent {
 
         // The figures come from this first call, the one that judged the credits: the operator's
         // access-only retry below charges nothing and would only repeat them.
-        let (decision, usage) = match self.ask(request).await {
+        let (decision, usage) = match self.ask(request, client).await {
             Ok((decision, usage)) => (Ok(decision), usage),
             Err(limiter_error) => (Err(limiter_error), None),
         };
@@ -345,7 +390,11 @@ impl Agent {
                 if !access_only.requests_authorization() {
                     identified(0, "operator")
                 } else {
-                    match self.ask(access_only).await.map(|(decision, _)| decision) {
+                    match self
+                        .ask(access_only, client)
+                        .await
+                        .map(|(decision, _)| decision)
+                    {
                         Ok(Decision::Allowed(grant)) => Verdict {
                             grant: Some(grant),
                             ..identified(0, "operator")
@@ -358,6 +407,10 @@ impl Agent {
                             violation: Some(violation),
                             ..identified(429, "credit")
                         },
+                        Ok(Decision::DeviceViolation(devices)) => Verdict {
+                            devices: Some(devices),
+                            ..identified(429, "devices")
+                        },
                         Err(_) => identified(503, "unavailable"),
                     }
                 }
@@ -365,6 +418,12 @@ impl Agent {
             Ok(Decision::CreditViolation(violation)) => Verdict {
                 violation: Some(violation),
                 ..identified(429, "credit")
+            },
+            // Not tolerated for the operator: the device cap is not a budget but a guard against
+            // a caller rotating its address or signature.
+            Ok(Decision::DeviceViolation(devices)) => Verdict {
+                devices: Some(devices),
+                ..identified(429, "devices")
             },
             Err(limiter_error) => {
                 warn!(error = %limiter_error, "spoe: limiter unavailable, failing closed");
@@ -382,11 +441,12 @@ impl Agent {
     async fn ask(
         &self,
         request: crate::limiter::protocol::Request,
+        client: Option<Client>,
     ) -> Result<(Decision, Option<UsageReport>)> {
         if self.limits.shadow {
-            Ok((self.limiter.evaluate(request).await?, None))
+            Ok((self.limiter.evaluate(request, client).await?, None))
         } else {
-            self.limiter.admit_reported(request).await
+            self.limiter.admit_reported(request, client).await
         }
     }
 
@@ -401,6 +461,7 @@ impl Agent {
                     path,
                     message.arg("auth").and_then(TypedData::as_str),
                     message.arg("length").and_then(TypedData::as_u64),
+                    message.arg("ip").and_then(TypedData::as_ip),
                 )
                 .await
             }
