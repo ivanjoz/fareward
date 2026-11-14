@@ -4,7 +4,7 @@
 //! by design (the client resynchronizes through the normal API).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -40,6 +40,9 @@ pub enum SendFrameError {
 /// split one tab into two registry entries.
 pub struct ClientChannel {
     pub key: String,
+    /// The topics this stream subscribed to when it opened. Fixed for the stream's life: a
+    /// tab that needs other topics opens a new stream, which replaces this one.
+    pub topics: Vec<String>,
     /// Compact JSON payloads, not framed SSE text: the HTTP layer wraps each one in its
     /// `data:` frame. Dropping every sender is what ends the stream — the receiver first
     /// drains whatever is still queued (notably the "replaced" notice), so a client always
@@ -51,11 +54,12 @@ pub struct ClientChannel {
 }
 
 impl ClientChannel {
-    fn new(key: String) -> (Arc<Self>, mpsc::Receiver<String>) {
+    fn new(key: String, topics: Vec<String>) -> (Arc<Self>, mpsc::Receiver<String>) {
         let (frame_sender, frame_receiver) = mpsc::channel(OUTBOUND_QUEUE_SIZE);
         let (closed_sender, _) = watch::channel(false);
         let channel = Arc::new(Self {
             key,
+            topics,
             frame_sender,
             closed_sender,
             pending_replies: Mutex::new(HashMap::new()),
@@ -107,10 +111,11 @@ impl ClientChannel {
         }
     }
 
-    /// Queues a payload without waiting. Used for the eviction notice, which must not block
-    /// the incoming connection that triggered it.
-    fn try_send_payload(&self, payload: &str) {
-        let _ = self.frame_sender.try_send(payload.to_owned());
+    /// Queues a payload without waiting; false when the queue is full or the stream gone. Used
+    /// for the eviction notice, which must not block the incoming connection that triggered
+    /// it, and for topic fan-out, where one wedged tab must not hold up the others.
+    fn try_send_payload(&self, payload: &str) -> bool {
+        self.frame_sender.try_send(payload.to_owned()).is_ok()
     }
 
     /// Registers a waiter for a command id and returns where its reply will arrive.
@@ -157,6 +162,31 @@ impl ClientChannel {
 struct RegistryState {
     channels: HashMap<String, Arc<ClientChannel>>,
     arrival_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+    /// topic → keys of the installed channels subscribed to it. Kept in step with `channels`
+    /// under the same lock, so a topic never names a channel that is no longer installed.
+    topic_subscribers: HashMap<String, HashSet<String>>,
+}
+
+impl RegistryState {
+    fn subscribe_topics(&mut self, channel: &ClientChannel) {
+        for topic in &channel.topics {
+            self.topic_subscribers
+                .entry(topic.clone())
+                .or_default()
+                .insert(channel.key.clone());
+        }
+    }
+
+    fn unsubscribe_topics(&mut self, channel: &ClientChannel) {
+        for topic in &channel.topics {
+            if let Some(subscriber_keys) = self.topic_subscribers.get_mut(topic) {
+                subscriber_keys.remove(&channel.key);
+                if subscriber_keys.is_empty() {
+                    self.topic_subscribers.remove(topic);
+                }
+            }
+        }
+    }
 }
 
 /// Maps channel keys to connected tabs and lets a publisher wait for one that is still
@@ -176,12 +206,20 @@ impl ChannelRegistry {
     /// Last-connection-wins: the evicted stream is told why it is ending, so a duplicated tab
     /// (which clones sessionStorage and inherits the tab id) can mint a new id instead of the
     /// two endlessly kicking each other off.
-    pub async fn open_channel(&self, key: &str) -> (Arc<ClientChannel>, mpsc::Receiver<String>) {
-        let (channel, frame_receiver) = ClientChannel::new(key.to_owned());
+    pub async fn open_channel(
+        &self,
+        key: &str,
+        topics: Vec<String>,
+    ) -> (Arc<ClientChannel>, mpsc::Receiver<String>) {
+        let (channel, frame_receiver) = ClientChannel::new(key.to_owned(), topics);
 
         let (previous_channel, waiters_to_wake) = {
             let mut state = self.state.write().await;
             let previous_channel = state.channels.insert(key.to_owned(), channel.clone());
+            if let Some(previous_channel) = &previous_channel {
+                state.unsubscribe_topics(previous_channel);
+            }
+            state.subscribe_topics(&channel);
             let waiters_to_wake = state.arrival_waiters.remove(key).unwrap_or_default();
             (previous_channel, waiters_to_wake)
         };
@@ -211,6 +249,7 @@ impl ChannelRegistry {
                 .is_some_and(|installed| Arc::ptr_eq(installed, channel))
             {
                 state.channels.remove(&channel.key);
+                state.unsubscribe_topics(channel);
             }
         }
         channel.close();
@@ -232,6 +271,29 @@ impl ChannelRegistry {
 
     pub async fn connected_channel_count(&self) -> usize {
         self.state.read().await.channels.len()
+    }
+
+    /// Fans one message out to every tab subscribed to `topic` and returns how many queued it.
+    ///
+    /// Non-blocking per tab: a topic message is a nudge ("something changed, refetch"), so a
+    /// tab whose queue is full simply misses it and catches up on its fallback poll, instead
+    /// of a wedged tab stalling the publisher for every other subscriber.
+    pub async fn publish_topic(&self, topic: &str, message: &serde_json::Value) -> usize {
+        let subscribers: Vec<Arc<ClientChannel>> = {
+            let state = self.state.read().await;
+            state
+                .topic_subscribers
+                .get(topic)
+                .into_iter()
+                .flatten()
+                .filter_map(|key| state.channels.get(key).cloned())
+                .collect()
+        };
+        let payload = message.to_string();
+        subscribers
+            .iter()
+            .filter(|channel| channel.try_send_payload(&payload))
+            .count()
     }
 
     /// Returns the channel for `key`, waiting up to `max_wait` for it to connect.
@@ -297,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn a_published_frame_reaches_the_connected_tab() {
         let registry = ChannelRegistry::new();
-        let (channel, mut frames) = registry.open_channel(TEST_KEY).await;
+        let (channel, mut frames) = registry.open_channel(TEST_KEY, vec![]).await;
 
         channel
             .send_frame(&serde_json::json!({ "Type": "agentStatus" }))
@@ -309,8 +371,8 @@ mod tests {
     #[tokio::test]
     async fn a_reconnect_replaces_the_previous_stream_and_tells_it_why() {
         let registry = ChannelRegistry::new();
-        let (first_channel, mut first_frames) = registry.open_channel(TEST_KEY).await;
-        let (second_channel, mut second_frames) = registry.open_channel(TEST_KEY).await;
+        let (first_channel, mut first_frames) = registry.open_channel(TEST_KEY, vec![]).await;
+        let (second_channel, mut second_frames) = registry.open_channel(TEST_KEY, vec![]).await;
 
         // The evicted stream learns why it ended, then its stream terminates.
         assert_eq!(
@@ -338,8 +400,8 @@ mod tests {
     #[tokio::test]
     async fn a_late_close_does_not_evict_the_successor() {
         let registry = ChannelRegistry::new();
-        let (first_channel, _first_frames) = registry.open_channel(TEST_KEY).await;
-        let (second_channel, _second_frames) = registry.open_channel(TEST_KEY).await;
+        let (first_channel, _first_frames) = registry.open_channel(TEST_KEY, vec![]).await;
+        let (second_channel, _second_frames) = registry.open_channel(TEST_KEY, vec![]).await;
 
         registry.close_channel(&first_channel).await;
 
@@ -351,9 +413,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_topic_message_reaches_every_subscriber_and_nobody_else() {
+        let registry = ChannelRegistry::new();
+        let floor_topic = "dining.7.3".to_owned();
+        let (_waiter_channel, mut waiter_frames) = registry
+            .open_channel("waiter-tab", vec![floor_topic.clone()])
+            .await;
+        let (_kitchen_channel, mut kitchen_frames) = registry
+            .open_channel("kitchen-tab", vec![floor_topic.clone()])
+            .await;
+        let (_other_channel, mut other_frames) = registry
+            .open_channel("other-tab", vec!["dining.7.4".to_owned()])
+            .await;
+
+        let delivered = registry
+            .publish_topic(&floor_topic, &serde_json::json!({ "Type": "dining" }))
+            .await;
+
+        assert_eq!(delivered, 2);
+        assert_eq!(waiter_frames.recv().await.unwrap(), "{\"Type\":\"dining\"}");
+        assert_eq!(
+            kitchen_frames.recv().await.unwrap(),
+            "{\"Type\":\"dining\"}"
+        );
+        assert!(other_frames.try_recv().is_err());
+        assert_eq!(
+            registry
+                .publish_topic("dining.7.9", &serde_json::json!({}))
+                .await,
+            0
+        );
+    }
+
+    /// A replaced or closed stream leaves its topics, so the registry only routes to live tabs
+    /// and an emptied topic does not linger.
+    #[tokio::test]
+    async fn replacing_or_closing_a_stream_moves_its_subscriptions() {
+        let registry = ChannelRegistry::new();
+        let (_first_channel, _first_frames) = registry
+            .open_channel(TEST_KEY, vec!["dining.7.3".to_owned()])
+            .await;
+        let (second_channel, mut second_frames) = registry
+            .open_channel(TEST_KEY, vec!["dining.7.4".to_owned()])
+            .await;
+
+        assert_eq!(
+            registry
+                .publish_topic("dining.7.3", &serde_json::json!({}))
+                .await,
+            0
+        );
+        assert_eq!(
+            registry
+                .publish_topic("dining.7.4", &serde_json::json!({}))
+                .await,
+            1
+        );
+        assert_eq!(second_frames.recv().await.unwrap(), "{}");
+
+        registry.close_channel(&second_channel).await;
+        assert_eq!(
+            registry
+                .publish_topic("dining.7.4", &serde_json::json!({}))
+                .await,
+            0
+        );
+        assert!(registry.state.read().await.topic_subscribers.is_empty());
+    }
+
+    /// A late close of a replaced stream must not unsubscribe its successor from a shared topic.
+    #[tokio::test]
+    async fn a_late_close_keeps_the_successor_subscribed() {
+        let registry = ChannelRegistry::new();
+        let floor_topic = vec!["dining.7.3".to_owned()];
+        let (first_channel, _first_frames) =
+            registry.open_channel(TEST_KEY, floor_topic.clone()).await;
+        let (_second_channel, _second_frames) = registry.open_channel(TEST_KEY, floor_topic).await;
+
+        registry.close_channel(&first_channel).await;
+
+        assert_eq!(
+            registry
+                .publish_topic("dining.7.3", &serde_json::json!({}))
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn a_reply_is_correlated_by_command_id() {
         let registry = ChannelRegistry::new();
-        let (channel, _frames) = registry.open_channel(TEST_KEY).await;
+        let (channel, _frames) = registry.open_channel(TEST_KEY, vec![]).await;
 
         let reply_receiver = channel.await_reply(9).await;
         assert!(
@@ -376,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_nobody_waits_for_is_reported_undelivered() {
         let registry = ChannelRegistry::new();
-        let (channel, _frames) = registry.open_channel(TEST_KEY).await;
+        let (channel, _frames) = registry.open_channel(TEST_KEY, vec![]).await;
 
         let envelope = ReplyEnvelope {
             kind: "result".to_owned(),
@@ -392,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn a_disconnect_fails_every_pending_reply() {
         let registry = ChannelRegistry::new();
-        let (channel, _frames) = registry.open_channel(TEST_KEY).await;
+        let (channel, _frames) = registry.open_channel(TEST_KEY, vec![]).await;
         let first_reply = channel.await_reply(1).await;
         let second_reply = channel.await_reply(2).await;
 
@@ -414,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn sending_to_a_closed_channel_reports_the_stream_is_gone() {
         let registry = ChannelRegistry::new();
-        let (channel, frames) = registry.open_channel(TEST_KEY).await;
+        let (channel, frames) = registry.open_channel(TEST_KEY, vec![]).await;
         drop(frames); // the browser went away
 
         assert_eq!(
@@ -428,7 +578,7 @@ mod tests {
     #[tokio::test]
     async fn await_channel_returns_immediately_when_already_connected() {
         let registry = ChannelRegistry::new();
-        let (channel, _frames) = registry.open_channel(TEST_KEY).await;
+        let (channel, _frames) = registry.open_channel(TEST_KEY, vec![]).await;
 
         let awaited = registry
             .await_channel(TEST_KEY, Duration::from_millis(0))
@@ -444,7 +594,7 @@ mod tests {
         let connecting_registry = registry.clone();
         let late_connect = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            connecting_registry.open_channel(TEST_KEY).await
+            connecting_registry.open_channel(TEST_KEY, vec![]).await
         });
 
         // The publisher is already waiting when the tab shows up.

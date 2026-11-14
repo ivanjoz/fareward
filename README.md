@@ -574,14 +574,28 @@ navegador                     bridge                        backend (Lambda)
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/sse?ch=<token>` | session token | Opens the stream. First frame `{"Type":"bridgeReady"}`, keepalive comment every 20s. |
+| `GET` | `/sse?ch=<token>&topics=<a,b>` | session token | Opens the stream. First frame `{"Type":"bridgeReady"}`, keepalive comment every 20s. `topics` is optional. |
 | `POST` | `/in?ch=<token>` | session token | Browser reply `{ID,Type,Payload}`. Wakes the `/rpc` waiting on that `ID`. |
 | `POST` | `/publish` | service tag | `{Channel,Message,WaitMs}` → `{Delivered}`. Does not block. |
 | `POST` | `/rpc` | service tag | `{Channel,ID,Message,TimeoutMs,WaitMs}` → `{Kind,Payload}`. Blocks until the reply. |
+| `POST` | `/publish-topic` | service tag | `{Topic,Message}` → `{Delivered: <subscriber count>}`. Never waits. |
 | `GET` | `/health` | — | `{Ok,Channels,UptimeSeconds}`. |
 
 Messages are opaque JSON and **nothing is buffered**: a message for a disconnected tab is
 dropped (`Delivered:false`). The bridge holds no business logic and never touches the database.
+
+### Topics
+
+A topic fans one message out to every tab subscribed to it — a live page (a restaurant floor
+map, a kitchen screen) where many tabs watch the same data. A tab subscribes when it opens its
+stream; to change topics it opens a new stream, which replaces the old one.
+
+A topic is `<name>.<companyID>[.<more>]`, at most 96 characters of `[A-Za-z0-9._-]`, up to 16
+per stream. The second segment is the tenant: `/sse` refuses (403) a topic whose company is not
+the session's, which is the whole access check — the bridge knows nothing else about the name.
+Delivery is a non-blocking queue per tab: a tab whose queue is full misses the message. Topic
+messages are therefore nudges ("something changed, refetch"), never data the page cannot recover
+through the normal API.
 
 ### Channel token
 

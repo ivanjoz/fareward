@@ -1,5 +1,5 @@
-//! HTTP surface of the bridge. Two endpoints face the browser (`/sse`, `/in`) and two face
-//! the backend (`/publish`, `/rpc`). The bridge never interprets the messages it moves: they
+//! HTTP surface of the bridge. Two endpoints face the browser (`/sse`, `/in`) and three face
+//! the backend (`/publish`, `/rpc`, `/publish-topic`). The bridge never interprets the messages it moves: they
 //! are opaque JSON objects framed as SSE `data:` events. The single exception is the command
 //! id, which travels as its own field so a reply can be correlated without parsing the
 //! payload.
@@ -32,6 +32,7 @@ use crate::bridge::{
     auth::{SERVICE_AUTH_HEADER, authenticate_user, verify_service_auth},
     channel::{ChannelRegistry, ClientChannel, ReplyEnvelope, SendFrameError},
     token::decode_channel_token,
+    topic::{parse_stream_topics, topic_company_id},
 };
 
 /// Sends an SSE comment often enough to survive the idle read timeouts of nginx and of mobile
@@ -70,6 +71,7 @@ pub fn routes(state: Arc<BridgeState>) -> Router {
         )
         .route("/publish", post(handle_service_publish))
         .route("/rpc", post(handle_service_rpc))
+        .route("/publish-topic", post(handle_service_publish_topic))
         .route("/health", get(handle_health))
         .with_state(state)
 }
@@ -78,6 +80,9 @@ pub fn routes(state: Arc<BridgeState>) -> Router {
 pub struct ChannelQuery {
     #[serde(default)]
     ch: String,
+    /// Comma-separated topics the stream subscribes to (`/sse` only).
+    #[serde(default)]
+    topics: String,
 }
 
 /// Answers a browser preflight. EventSource cannot set headers, so the frontend reads the
@@ -120,7 +125,7 @@ fn json_body(value: Value) -> Response {
     (StatusCode::OK, client_cors_headers(), Json(value)).into_response()
 }
 
-/// Turns a browser request into the channel it may address.
+/// Turns a browser request into the channel it may address and the company it acts for.
 ///
 /// The channel token names the tab, but it does NOT prove who is asking: it is a plain
 /// identifier anyone could rewrite. The session token is the proof, so the two are
@@ -130,7 +135,7 @@ async fn resolve_client_channel(
     state: &BridgeState,
     headers: &HeaderMap,
     channel_token: &str,
-) -> Result<String, String> {
+) -> Result<(String, i32), String> {
     let channel_token = channel_token.trim();
     if channel_token.is_empty() {
         return Err("falta el parámetro ?ch=".to_owned());
@@ -147,7 +152,7 @@ async fn resolve_client_channel(
     if channel_company_id != user_token.company_id || channel_user_id != user_token.id {
         return Err("el canal solicitado no pertenece al usuario autenticado".to_owned());
     }
-    Ok(channel_token.to_owned())
+    Ok((channel_token.to_owned(), channel_company_id))
 }
 
 /// Opens the tab's event stream. It stays open until the client disconnects or another
@@ -157,15 +162,24 @@ async fn handle_client_stream(
     Query(query): Query<ChannelQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let channel_key = match resolve_client_channel(&state, &headers, &query.ch).await {
-        Ok(channel_key) => channel_key,
+    let (channel_key, company_id) = match resolve_client_channel(&state, &headers, &query.ch).await
+    {
+        Ok(resolved) => resolved,
         Err(reason) => {
             warn!(reason, "stream rejected");
             return json_error(StatusCode::UNAUTHORIZED, reason);
         }
     };
+    // A topic carries one company's events, so a tab may only join its own company's topics.
+    let topics = match parse_stream_topics(&query.topics, company_id) {
+        Ok(topics) => topics,
+        Err(reason) => {
+            warn!(channel = channel_key, reason, "stream topics rejected");
+            return json_error(StatusCode::FORBIDDEN, reason);
+        }
+    };
 
-    let (channel, frame_receiver) = state.registry.open_channel(&channel_key).await;
+    let (channel, frame_receiver) = state.registry.open_channel(&channel_key, topics).await;
 
     // Handshake, queued only after open_channel: a client that has seen this frame is
     // guaranteed to be routable, which is what lets the frontend delay its first turn until
@@ -271,7 +285,7 @@ async fn handle_client_inbound(
     body: String,
 ) -> Response {
     let channel_key = match resolve_client_channel(&state, &headers, &query.ch).await {
-        Ok(channel_key) => channel_key,
+        Ok((channel_key, _)) => channel_key,
         Err(reason) => return json_error(StatusCode::UNAUTHORIZED, reason),
     };
 
@@ -435,6 +449,47 @@ async fn handle_service_publish(
             json_body(json!({ "Delivered": false, "Error": reason }))
         }
     }
+}
+
+/// Fans one message out to every tab subscribed to a topic. Nothing waits: a tab not connected
+/// right now catches up through the normal API when it reconnects.
+#[derive(Deserialize)]
+pub struct PublishTopicRequest {
+    #[serde(default, rename = "Topic")]
+    topic: String,
+    #[serde(default, rename = "Message")]
+    message: Value,
+}
+
+async fn handle_service_publish_topic(
+    State(state): State<Arc<BridgeState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(rejection) = verify_service_call(&state, &headers) {
+        return rejection;
+    }
+    let publish: PublishTopicRequest = match serde_json::from_str(&body) {
+        Ok(publish) => publish,
+        Err(error) => {
+            return json_error(StatusCode::BAD_REQUEST, format!("cuerpo inválido: {error}"));
+        }
+    };
+    if let Err(reason) = topic_company_id(&publish.topic) {
+        return json_error(StatusCode::BAD_REQUEST, reason);
+    }
+    if publish.message.is_null() {
+        return json_error(StatusCode::BAD_REQUEST, "Message es obligatorio");
+    }
+
+    let delivered_count = state
+        .registry
+        .publish_topic(&publish.topic, &publish.message)
+        .await;
+    if state.verbose_logs {
+        debug!(topic = publish.topic, delivered_count, "topic published");
+    }
+    json_body(json!({ "Delivered": delivered_count }))
 }
 
 async fn handle_service_rpc(

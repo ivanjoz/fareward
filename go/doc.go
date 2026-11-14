@@ -25,6 +25,11 @@
 // call made before ConfigureFareward returns ErrCreditLimiterMissing or its per-service
 // equivalent rather than panicking.
 //
+// The SSE bridge is the other half of the daemon and speaks HTTP, not this protocol. bridge.go is
+// its service-side client, configured separately because a deployment may run one without the
+// other: fareward.ConfigureBridge(bridgeURL, secret), then BridgePublish, BridgeRPC and
+// BridgePublishTopic.
+//
 // There is deliberately no package-level shutdown. The connection is meant to live as long as the
 // process, and calling ConfigureFareward again closes the previous one — which is what a config
 // reload wants. A caller that needs to drop the connection for its own reasons does not have a

@@ -7,3 +7,6 @@
 # Release staging directory used by .github/workflows/release-binaries.yml.
 /dist/
 plans/
+
+# Local daemon store when the binary is run from this directory (cargo run).
+/tmp/

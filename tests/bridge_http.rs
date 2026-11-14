@@ -48,10 +48,18 @@ fn test_router() -> Router {
 
 /// Opens a tab's stream and consumes the handshake, leaving the body ready for events.
 async fn open_stream(router: &Router, channel_token: &str) -> BodyDataStream {
+    open_stream_with_topics(router, channel_token, "").await
+}
+
+async fn open_stream_with_topics(
+    router: &Router,
+    channel_token: &str,
+    topics: &str,
+) -> BodyDataStream {
     let response = router
         .clone()
         .oneshot(
-            Request::get(format!("/sse?ch={channel_token}"))
+            Request::get(format!("/sse?ch={channel_token}&topics={topics}"))
                 .header(header::AUTHORIZATION, format!("Bearer {SESSION_TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -172,6 +180,69 @@ async fn publish_from_another_tenant_cannot_reach_the_tab() {
     .await;
 
     assert_eq!(body["Delivered"], false);
+}
+
+#[tokio::test]
+async fn publish_topic_reaches_the_subscribed_tab() {
+    let router = test_router();
+    let mut frames = open_stream_with_topics(&router, TEST_CHANNEL, "dining.7.3,dining.7.4").await;
+
+    let (status, body) = post_service(
+        &router,
+        "/publish-topic",
+        json!({ "Topic": "dining.7.4", "Message": { "Type": "dining", "LayoutID": 4 } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Delivered"], 1);
+    assert_eq!(next_frame(&mut frames).await["LayoutID"], 4);
+
+    let (_, body) = post_service(
+        &router,
+        "/publish-topic",
+        json!({ "Topic": "dining.7.9", "Message": { "Type": "dining" } }),
+    )
+    .await;
+    assert_eq!(body["Delivered"], 0);
+}
+
+/// A topic names its company, and the session proves the tab's company: a tab of company 7
+/// asking for a company 8 topic is refused before anything is registered.
+#[tokio::test]
+async fn a_client_cannot_subscribe_to_another_company_topic() {
+    let router = test_router();
+
+    let response = router
+        .oneshot(
+            Request::get(format!(
+                "/sse?ch={TEST_CHANNEL}&topics=dining.7.3,dining.8.3"
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {SESSION_TOKEN}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn publish_topic_requires_a_valid_topic_and_message() {
+    let router = test_router();
+
+    let (status, _) = post_service(
+        &router,
+        "/publish-topic",
+        json!({ "Topic": "dining", "Message": { "Type": "dining" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) =
+        post_service(&router, "/publish-topic", json!({ "Topic": "dining.7.3" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// The channel token is an identifier, not a credential: editing the company id inside it must
