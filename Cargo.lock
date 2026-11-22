@@ -157,16 +157,16 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "colbin"
-version = "0.10.0"
-source = "git+https://github.com/ivanjoz/colbin?tag=v0.10.0#a154a55ba3af7a8505c5558ff2df38076b7e939c"
+version = "0.13.1"
+source = "git+https://github.com/ivanjoz/colbin?tag=v0.13.1#86776ae98566b63cad6e2dabd11271615386b092"
 dependencies = [
  "colbin-derive",
 ]
 
 [[package]]
 name = "colbin-derive"
-version = "0.10.0"
-source = "git+https://github.com/ivanjoz/colbin?tag=v0.10.0#a154a55ba3af7a8505c5558ff2df38076b7e939c"
+version = "0.13.1"
+source = "git+https://github.com/ivanjoz/colbin?tag=v0.13.1#86776ae98566b63cad6e2dabd11271615386b092"
 dependencies = [
  "proc-macro2",
  "quote",
